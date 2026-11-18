@@ -7,16 +7,17 @@ Benchmark de **harness × modelo** para agentes de código. Métrica principal: 
 - `harness_bench.py`: motor e única fonte de verdade. Contém `run`, `reconcile` (custo real do LiteLLM), `report` e um parser por harness.
 - `harness_bench_litellm.py`: wrapper fino sobre o motor. Remove harnesses com `parser: cursor` e força o custo LiteLLM. Lógica nova vai para o motor; o wrapper só filtra o config e encadeia comandos.
 - `HARNESS_BENCH.md`: arquivo **gerado** por `scripts/build_md.py`. Edite o gerador e regenere o arquivo.
-- `tests/`: `fake_agent.py` imita a saída JSON de cada CLI, `fake_litellm.py` imita `/spend/logs/v2` e `smoke.py` testa tudo ponta a ponta.
+- `tests/`: `fake_agent.py` imita a saída JSON de cada CLI e sonda vazamentos (env, histórico git, adulteração de testes). `fake_litellm.py` imita `/spend/logs/v2`, e `smoke.py` testa tudo ponta a ponta.
 - `*.example.*`: configs de exemplo do benchmark (`config*.json`) e de cada harness apontando para o LiteLLM (Pi, OpenCode, Codex).
 
 ## Regras
 
 - Python 3.12, só biblioteca padrão. O ambiente de execução não instala dependências.
 - O único acesso de rede é `GET` no LiteLLM configurado, feito pelo `reconcile`.
-- Segredos entram só por env (`${VAR}` no config). `config*.json` (exceto exemplos), `results*/`, `work/` e `.cache/` ficam fora do git, porque contêm URLs internas, código e respostas dos agentes.
+- Segredos entram só por env (`${VAR}` no config). `config*.json` (exceto exemplos), `results*/` e `.cache/` ficam fora do git, porque contêm URLs internas, código e respostas dos agentes.
 - Docs e relatório em português. Código e comentários em inglês.
 - Custo desconhecido é `None`, nunca `0`. Um `0` falso joga o par para o topo do ranking de custo.
+- O agente e o repositório da tarefa são **não confiáveis**. Toda mudança em `cmd_run` preserva as defesas: workdir fora do repositório e sem histórico git; ambiente por allowlist (`BASE_ENV` + `env_passthrough` + `env` do harness), sem a chave de spend; `protected_paths` restaurados a partir de um snapshot fora do workdir; diff de auditoria; logs com redação; `rmtree_inside` para apagar; comandos sem `shell=True` e passados por `wrap()` (sandbox). O `tests/smoke.py` tem um caso para cada defesa. Uma defesa nova ganha um caso novo.
 
 ## Semântica de usage por harness
 

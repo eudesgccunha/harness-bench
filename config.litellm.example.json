@@ -3,7 +3,11 @@
   "timeout": 1800,
   "cost_source": "litellm",
   "output_dir": "results-litellm",
-  "work_dir": "work",
+  "sandbox": {
+    "_comment": "Obrigatório fora de VM descartável. Ex.: [\"docker\",\"run\",\"--rm\",\"-i\",\"--env-file\",\"{env_file}\",\"-v\",\"{workdir}:{workdir}\",\"-w\",\"{workdir}\",\"IMAGEM-COM-OS-CLIS\"]",
+    "prefix": []
+  },
+  "env_passthrough": [],
   "litellm": {
     "base_url": "${LITELLM_BASE_URL}",
     "api_key": "${LITELLM_SPEND_KEY}"
@@ -38,7 +42,10 @@
         "--model",
         "{model_name}",
         "{prompt}"
-      ]
+      ],
+      "env": {
+        "LITELLM_API_KEY": "${LITELLM_API_KEY}"
+      }
     },
     "opencode": {
       "parser": "opencode",
@@ -50,7 +57,10 @@
         "--model",
         "{model}",
         "{prompt}"
-      ]
+      ],
+      "env": {
+        "LITELLM_API_KEY": "${LITELLM_API_KEY}"
+      }
     },
     "codex": {
       "parser": "codex",
@@ -65,7 +75,10 @@
         "-m",
         "{model}",
         "{prompt}"
-      ]
+      ],
+      "env": {
+        "LITELLM_API_KEY": "${LITELLM_API_KEY}"
+      }
     }
   },
   "matrix": [
@@ -116,7 +129,8 @@
       "repo": "tasks/fizzbuzz/repo",
       "prompt": "The function fizzbuzz in fizzbuzz.py has bugs. Fix it so fizzbuzz(n) returns 'Fizz' for multiples of 3, 'Buzz' for multiples of 5, 'FizzBuzz' for multiples of both, and str(n) otherwise. Do not ask questions.",
       "hidden_tests": "tasks/fizzbuzz/hidden_tests",
-      "test": "python3 -m unittest -q test_hidden.py"
+      "test": "python3 -m unittest -q test_hidden.py",
+      "protected_paths": []
     },
     {
       "id": "exemplo-repo-real",
@@ -126,7 +140,12 @@
       "prompt": "Descreva aqui o bug ou a feature, como numa issue real.",
       "hidden_tests": "tasks/exemplo-repo-real/hidden_tests",
       "test": "npx vitest run tests/hidden",
-      "timeout": 2400
+      "timeout": 2400,
+      "protected_paths": [
+        "tests",
+        "package.json",
+        "vitest.config.ts"
+      ]
     }
   ]
 }

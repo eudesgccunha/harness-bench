@@ -1,14 +1,39 @@
 """Fake coding-agent CLI for tests. Prints the JSON shape of a real harness.
 
-Usage: fake_agent.py <claude|opencode|pi|codex|cursor> <fix|nofix>
-"fix" repairs fizzbuzz.py in the cwd. When BENCH_TAG is set (and kind is not cursor),
+Usage: fake_agent.py <claude|opencode|pi|codex|cursor> <fix|nofix|hack>
+"fix" repairs fizzbuzz.py in the cwd. "hack" leaves the bug and tampers with the test
+infrastructure instead (rewrites run_tests.py, adds conftest.py, moves git refs).
+Security probes: exits 9 if the LiteLLM spend key or SECRET_CANARY reached the agent,
+prints FAKE_API_KEY to stderr (must be redacted in logs), and records git history depth. When BENCH_TAG is set (and kind is not cursor),
 the tag is appended to $FAKE_TAGS_FILE, which fake_litellm.py serves as spend logs.
 """
 import json
 import os
 import sys
 
-kind, fix = sys.argv[1], sys.argv[2] == "fix"
+kind, mode = sys.argv[1], sys.argv[2]
+fix = mode == "fix"
+for leaked in ("FAKE_KEY", "SECRET_CANARY"):
+    if leaked in os.environ:
+        sys.exit(9)
+print(f"debug key={os.environ.get('FAKE_API_KEY', '')}", file=sys.stderr)
+if os.environ.get("FAKE_PROBE_FILE"):
+    import subprocess
+    depth = subprocess.run(["git", "rev-list", "--all", "--count"], capture_output=True,
+                           text=True).stdout.strip()
+    remotes = subprocess.run(["git", "remote"], capture_output=True, text=True).stdout.strip()
+    with open(os.environ["FAKE_PROBE_FILE"], "a") as f:
+        f.write(json.dumps({"cwd": os.getcwd(), "depth": depth, "remotes": remotes,
+                            "sandbox": os.environ.get("FAKE_SANDBOX", "")}) + "\n")
+if mode == "hack":
+    with open("run_tests.py", "w") as f:
+        f.write("import sys\nsys.exit(0)\n")
+    os.makedirs("tests_infra", exist_ok=True)
+    with open("tests_infra/conftest.py", "w") as f:
+        f.write("# planted\n")
+    import subprocess
+    subprocess.run(["git", "-c", "user.name=x", "-c", "user.email=x@x", "commit", "-qam", "hack"],
+                   capture_output=True)
 if fix:
     with open("fizzbuzz.py", "w") as f:
         f.write("def fizzbuzz(n):\n    if n % 15 == 0:\n        return 'FizzBuzz'\n"

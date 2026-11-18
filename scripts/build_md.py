@@ -48,7 +48,7 @@ O `harness_bench_litellm.py` usa o mesmo motor. Os dois arquivos precisam estar 
 ```bash
 cp config.litellm.example.json config.litellm.json
 python3 harness_bench_litellm.py run --config config.litellm.json --dry-run
-python3 harness_bench_litellm.py run --config config.litellm.json --reps 1 --only pi   # smoke test
+python3 harness_bench_litellm.py run --config config.litellm.json --reps 1 --only pi   # smoke test (exige sandbox.prefix ou --allow-unsandboxed)
 python3 harness_bench_litellm.py run --config config.litellm.json                     # rodada completa
 python3 harness_bench_litellm.py reconcile --config config.litellm.json               # se os logs atrasarem
 ```
@@ -109,7 +109,9 @@ Saídas em `results/`:
 
 - `results.jsonl`: uma linha por execução, com dados brutos;
 - `summary.md` e `summary.csv`: tabela ordenada por custo por tarefa resolvida, mais a matriz de acerto por tarefa;
-- `logs/`: saída JSON de cada agente, stderr, setup e testes.
+- `logs/`: saída JSON de cada agente, stderr, setup, testes e o `.diff` de tudo que o agente mudou. Segredos conhecidos aparecem como `***REDACTED***`.
+
+O comando `run` só roda com `sandbox.prefix` configurado (veja [Segurança](#segurança)). Dentro de uma VM descartável, adicione `--allow-unsandboxed`.
 
 ## Fontes de custo
 
@@ -153,7 +155,7 @@ Use `opencode.example.json` como config global ou do projeto. Os exemplos oficia
 
 ### Codex CLI
 
-Adicione o trecho ao `~/.codex/config.toml`. Prefira um `CODEX_HOME` dedicado ao benchmark. `env_http_headers` mapeia header → nome da env var. **Confirme o nome dessas chaves na documentação da sua versão do Codex.** O comando usa `--full-auto` (sandbox com escrita no workspace). Se a tarefa precisar de rede (ex.: `npm ci`), deixe isso no `setup`, que roda fora do agente.
+Adicione o trecho ao `~/.codex/config.toml`. Prefira um `CODEX_HOME` dedicado ao benchmark. `env_http_headers` mapeia header → nome da env var. **Confirme o nome dessas chaves na documentação da sua versão do Codex.** O comando usa `--full-auto` (sandbox com escrita no workspace). Se a tarefa precisar de rede (ex.: `npm ci`), deixe isso no `setup`, que roda antes do agente.
 
 ```toml
 {cdx}```
@@ -182,8 +184,39 @@ Parser: o `usage` do evento `turn.completed` é o total acumulado da thread, ent
 - **Comece pelo mesmo modelo em harnesses diferentes**: Claude em Claude Code × Pi × OpenCode × Cursor; GPT em Codex × Pi × OpenCode × Cursor. Isso isola o efeito do harness. Depois compare modelos.
 - **Configuração limpa**: o Claude Code carrega `~/.claude/CLAUDE.md`, MCP servers e plugins. Isso aumenta tokens. Rode o benchmark com um usuário ou HOME dedicado, e faça o mesmo para os outros harnesses (`~/.pi/agent/`, `~/.config/opencode/`, `CODEX_HOME`).
 - **Mesmo "esforço"**: thinking e reasoning effort mudam muito o custo. Fixe esses parâmetros por modelo e registre no nome do par (ex.: `GPT_MODEL` com `-c model_reasoning_effort=medium` no Codex; `modelo:high` no Pi).
-- **Segurança**: os agentes rodam sem pedir aprovação. Use VM ou container sem acesso a dados sensíveis.
 - **Variância**: use `reps` ≥ 3 e 5–10 tarefas antes de concluir algo.
+
+## Segurança
+
+Os agentes rodam **sem pedir aprovação** e o comando `test` executa código escrito pelo agente. Trate o agente e o repositório da tarefa como não confiáveis: um README ou issue pode trazer prompt injection.
+
+O que o script faz em cada execução:
+
+1. **Workdir fora do repositório do benchmark**: um diretório temporário novo, ou `work_dir` absoluto fora do repositório (o script recusa um caminho dentro dele). Assim o agente não trabalha ao lado de testes ocultos, config e resultados.
+2. **Sem histórico git**: o repositório da tarefa é copiado sem `.git` e recebe um único commit `baseline`. Um clone no commit anterior ao fix ainda teria o commit do fix, e o remote apontaria de volta para o benchmark.
+3. **Ambiente mínimo**: o agente recebe só `PATH`, `HOME`, `USER`, locale, `TERM`, `TMPDIR`, as variáveis de `env_passthrough` e as do bloco `env` do harness. O `setup` e o `test` recebem o mesmo, sem o `env` do harness. A chave de leitura de spend do LiteLLM (`litellm.api_key`) **nunca** chega ao agente: o script recusa um config que tente repassá-la.
+4. **Arquivos protegidos**: antes do agente rodar, cada caminho em `protected_paths` é copiado para fora do workdir. Antes do teste, esse conteúdo volta e tudo que o agente criou ali é apagado. Use para runner de testes e configs (`tests/`, `package.json`, `pytest.ini`, `conftest.py`, `vitest.config.ts`). Sem isso, um agente pode "resolver" a tarefa fazendo o teste passar sempre.
+5. **Auditoria**: `logs/<execução>.diff` guarda tudo que o agente mudou em relação ao baseline.
+6. **Logs sem segredos**: valores das variáveis do bloco `env` do harness e a chave de spend são trocados por `***REDACTED***`.
+7. **Validação do config**: ids de tarefa e nomes de harness só aceitam letras, dígitos, `_`, `.` e `-`. `repo` e `ref` não podem começar com `-`. `protected_paths` precisam ser relativos e sem `..`. O script só apaga diretórios dentro da raiz de trabalho.
+8. **LiteLLM**: `base_url` precisa de `https` (http só para localhost) e redirects não são seguidos, para a chave não ir para outro host.
+
+O que o script **não** resolve sozinho: sem sandbox, o agente roda com o seu usuário e consegue ler qualquer arquivo seu (incluindo `~/.ssh`) e alterar os resultados. Por isso `run` exige `sandbox.prefix` ou `--allow-unsandboxed`.
+
+### `sandbox.prefix`
+
+Comando colocado na frente do agente, do `setup` e do `test`. Placeholders: `{{workdir}}` e `{{env_file}}`, um arquivo `KEY=valor` com permissão 0600, apagado logo após cada passo. Exemplo com Docker, montando só o workdir no mesmo caminho:
+
+```json
+"sandbox": {{
+  "prefix": ["docker", "run", "--rm", "-i",
+             "--env-file", "{{env_file}}",
+             "-v", "{{workdir}}:{{workdir}}", "-w", "{{workdir}}",
+             "IMAGEM-COM-OS-CLIS"]
+}}
+```
+
+A imagem precisa ter os CLIs dos harnesses, `git`, `sh` e o que os testes usam. Configure a autenticação dos CLIs por variável de ambiente (LiteLLM), não por arquivos do seu HOME. Com o `HOME` da imagem, cada CLI começa com configuração limpa, o que também deixa a comparação mais justa.
 
 ## Como escolher tarefas
 
@@ -191,11 +224,13 @@ Parser: o `usage` do evento `turn.completed` é o total acumulado da thread, ent
 - Escreva o prompt como uma issue, sem dica da solução.
 - Use como testes ocultos os testes do commit do fix.
 - `setup` (ex.: `npm ci`) roda antes do agente e não entra no custo.
+- Liste em `protected_paths` os testes e configs de teste do repositório.
 
 ## Placeholders do `command`
 
 `{{prompt}}`, `{{model}}`, `{{provider}}` (parte antes da `/`), `{{model_name}}` (parte depois da `/`).
 Em `env`: `${{VAR}}` é expandido do ambiente e `{{run_tag}}` vira a tag da execução. `BENCH_TAG` é sempre exportada.
+Em `sandbox.prefix`: `{{workdir}}` e `{{env_file}}`.
 
 ---
 

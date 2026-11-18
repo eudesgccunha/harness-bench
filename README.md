@@ -25,7 +25,7 @@ export LITELLM_SPEND_KEY=sk-...                      # leitura de /spend/logs
 
 cp config.litellm.example.json config.litellm.json   # preencha modelos e tarefas
 python3 harness_bench_litellm.py run --config config.litellm.json --dry-run
-python3 harness_bench_litellm.py run --config config.litellm.json --reps 1 --only pi
+python3 harness_bench_litellm.py run --config config.litellm.json --reps 1 --only pi   # + --allow-unsandboxed se não houver sandbox
 python3 harness_bench_litellm.py run --config config.litellm.json
 ```
 
@@ -46,6 +46,13 @@ Antes, configure cada harness para usar o LiteLLM e enviar a tag da execução. 
 
 ## Segurança
 
-- Os agentes rodam **sem pedir aprovação**. Use VM ou container isolado, sem acesso a credenciais sensíveis.
-- O `.gitignore` já exclui configs locais, resultados e tarefas reais. Não force a inclusão desses arquivos.
-- Passe chaves só por variável de ambiente.
+Os agentes rodam **sem pedir aprovação** e os testes executam código escrito por eles. O script isola o que consegue:
+
+- workdir temporário fora do repositório, sem histórico git;
+- ambiente mínimo, sem a chave de spend do LiteLLM;
+- arquivos de teste protegidos contra adulteração;
+- diff de auditoria e logs sem segredos.
+
+O resto depende de sandbox. O `run` exige `sandbox.prefix` (ex.: `docker run ...`) ou `--allow-unsandboxed`, que só deve ser usado dentro de uma VM descartável. Detalhes na seção "Segurança" do [`HARNESS_BENCH.md`](HARNESS_BENCH.md).
+
+O `.gitignore` já exclui configs locais, resultados e tarefas reais. Não force a inclusão desses arquivos.

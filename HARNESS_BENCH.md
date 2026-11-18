@@ -41,7 +41,7 @@ O `harness_bench_litellm.py` usa o mesmo motor. Os dois arquivos precisam estar 
 ```bash
 cp config.litellm.example.json config.litellm.json
 python3 harness_bench_litellm.py run --config config.litellm.json --dry-run
-python3 harness_bench_litellm.py run --config config.litellm.json --reps 1 --only pi   # smoke test
+python3 harness_bench_litellm.py run --config config.litellm.json --reps 1 --only pi   # smoke test (exige sandbox.prefix ou --allow-unsandboxed)
 python3 harness_bench_litellm.py run --config config.litellm.json                     # rodada completa
 python3 harness_bench_litellm.py reconcile --config config.litellm.json               # se os logs atrasarem
 ```
@@ -102,7 +102,9 @@ Saídas em `results/`:
 
 - `results.jsonl`: uma linha por execução, com dados brutos;
 - `summary.md` e `summary.csv`: tabela ordenada por custo por tarefa resolvida, mais a matriz de acerto por tarefa;
-- `logs/`: saída JSON de cada agente, stderr, setup e testes.
+- `logs/`: saída JSON de cada agente, stderr, setup, testes e o `.diff` de tudo que o agente mudou. Segredos conhecidos aparecem como `***REDACTED***`.
+
+O comando `run` só roda com `sandbox.prefix` configurado (veja [Segurança](#segurança)). Dentro de uma VM descartável, adicione `--allow-unsandboxed`.
 
 ## Fontes de custo
 
@@ -188,7 +190,7 @@ Use `opencode.example.json` como config global ou do projeto. Os exemplos oficia
 
 ### Codex CLI
 
-Adicione o trecho ao `~/.codex/config.toml`. Prefira um `CODEX_HOME` dedicado ao benchmark. `env_http_headers` mapeia header → nome da env var. **Confirme o nome dessas chaves na documentação da sua versão do Codex.** O comando usa `--full-auto` (sandbox com escrita no workspace). Se a tarefa precisar de rede (ex.: `npm ci`), deixe isso no `setup`, que roda fora do agente.
+Adicione o trecho ao `~/.codex/config.toml`. Prefira um `CODEX_HOME` dedicado ao benchmark. `env_http_headers` mapeia header → nome da env var. **Confirme o nome dessas chaves na documentação da sua versão do Codex.** O comando usa `--full-auto` (sandbox com escrita no workspace). Se a tarefa precisar de rede (ex.: `npm ci`), deixe isso no `setup`, que roda antes do agente.
 
 ```toml
 # Trecho para ~/.codex/config.toml (ou CODEX_HOME dedicado ao benchmark)
@@ -224,8 +226,39 @@ Parser: o `usage` do evento `turn.completed` é o total acumulado da thread, ent
 - **Comece pelo mesmo modelo em harnesses diferentes**: Claude em Claude Code × Pi × OpenCode × Cursor; GPT em Codex × Pi × OpenCode × Cursor. Isso isola o efeito do harness. Depois compare modelos.
 - **Configuração limpa**: o Claude Code carrega `~/.claude/CLAUDE.md`, MCP servers e plugins. Isso aumenta tokens. Rode o benchmark com um usuário ou HOME dedicado, e faça o mesmo para os outros harnesses (`~/.pi/agent/`, `~/.config/opencode/`, `CODEX_HOME`).
 - **Mesmo "esforço"**: thinking e reasoning effort mudam muito o custo. Fixe esses parâmetros por modelo e registre no nome do par (ex.: `GPT_MODEL` com `-c model_reasoning_effort=medium` no Codex; `modelo:high` no Pi).
-- **Segurança**: os agentes rodam sem pedir aprovação. Use VM ou container sem acesso a dados sensíveis.
 - **Variância**: use `reps` ≥ 3 e 5–10 tarefas antes de concluir algo.
+
+## Segurança
+
+Os agentes rodam **sem pedir aprovação** e o comando `test` executa código escrito pelo agente. Trate o agente e o repositório da tarefa como não confiáveis: um README ou issue pode trazer prompt injection.
+
+O que o script faz em cada execução:
+
+1. **Workdir fora do repositório do benchmark**: um diretório temporário novo, ou `work_dir` absoluto fora do repositório (o script recusa um caminho dentro dele). Assim o agente não trabalha ao lado de testes ocultos, config e resultados.
+2. **Sem histórico git**: o repositório da tarefa é copiado sem `.git` e recebe um único commit `baseline`. Um clone no commit anterior ao fix ainda teria o commit do fix, e o remote apontaria de volta para o benchmark.
+3. **Ambiente mínimo**: o agente recebe só `PATH`, `HOME`, `USER`, locale, `TERM`, `TMPDIR`, as variáveis de `env_passthrough` e as do bloco `env` do harness. O `setup` e o `test` recebem o mesmo, sem o `env` do harness. A chave de leitura de spend do LiteLLM (`litellm.api_key`) **nunca** chega ao agente: o script recusa um config que tente repassá-la.
+4. **Arquivos protegidos**: antes do agente rodar, cada caminho em `protected_paths` é copiado para fora do workdir. Antes do teste, esse conteúdo volta e tudo que o agente criou ali é apagado. Use para runner de testes e configs (`tests/`, `package.json`, `pytest.ini`, `conftest.py`, `vitest.config.ts`). Sem isso, um agente pode "resolver" a tarefa fazendo o teste passar sempre.
+5. **Auditoria**: `logs/<execução>.diff` guarda tudo que o agente mudou em relação ao baseline.
+6. **Logs sem segredos**: valores das variáveis do bloco `env` do harness e a chave de spend são trocados por `***REDACTED***`.
+7. **Validação do config**: ids de tarefa e nomes de harness só aceitam letras, dígitos, `_`, `.` e `-`. `repo` e `ref` não podem começar com `-`. `protected_paths` precisam ser relativos e sem `..`. O script só apaga diretórios dentro da raiz de trabalho.
+8. **LiteLLM**: `base_url` precisa de `https` (http só para localhost) e redirects não são seguidos, para a chave não ir para outro host.
+
+O que o script **não** resolve sozinho: sem sandbox, o agente roda com o seu usuário e consegue ler qualquer arquivo seu (incluindo `~/.ssh`) e alterar os resultados. Por isso `run` exige `sandbox.prefix` ou `--allow-unsandboxed`.
+
+### `sandbox.prefix`
+
+Comando colocado na frente do agente, do `setup` e do `test`. Placeholders: `{workdir}` e `{env_file}`, um arquivo `KEY=valor` com permissão 0600, apagado logo após cada passo. Exemplo com Docker, montando só o workdir no mesmo caminho:
+
+```json
+"sandbox": {
+  "prefix": ["docker", "run", "--rm", "-i",
+             "--env-file", "{env_file}",
+             "-v", "{workdir}:{workdir}", "-w", "{workdir}",
+             "IMAGEM-COM-OS-CLIS"]
+}
+```
+
+A imagem precisa ter os CLIs dos harnesses, `git`, `sh` e o que os testes usam. Configure a autenticação dos CLIs por variável de ambiente (LiteLLM), não por arquivos do seu HOME. Com o `HOME` da imagem, cada CLI começa com configuração limpa, o que também deixa a comparação mais justa.
 
 ## Como escolher tarefas
 
@@ -233,11 +266,13 @@ Parser: o `usage` do evento `turn.completed` é o total acumulado da thread, ent
 - Escreva o prompt como uma issue, sem dica da solução.
 - Use como testes ocultos os testes do commit do fix.
 - `setup` (ex.: `npm ci`) roda antes do agente e não entra no custo.
+- Liste em `protected_paths` os testes e configs de teste do repositório.
 
 ## Placeholders do `command`
 
 `{prompt}`, `{model}`, `{provider}` (parte antes da `/`), `{model_name}` (parte depois da `/`).
 Em `env`: `${VAR}` é expandido do ambiente e `{run_tag}` vira a tag da execução. `BENCH_TAG` é sempre exportada.
+Em `sandbox.prefix`: `{workdir}` e `{env_file}`.
 
 ---
 
@@ -265,6 +300,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -457,18 +493,109 @@ def computed_cost(u, price):
             + u["cache_write"] * price.get("cache_write", price.get("input", 0))) / 1e6
 
 
+# ---------------------------------------------------------------- safety helpers
+
+# Environment the agent and the setup/test commands get. Everything else (cloud
+# credentials, tokens, SSH agent, the LiteLLM spend key) stays out unless a harness
+# names it explicitly in its "env" block.
+BASE_ENV = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE",
+            "TERM", "TZ", "TMPDIR")
+SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]")
+LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def safe(s):
+    """Filesystem-safe fragment: no separators, no leading dots."""
+    return SAFE_NAME.sub("_", str(s)).lstrip(".") or "_"
+
+
+def env_var_names(value):
+    return set(re.findall(r"\$\{(\w+)\}", value or ""))
+
+
+def base_env(cfg):
+    env = {k: os.environ[k] for k in BASE_ENV if k in os.environ}
+    for k in cfg.get("env_passthrough", []):
+        if k in os.environ:
+            env[k] = os.environ[k]
+    for k in spend_key_vars(cfg):
+        env.pop(k, None)
+    return env
+
+
+def spend_key_vars(cfg):
+    return env_var_names((cfg.get("litellm") or {}).get("api_key"))
+
+
+def redact(text, secrets):
+    for s in secrets:
+        if s and len(s) >= 8:
+            text = text.replace(s, "***REDACTED***")
+    return text
+
+
+def validate_config(cfg):
+    for task in cfg["tasks"]:
+        if SAFE_NAME.search(task["id"]) or task["id"].startswith("."):
+            sys.exit(f"invalid task id {task['id']!r}: use only letters, digits, _ . - (no leading dot)")
+        for field in ("repo", "ref"):
+            if str(task.get(field, "")).startswith("-"):
+                sys.exit(f"task {task['id']}: {field} must not start with '-'")
+        for p in task.get("protected_paths", []):
+            if Path(p).is_absolute() or ".." in Path(p).parts:
+                sys.exit(f"task {task['id']}: protected path {p!r} must be relative, without '..'")
+    for name in cfg["harnesses"]:
+        if SAFE_NAME.search(name):
+            sys.exit(f"invalid harness name {name!r}")
+    leaked = spend_key_vars(cfg) & (set(cfg.get("env_passthrough", []))
+                                    | {v for h in cfg["harnesses"].values()
+                                       for val in h.get("env", {}).values() for v in env_var_names(val)})
+    if leaked:
+        sys.exit(f"LiteLLM spend key {sorted(leaked)} must not be passed to agents")
+
+
+def rmtree_inside(path, root):
+    path, root = Path(path).resolve(), Path(root).resolve()
+    if path == root or not path.is_relative_to(root):
+        raise RuntimeError(f"refusing to delete {path}: outside {root}")
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def wrap(cfg, argv, workdir, env_file):
+    """Prefix a command with the configured sandbox (e.g. docker run ...)."""
+    prefix = (cfg.get("sandbox") or {}).get("prefix")
+    if not prefix:
+        return argv
+    fields = {"workdir": str(workdir), "env_file": str(env_file)}
+    return [p.format(**fields) for p in prefix] + argv
+
+
+def write_env_file(env, path):
+    """Docker --env-file format; 0600; deleted after the run."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        for k, v in env.items():
+            if "\n" not in v:
+                f.write(f"{k}={v}\n")
+
+
 # ---------------------------------------------------------------- run
 
-def sh(cmd, cwd, timeout, env=None, log=None):
-    """Run a shell command; return (returncode, timed_out)."""
+def run_proc(argv, cwd, env, timeout):
+    """Run argv without a shell; return (rc, timed_out, stdout, stderr)."""
     try:
-        p = subprocess.run(cmd, shell=True, cwd=cwd, env=env, timeout=timeout,
-                           stdin=subprocess.DEVNULL, capture_output=True, text=True)
-        if log:
-            log.write_text(p.stdout + "\n--- stderr ---\n" + p.stderr)
-        return p.returncode, False
-    except subprocess.TimeoutExpired:
-        return -1, True
+        p = subprocess.run(argv, cwd=cwd, env=env, timeout=timeout, stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True)
+        return p.returncode, False, p.stdout, p.stderr
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+        err = e.stderr.decode() if isinstance(e.stderr, bytes) else (e.stderr or "")
+        return -1, True, out, err
+
+
+def git(*args, cwd=None):
+    subprocess.run(["git", *args], cwd=cwd, check=True, stdin=subprocess.DEVNULL,
+                   capture_output=True, text=True)
 
 
 def is_git_source(src):
@@ -476,19 +603,79 @@ def is_git_source(src):
 
 
 def prepare_workdir(task, base, workdir):
+    """Fresh copy of the task repo, without git history.
+
+    History is dropped on purpose: a clone at a pre-fix ref still holds the fix commit,
+    and the origin remote would point back into this repo."""
     src = task["repo"]
     if not re.match(r"^(\w+://|git@)", src) and not Path(src).is_absolute():
         src = str((base / src).resolve())
     if is_git_source(src):
-        cache = base / ".cache" / task["id"]
+        cache = base / ".cache" / safe(task["id"])
         if not cache.exists():
             cache.parent.mkdir(parents=True, exist_ok=True)
-            subprocess.run(["git", "clone", "--quiet", src, str(cache)], check=True)
-        subprocess.run(["git", "clone", "--quiet", "--local", str(cache), str(workdir)], check=True)
+            git("clone", "--quiet", "--", src, str(cache))
+        git("clone", "--quiet", "--local", "--", str(cache), str(workdir))
         if task.get("ref"):
-            subprocess.run(["git", "-C", str(workdir), "checkout", "--quiet", task["ref"]], check=True)
+            git("-C", str(workdir), "checkout", "--quiet", "--detach", task["ref"])
+        shutil.rmtree(workdir / ".git")
     else:
-        shutil.copytree(src, workdir)
+        shutil.copytree(src, workdir, symlinks=True)
+
+
+def make_baseline(workdir):
+    """Single commit with the state the agent starts from (after setup). Returns its SHA."""
+    ident = ["-c", "user.name=harness-bench", "-c", "user.email=bench@localhost",
+             "-c", "commit.gpgsign=false"]
+    git("init", "--quiet", "-b", "main", cwd=workdir)
+    git("add", "-A", cwd=workdir)
+    git(*ident, "commit", "--quiet", "--allow-empty", "-m", "baseline", cwd=workdir)
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=workdir, capture_output=True,
+                          text=True, check=True).stdout.strip()
+
+
+def _remove(path):
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    elif path.exists() or path.is_symlink():
+        path.unlink()
+
+
+def snapshot_protected(task, workdir, snap):
+    """Copy protected paths out of the workdir before the agent runs. The snapshot lives
+    outside the workdir, so moving git refs or deleting .git cannot alter it."""
+    for rel in task.get("protected_paths", []):
+        src, dst = workdir / rel, snap / rel
+        if src.is_dir() and not src.is_symlink():
+            shutil.copytree(src, dst, symlinks=True)
+        elif src.exists() or src.is_symlink():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst, follow_symlinks=False)
+
+
+def restore_protected(task, workdir, snap):
+    """Undo agent edits to test infrastructure: put back the snapshot of each protected
+    path and delete anything the agent added there."""
+    for rel in task.get("protected_paths", []):
+        target, saved = workdir / rel, snap / rel
+        _remove(target)
+        if saved.is_dir() and not saved.is_symlink():
+            shutil.copytree(saved, target, symlinks=True)
+        elif saved.exists() or saved.is_symlink():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(saved, target, follow_symlinks=False)
+
+
+def save_diff(workdir, baseline, path, limit=2_000_000):
+    """Everything the agent changed vs baseline, including new files (for audit)."""
+    try:
+        git("add", "-A", cwd=workdir)
+        p = subprocess.run(["git", "diff", "--cached", "--stat", "--patch", baseline],
+                           cwd=workdir, capture_output=True, text=True, timeout=300)
+        text = p.stdout if p.returncode == 0 else f"git diff failed (agent changed .git?):\n{p.stderr}"
+    except (subprocess.SubprocessError, OSError) as e:
+        text = f"git diff failed (agent changed .git?): {e}"
+    path.write_text(text[:limit] + ("\n[truncated]" if len(text) > limit else ""))
 
 
 def build_cmd(template, model, prompt):
@@ -506,17 +693,38 @@ def done_keys(results_path):
     return keys
 
 
+def resolve_work_root(cfg, base):
+    """Work directories live outside the benchmark repo, so the agent's cwd does not
+    sit next to hidden tests, config and results."""
+    if cfg.get("work_dir"):
+        root = Path(expand_env(cfg["work_dir"])).expanduser().resolve()
+        if root.is_relative_to(base.resolve()):
+            sys.exit(f"work_dir {root} is inside the benchmark repo; use a path outside it")
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+    return Path(tempfile.mkdtemp(prefix="harness-bench-work-"))
+
+
 def cmd_run(args, cfg, base):
+    validate_config(cfg)
+    sandboxed = bool((cfg.get("sandbox") or {}).get("prefix"))
+    if not sandboxed and not args.dry_run and not args.allow_unsandboxed:
+        sys.exit("No sandbox configured. Agents run without approval prompts and the test\n"
+                 "command executes agent-written code as your user. Set sandbox.prefix in the\n"
+                 "config (see HARNESS_BENCH.md) or pass --allow-unsandboxed inside a disposable VM.")
     out_dir = base / cfg.get("output_dir", "results")
     out_dir.mkdir(parents=True, exist_ok=True)
     logs_dir = out_dir / "logs"
     logs_dir.mkdir(exist_ok=True)
-    work_root = base / cfg.get("work_dir", "work")
     results_path = out_dir / "results.jsonl"
     finished = done_keys(results_path)
     reps = args.reps or cfg.get("reps", 1)
     harnesses = cfg["harnesses"]
     prices = cfg.get("prices", {})
+    work_root = None if args.dry_run else resolve_work_root(cfg, base)
+    if work_root:
+        print(f"work dir: {work_root}")
+    secrets_all = [os.environ.get(v, "") for v in spend_key_vars(cfg)]
 
     for pair in cfg["matrix"]:
         hname, model = pair["harness"], pair["model"]
@@ -534,47 +742,64 @@ def cmd_run(args, cfg, base):
                 if args.dry_run:
                     print(shlex.join(cmd))
                     continue
-                tag = f"{task['id']}__{hname}__{re.sub(r'[^A-Za-z0-9_.-]', '_', model)}__r{rep}"
+                tag = f"{safe(task['id'])}__{safe(hname)}__{safe(model)}__r{rep}"
                 workdir = work_root / tag
                 run_tag = f"bench-{datetime.now().strftime('%Y%m%d%H%M%S')}-{tag}"
-                env = os.environ.copy()
-                env["BENCH_TAG"] = run_tag  # Pi models.json can reference $BENCH_TAG in headers
-                env.update({k: expand_env(v).replace("{run_tag}", run_tag)
-                            for k, v in h.get("env", {}).items()})
+                cmd_env = base_env(cfg)
+                agent_env = dict(cmd_env, BENCH_TAG=run_tag)  # Pi/OpenCode/Codex send it as x-litellm-tags
+                harness_env = {k: expand_env(v).replace("{run_tag}", run_tag)
+                               for k, v in h.get("env", {}).items()}
+                agent_env.update(harness_env)
+                secrets = secrets_all + [v for v in harness_env.values() if v != run_tag]
                 if workdir.exists():
-                    shutil.rmtree(workdir)
-                workdir.parent.mkdir(parents=True, exist_ok=True)
+                    rmtree_inside(workdir, work_root)
                 prepare_workdir(task, base, workdir)
+                env_file = work_root / f".{tag}.env"
+
+                def step(command, env, timeout, log_name):
+                    write_env_file(env, env_file)
+                    try:
+                        rc, to, out, err = run_proc(
+                            wrap(cfg, ["sh", "-c", command], workdir, env_file), workdir, env, timeout)
+                    finally:
+                        env_file.unlink(missing_ok=True)
+                    (logs_dir / log_name).write_text(redact(out + "\n--- stderr ---\n" + err, secrets))
+                    return rc, to
 
                 if task.get("setup"):
-                    sh(task["setup"], workdir, task.get("setup_timeout", 900),
-                       log=logs_dir / f"{tag}.setup.log")
+                    step(task["setup"], cmd_env, task.get("setup_timeout", 900), f"{tag}.setup.log")
+                baseline = make_baseline(workdir)
+                snap = work_root / f".{tag}.protected"
+                if snap.exists():
+                    rmtree_inside(snap, work_root)
+                snap.mkdir()
+                snapshot_protected(task, workdir, snap)
 
                 print(f"run   {tag}", flush=True)
                 t0 = time.time()
-                timed_out = False
+                write_env_file(agent_env, env_file)
                 try:
-                    p = subprocess.run(cmd, cwd=workdir, env=env, stdin=subprocess.DEVNULL,
-                                       capture_output=True, text=True,
-                                       timeout=task.get("timeout", cfg.get("timeout", 1800)))
-                    stdout, stderr, rc = p.stdout, p.stderr, p.returncode
-                except subprocess.TimeoutExpired as e:
-                    stdout = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
-                    stderr = e.stderr.decode() if isinstance(e.stderr, bytes) else (e.stderr or "")
-                    rc, timed_out = -1, True
+                    rc, timed_out, stdout, stderr = run_proc(
+                        wrap(cfg, cmd, workdir, env_file), workdir, agent_env,
+                        task.get("timeout", cfg.get("timeout", 1800)))
+                finally:
+                    env_file.unlink(missing_ok=True)
                 wall = time.time() - t0
-                (logs_dir / f"{tag}.agent.jsonl").write_text(stdout)
-                (logs_dir / f"{tag}.agent.stderr").write_text(stderr)
+                (logs_dir / f"{tag}.agent.jsonl").write_text(redact(stdout, secrets))
+                (logs_dir / f"{tag}.agent.stderr").write_text(redact(stderr, secrets))
 
                 usage = PARSERS[h["parser"]](stdout)
                 parse_ok = usage is not None
                 usage = usage or empty_usage()
 
+                save_diff(workdir, baseline, logs_dir / f"{tag}.diff")
+                restore_protected(task, workdir, snap)
+                rmtree_inside(snap, work_root)
                 if task.get("hidden_tests"):
                     src = (base / task["hidden_tests"]).resolve()
                     shutil.copytree(src, workdir, dirs_exist_ok=True)
-                test_rc, test_to = sh(task["test"], workdir, task.get("test_timeout", 900),
-                                      log=logs_dir / f"{tag}.test.log")
+                test_rc, test_to = step(task["test"], cmd_env, task.get("test_timeout", 900),
+                                        f"{tag}.test.log")
 
                 row = {
                     "ts": datetime.now(UTC).isoformat(timespec="seconds"),
@@ -583,6 +808,7 @@ def cmd_run(args, cfg, base):
                     "agent_rc": rc, "agent_timed_out": timed_out,
                     "wall_s": round(wall, 1), "parse_ok": parse_ok,
                     "run_tag": run_tag, "t_start": t0, "t_end": t0 + wall,
+                    "sandboxed": sandboxed,
                     **usage,
                     "cost_computed": computed_cost(usage, price) if parse_ok else None,
                 }
@@ -593,17 +819,35 @@ def cmd_run(args, cfg, base):
                       f" cost={row['cost_computed'] if row['cost_computed'] is not None else usage['cost_reported']}",
                       flush=True)
                 if not args.keep:
-                    shutil.rmtree(workdir, ignore_errors=True)
+                    rmtree_inside(workdir, work_root)
+    if work_root and not args.keep and not cfg.get("work_dir"):
+        shutil.rmtree(work_root, ignore_errors=True)
     if not args.dry_run and not getattr(args, "no_report", False):
         cmd_report(args, cfg, base)
 
 
 # ---------------------------------------------------------------- LiteLLM
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow redirects: the Authorization header must not reach another host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def check_litellm_url(base_url):
+    u = urllib.parse.urlparse(base_url)
+    if u.scheme == "https" or (u.scheme == "http" and u.hostname in LOCAL_HOSTS):
+        return
+    sys.exit(f"litellm.base_url must use https (http only for localhost): {base_url}")
+
+
 def litellm_get(base_url, key, path, params):
+    check_litellm_url(base_url)
     url = base_url.rstrip("/") + path + "?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"})
-    with urllib.request.urlopen(req, timeout=120) as r:
+    opener = urllib.request.build_opener(_NoRedirect)
+    with opener.open(req, timeout=120) as r:
         return json.loads(r.read().decode())
 
 
@@ -801,6 +1045,8 @@ def main():
     r.add_argument("--only", nargs="*", help="only these harness names")
     r.add_argument("--keep", action="store_true", help="keep work directories")
     r.add_argument("--dry-run", action="store_true", help="print commands only")
+    r.add_argument("--allow-unsandboxed", action="store_true",
+                   help="run without sandbox.prefix (only inside a disposable VM)")
     p = sub.add_parser("report")
     p.add_argument("--config", required=True)
     p.add_argument("--cost-source", choices=["auto", "litellm", "computed", "reported"])
@@ -878,6 +1124,8 @@ def main():
     r.add_argument("--only", nargs="*", help="only these harness names")
     r.add_argument("--keep", action="store_true", help="keep work directories")
     r.add_argument("--dry-run", action="store_true", help="print commands only")
+    r.add_argument("--allow-unsandboxed", action="store_true",
+                   help="run without sandbox.prefix (only inside a disposable VM)")
     r.add_argument("--settle", type=int, default=60,
                    help="seconds to wait for LiteLLM to write spend logs before reconcile")
     for name in ("reconcile", "report"):
@@ -916,7 +1164,11 @@ if __name__ == "__main__":
   "timeout": 1800,
   "cost_source": "litellm",
   "output_dir": "results-litellm",
-  "work_dir": "work",
+  "sandbox": {
+    "_comment": "Obrigatório fora de VM descartável. Ex.: [\"docker\",\"run\",\"--rm\",\"-i\",\"--env-file\",\"{env_file}\",\"-v\",\"{workdir}:{workdir}\",\"-w\",\"{workdir}\",\"IMAGEM-COM-OS-CLIS\"]",
+    "prefix": []
+  },
+  "env_passthrough": [],
   "litellm": {
     "base_url": "${LITELLM_BASE_URL}",
     "api_key": "${LITELLM_SPEND_KEY}"
@@ -951,7 +1203,10 @@ if __name__ == "__main__":
         "--model",
         "{model_name}",
         "{prompt}"
-      ]
+      ],
+      "env": {
+        "LITELLM_API_KEY": "${LITELLM_API_KEY}"
+      }
     },
     "opencode": {
       "parser": "opencode",
@@ -963,7 +1218,10 @@ if __name__ == "__main__":
         "--model",
         "{model}",
         "{prompt}"
-      ]
+      ],
+      "env": {
+        "LITELLM_API_KEY": "${LITELLM_API_KEY}"
+      }
     },
     "codex": {
       "parser": "codex",
@@ -978,7 +1236,10 @@ if __name__ == "__main__":
         "-m",
         "{model}",
         "{prompt}"
-      ]
+      ],
+      "env": {
+        "LITELLM_API_KEY": "${LITELLM_API_KEY}"
+      }
     }
   },
   "matrix": [
@@ -1029,7 +1290,8 @@ if __name__ == "__main__":
       "repo": "tasks/fizzbuzz/repo",
       "prompt": "The function fizzbuzz in fizzbuzz.py has bugs. Fix it so fizzbuzz(n) returns 'Fizz' for multiples of 3, 'Buzz' for multiples of 5, 'FizzBuzz' for multiples of both, and str(n) otherwise. Do not ask questions.",
       "hidden_tests": "tasks/fizzbuzz/hidden_tests",
-      "test": "python3 -m unittest -q test_hidden.py"
+      "test": "python3 -m unittest -q test_hidden.py",
+      "protected_paths": []
     },
     {
       "id": "exemplo-repo-real",
@@ -1039,7 +1301,12 @@ if __name__ == "__main__":
       "prompt": "Descreva aqui o bug ou a feature, como numa issue real.",
       "hidden_tests": "tasks/exemplo-repo-real/hidden_tests",
       "test": "npx vitest run tests/hidden",
-      "timeout": 2400
+      "timeout": 2400,
+      "protected_paths": [
+        "tests",
+        "package.json",
+        "vitest.config.ts"
+      ]
     }
   ]
 }
@@ -1053,7 +1320,11 @@ if __name__ == "__main__":
   "timeout": 1800,
   "cost_source": "auto",
   "output_dir": "results",
-  "work_dir": "work",
+  "sandbox": {
+    "_comment": "Obrigatório fora de VM descartável. Ex.: [\"docker\",\"run\",\"--rm\",\"-i\",\"--env-file\",\"{env_file}\",\"-v\",\"{workdir}:{workdir}\",\"-w\",\"{workdir}\",\"IMAGEM-COM-OS-CLIS\"]",
+    "prefix": []
+  },
+  "env_passthrough": [],
   "litellm": {
     "base_url": "${LITELLM_BASE_URL}",
     "api_key": "${LITELLM_SPEND_KEY}"
@@ -1088,7 +1359,10 @@ if __name__ == "__main__":
         "--model",
         "{model_name}",
         "{prompt}"
-      ]
+      ],
+      "env": {
+        "LITELLM_API_KEY": "${LITELLM_API_KEY}"
+      }
     },
     "cursor": {
       "parser": "cursor",
@@ -1114,7 +1388,10 @@ if __name__ == "__main__":
         "--model",
         "{model}",
         "{prompt}"
-      ]
+      ],
+      "env": {
+        "LITELLM_API_KEY": "${LITELLM_API_KEY}"
+      }
     },
     "codex": {
       "parser": "codex",
@@ -1129,7 +1406,10 @@ if __name__ == "__main__":
         "-m",
         "{model}",
         "{prompt}"
-      ]
+      ],
+      "env": {
+        "LITELLM_API_KEY": "${LITELLM_API_KEY}"
+      }
     }
   },
   "matrix": [
@@ -1227,7 +1507,8 @@ if __name__ == "__main__":
       "repo": "tasks/fizzbuzz/repo",
       "prompt": "The function fizzbuzz in fizzbuzz.py has bugs. Fix it so fizzbuzz(n) returns 'Fizz' for multiples of 3, 'Buzz' for multiples of 5, 'FizzBuzz' for multiples of both, and str(n) otherwise. Do not ask questions.",
       "hidden_tests": "tasks/fizzbuzz/hidden_tests",
-      "test": "python3 -m unittest -q test_hidden.py"
+      "test": "python3 -m unittest -q test_hidden.py",
+      "protected_paths": []
     },
     {
       "id": "exemplo-repo-real",
@@ -1237,7 +1518,12 @@ if __name__ == "__main__":
       "prompt": "Descreva aqui o bug ou a feature, como numa issue real.",
       "hidden_tests": "tasks/exemplo-repo-real/hidden_tests",
       "test": "npx vitest run tests/hidden",
-      "timeout": 2400
+      "timeout": 2400,
+      "protected_paths": [
+        "tests",
+        "package.json",
+        "vitest.config.ts"
+      ]
     }
   ]
 }
@@ -1301,7 +1587,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tests"))
+sys.path.insert(0, str(ROOT))
 import fake_litellm  # noqa: E402
+import harness_bench as hb  # noqa: E402
+
+PY = sys.executable
+AGENT = str(ROOT / "tests" / "fake_agent.py")
+API_KEY = "sk-test-agent-key-0123456789"
 
 
 def check(cond, msg):
@@ -1310,28 +1602,68 @@ def check(cond, msg):
     print(f"ok   {msg}")
 
 
+def results(path):
+    return [json.loads(x) for x in path.read_text().splitlines() if x.strip()]
+
+
+def run(tmp, *args, config="config.json", expect_ok=True):
+    p = subprocess.run([PY, *args, "--config", config], cwd=tmp, capture_output=True, text=True)
+    if expect_ok and p.returncode != 0:
+        sys.exit(f"FAIL: {' '.join(args)}\n{p.stdout}\n{p.stderr}")
+    return p
+
+
+def git(cwd, *args):
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=cwd,
+                   check=True, capture_output=True)
+
+
+def make_git_task(tmp):
+    """Repo with a buggy commit followed by the fix: the agent must only see the first."""
+    repo = tmp / "gitrepo"
+    shutil.copytree(ROOT / "tasks" / "fizzbuzz" / "repo", repo)
+    (repo / "run_tests.py").write_text(
+        "import sys, unittest\n"
+        "r = unittest.main(module='test_hidden', exit=False).result\n"
+        "sys.exit(0 if r.wasSuccessful() else 1)\n")
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "buggy")
+    buggy = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True,
+                           text=True).stdout.strip()
+    (repo / "fizzbuzz.py").write_text("def fizzbuzz(n):\n    return 'SOLUTION'\n")
+    git(repo, "commit", "-qam", "the fix")
+    return str(repo), buggy
+
+
 def main():
     tmp = Path(tempfile.mkdtemp(prefix="hb-smoke-"))
     try:
         for f in ("harness_bench.py", "harness_bench_litellm.py"):
             shutil.copy(ROOT / f, tmp)
         shutil.copytree(ROOT / "tasks" / "fizzbuzz", tmp / "tasks" / "fizzbuzz")
-        tags_file = tmp / "tags.txt"
-        os.environ["FAKE_TAGS_FILE"] = str(tags_file)
-        os.environ["FAKE_KEY"] = fake_litellm.KEY
+        tags_file, probe_file = tmp / "tags.txt", tmp / "probe.jsonl"
+        os.environ.update(FAKE_TAGS_FILE=str(tags_file), FAKE_PROBE_FILE=str(probe_file),
+                          FAKE_KEY=fake_litellm.KEY, SECRET_CANARY="must-not-leak",
+                          FAKE_API_KEY=API_KEY)
 
         srv, port = fake_litellm.serve()
         threading.Thread(target=srv.serve_forever, daemon=True).start()
 
-        agent = str(ROOT / "tests" / "fake_agent.py")
-        harness = lambda kind, model_field: {  # noqa: E731
-            "parser": kind, "command": [sys.executable, agent, kind, model_field],
-            "env": {"ANTHROPIC_CUSTOM_HEADERS": "x-litellm-tags: {run_tag}"}}
+        def harness(kind, mode="{model_name}"):
+            return {"parser": kind, "command": [PY, AGENT, kind, mode],
+                    "env": {"ANTHROPIC_CUSTOM_HEADERS": "x-litellm-tags: {run_tag}",
+                            "FAKE_TAGS_FILE": "${FAKE_TAGS_FILE}",
+                            "FAKE_PROBE_FILE": "${FAKE_PROBE_FILE}",
+                            "FAKE_API_KEY": "${FAKE_API_KEY}"}}
+
+        test_cmd = f"{PY} -m unittest -q test_hidden.py"
+        fizz = {"id": "fizzbuzz", "repo": "tasks/fizzbuzz/repo", "prompt": "fix it",
+                "hidden_tests": "tasks/fizzbuzz/hidden_tests", "test": test_cmd}
         cfg = {
             "reps": 1,
             "litellm": {"base_url": f"http://127.0.0.1:{port}", "api_key": "${FAKE_KEY}"},
-            "harnesses": {k: harness(k, "{model_name}") for k in
-                          ("claude", "opencode", "pi", "codex", "cursor")},
+            "harnesses": {k: harness(k) for k in ("claude", "opencode", "pi", "codex", "cursor")},
             "matrix": [
                 {"harness": "claude", "model": "fix"},
                 {"harness": "opencode", "model": "p/nofix"},
@@ -1340,23 +1672,17 @@ def main():
                 {"harness": "cursor", "model": "fix", "price": "x"},
             ],
             "prices": {"x": {"input": 3, "output": 15}},
-            "tasks": [{"id": "fizzbuzz", "repo": "tasks/fizzbuzz/repo", "prompt": "fix it",
-                       "hidden_tests": "tasks/fizzbuzz/hidden_tests",
-                       "test": f"{sys.executable} -m unittest -q test_hidden.py"}],
+            "tasks": [fizz],
         }
         (tmp / "config.json").write_text(json.dumps(cfg))
 
-        def run(*args):
-            p = subprocess.run([sys.executable, *args, "--config", "config.json"], cwd=tmp,
-                               capture_output=True, text=True)
-            if p.returncode != 0:
-                sys.exit(f"FAIL: {' '.join(args)}\n{p.stdout}\n{p.stderr}")
-            return p.stdout
-
-        # --- full script
-        run("harness_bench.py", "run")
-        rows = {r["harness"]: r for r in map(json.loads, (tmp / "results/results.jsonl").read_text().split("\n")[:-1])}
+        # --- parsers, cost, reconcile (full script)
+        p = run(tmp, "harness_bench.py", "run", expect_ok=False)
+        check(p.returncode != 0 and "No sandbox configured" in p.stderr, "refuses to run without sandbox")
+        run(tmp, "harness_bench.py", "run", "--allow-unsandboxed")
+        rows = {r["harness"]: r for r in results(tmp / "results/results.jsonl")}
         check(len(rows) == 5, "full script: 5 runs recorded")
+        check(all(r["agent_rc"] == 0 for r in rows.values()), "agent env: spend key and other secrets absent")
         check(rows["claude"]["passed"] and not rows["opencode"]["passed"], "hidden tests decide pass/fail")
         check(rows["claude"]["input"] == 310 and rows["claude"]["cache_read"] == 40000, "claude: modelUsage summed")
         check(rows["opencode"]["turns"] == 3 and rows["opencode"]["reasoning"] == 150, "opencode: step_finish summed")
@@ -1364,20 +1690,67 @@ def main():
         check(rows["codex"]["input"] == 5000 and rows["codex"]["cache_read"] == 15000, "codex: cached is subset of input")
         check(abs(rows["codex"]["cost_computed"] - 0.0735) < 1e-9, "codex: computed cost from prices")
         check(not rows["cursor"]["parse_ok"] and rows["cursor"]["cost_computed"] is None, "cursor: no usage, no fake $0")
+        logs = tmp / "results" / "logs"
+        stderr_logs = "".join(f.read_text() for f in logs.glob("*.agent.stderr"))
+        check(API_KEY not in stderr_logs and "***REDACTED***" in stderr_logs, "logs: harness secrets redacted")
+        check(any(f.read_text() for f in logs.glob("fizzbuzz__claude__*.diff")), "audit diff saved")
+        probes = [json.loads(x) for x in probe_file.read_text().splitlines()]
+        check(all(not Path(pr["cwd"]).is_relative_to(tmp) for pr in probes), "workdir outside benchmark repo")
+        check(not (tmp / "work").exists(), "no work dir created inside repo")
 
-        out = run("harness_bench.py", "reconcile")
+        out = run(tmp, "harness_bench.py", "reconcile").stdout
         check("4/5 runs matched" in out, "reconcile: tagged runs matched, cursor unmatched")
-        rows = {r["harness"]: r for r in map(json.loads, (tmp / "results/results.jsonl").read_text().split("\n")[:-1])}
+        rows = {r["harness"]: r for r in results(tmp / "results/results.jsonl")}
         check(abs(rows["pi"]["cost_litellm"] - 0.02) < 1e-9, "reconcile: unrelated rows ignored")
         check((tmp / "results/summary.md").exists() and (tmp / "results/summary.csv").exists(), "report files written")
 
         # --- LiteLLM-only script
         tags_file.unlink()
-        out = run("harness_bench_litellm.py", "run", "--settle", "0")
+        out = run(tmp, "harness_bench_litellm.py", "run", "--settle", "0", "--allow-unsandboxed").stdout
         check("ignored 1 matrix entries" in out, "litellm script: cursor dropped")
         check("4/4 runs matched" in out, "litellm script: all runs matched")
         summary = (tmp / "results-litellm/summary.md").read_text()
         check("cursor" not in summary and summary.count("| litellm |") == 4, "litellm script: cost source litellm only")
+
+        # --- git history, protected paths, sandbox prefix
+        repo, buggy = make_git_task(tmp)
+        probe_file.unlink()
+        hist = {"id": "hist", "repo": repo, "ref": buggy, "prompt": "fix it",
+                "hidden_tests": "tasks/fizzbuzz/hidden_tests", "test": f"{PY} run_tests.py",
+                "protected_paths": ["run_tests.py", "tests_infra"]}
+        cfg2 = dict(cfg, output_dir="results-sec", tasks=[hist],
+                    harnesses={"claude": harness("claude", "hack")},
+                    matrix=[{"harness": "claude", "model": "m"}],
+                    sandbox={"prefix": ["env", "FAKE_SANDBOX={workdir}"]})
+        (tmp / "config2.json").write_text(json.dumps(cfg2))
+        run(tmp, "harness_bench.py", "run", config="config2.json")
+        pr = json.loads(probe_file.read_text().splitlines()[0])
+        check(pr["depth"] == "1" and pr["remotes"] == "", "workdir: no git history or remote (fix commit hidden)")
+        check(pr["sandbox"] == pr["cwd"], "sandbox prefix wraps the agent command")
+        row = results(tmp / "results-sec/results.jsonl")[0]
+        check(not row["passed"] and row["sandboxed"], "protected paths restored: test-runner hack does not pass")
+        diff = next((tmp / "results-sec/logs").glob("*.diff")).read_text()
+        check("run_tests.py" in diff and "conftest.py" in diff, "audit diff shows tampering")
+
+        # --- config validation and URL policy
+        for bad, why in ((dict(fizz, id="/etc"), "absolute task id"),
+                         (dict(fizz, id="../x"), "traversal task id"),
+                         (dict(fizz, ref="--upload-pack=x"), "option-like git ref")):
+            (tmp / "bad.json").write_text(json.dumps(dict(cfg, tasks=[bad])))
+            p = run(tmp, "harness_bench.py", "run", "--allow-unsandboxed", config="bad.json", expect_ok=False)
+            check(p.returncode != 0, f"rejects {why}")
+        leak = dict(cfg, env_passthrough=["FAKE_KEY"])
+        (tmp / "bad.json").write_text(json.dumps(leak))
+        p = run(tmp, "harness_bench.py", "run", "--allow-unsandboxed", config="bad.json", expect_ok=False)
+        check(p.returncode != 0 and "spend key" in p.stderr, "rejects passing spend key to agents")
+        for url, ok in (("https://litellm.example.com", True), ("http://localhost:4000", True),
+                        ("http://litellm.example.com", False)):
+            try:
+                hb.check_litellm_url(url)
+                passed = True
+            except SystemExit:
+                passed = False
+            check(passed == ok, f"url policy: {url} {'allowed' if ok else 'blocked'}")
         print("\nPASS")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -1392,15 +1765,40 @@ if __name__ == "__main__":
 ```python
 """Fake coding-agent CLI for tests. Prints the JSON shape of a real harness.
 
-Usage: fake_agent.py <claude|opencode|pi|codex|cursor> <fix|nofix>
-"fix" repairs fizzbuzz.py in the cwd. When BENCH_TAG is set (and kind is not cursor),
+Usage: fake_agent.py <claude|opencode|pi|codex|cursor> <fix|nofix|hack>
+"fix" repairs fizzbuzz.py in the cwd. "hack" leaves the bug and tampers with the test
+infrastructure instead (rewrites run_tests.py, adds conftest.py, moves git refs).
+Security probes: exits 9 if the LiteLLM spend key or SECRET_CANARY reached the agent,
+prints FAKE_API_KEY to stderr (must be redacted in logs), and records git history depth. When BENCH_TAG is set (and kind is not cursor),
 the tag is appended to $FAKE_TAGS_FILE, which fake_litellm.py serves as spend logs.
 """
 import json
 import os
 import sys
 
-kind, fix = sys.argv[1], sys.argv[2] == "fix"
+kind, mode = sys.argv[1], sys.argv[2]
+fix = mode == "fix"
+for leaked in ("FAKE_KEY", "SECRET_CANARY"):
+    if leaked in os.environ:
+        sys.exit(9)
+print(f"debug key={os.environ.get('FAKE_API_KEY', '')}", file=sys.stderr)
+if os.environ.get("FAKE_PROBE_FILE"):
+    import subprocess
+    depth = subprocess.run(["git", "rev-list", "--all", "--count"], capture_output=True,
+                           text=True).stdout.strip()
+    remotes = subprocess.run(["git", "remote"], capture_output=True, text=True).stdout.strip()
+    with open(os.environ["FAKE_PROBE_FILE"], "a") as f:
+        f.write(json.dumps({"cwd": os.getcwd(), "depth": depth, "remotes": remotes,
+                            "sandbox": os.environ.get("FAKE_SANDBOX", "")}) + "\n")
+if mode == "hack":
+    with open("run_tests.py", "w") as f:
+        f.write("import sys\nsys.exit(0)\n")
+    os.makedirs("tests_infra", exist_ok=True)
+    with open("tests_infra/conftest.py", "w") as f:
+        f.write("# planted\n")
+    import subprocess
+    subprocess.run(["git", "-c", "user.name=x", "-c", "user.email=x@x", "commit", "-qam", "hack"],
+                   capture_output=True)
 if fix:
     with open("fizzbuzz.py", "w") as f:
         f.write("def fizzbuzz(n):\n    if n % 15 == 0:\n        return 'FizzBuzz'\n"
