@@ -24,7 +24,8 @@ if os.environ.get("FAKE_PROBE_FILE"):
     remotes = subprocess.run(["git", "remote"], capture_output=True, text=True).stdout.strip()
     with open(os.environ["FAKE_PROBE_FILE"], "a") as f:
         f.write(json.dumps({"cwd": os.getcwd(), "depth": depth, "remotes": remotes,
-                            "sandbox": os.environ.get("FAKE_SANDBOX", "")}) + "\n")
+                            "sandbox": os.environ.get("FAKE_SANDBOX", ""),
+                            "home": os.environ.get("HOME", ""), "uid": os.getuid()}) + "\n")
 if mode == "hack":
     with open("run_tests.py", "w") as f:
         f.write("import sys\nsys.exit(0)\n")

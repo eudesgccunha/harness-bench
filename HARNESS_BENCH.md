@@ -56,7 +56,10 @@ harness-bench/
 ├── harness_bench_litellm.py     # versão só LiteLLM (sem Cursor)
 ├── README.md / AGENTS.md
 ├── scripts/build_md.py          # gera este HARNESS_BENCH.md
+├── sandbox/Dockerfile           # imagem do sandbox com os CLIs
+├── sandbox/entrypoint.sh        # renderiza configs dos harnesses com LITELLM_BASE_URL
 ├── tests/smoke.py               # teste ponta a ponta com agentes e LiteLLM falsos
+├── tests/docker_e2e.py          # mesmo fluxo dentro do container
 ├── config.json                  # copie de config.example.json
 ├── config.litellm.json          # copie de config.litellm.example.json
 ├── pi-models.example.json       # vai para ~/.pi/agent/models.json
@@ -80,6 +83,10 @@ cp config.example.json config.json   # troque os placeholders de modelo, preço 
 
 # 0. Teste offline do próprio script (sem rede, sem CLIs reais)
 python3 tests/smoke.py
+
+# 0b. Imagem do sandbox (uma vez por máquina) e teste do container
+docker build -f sandbox/Dockerfile -t harness-bench-agents   --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
+python3 tests/docker_e2e.py
 
 # 1. Confira os comandos gerados (não gasta nada)
 python3 harness_bench.py run --config config.json --dry-run
@@ -130,7 +137,7 @@ O `{run_tag}` é trocado pela tag de cada execução. Os guias da LiteLLM diverg
 
 ### Pi
 
-Copie `pi-models.example.json` para `~/.pi/agent/models.json` ou mescle com o arquivo existente. Pi aceita `headers` por provider, e `$BENCH_TAG` é lido do ambiente.
+Com a imagem Docker, nada a fazer: o entrypoint gera `~/.pi/agent/models.json` a partir de `pi-models.example.json`. Sem Docker, copie o arquivo para `~/.pi/agent/models.json` e troque `__LITELLM_BASE_URL__` pela URL do proxy. Pi aceita `headers` por provider, e `$BENCH_TAG` é lido do ambiente.
 
 - Modelos Claude: use o provider `litellm-anthropic` (`api: anthropic-messages`). Pela API OpenAI-compatível, o prompt caching da Anthropic pode não funcionar, o que encarece e distorce a comparação.
 - Modelos GPT e Gemini: use o provider `litellm` (`openai-completions`).
@@ -140,7 +147,7 @@ Copie `pi-models.example.json` para `~/.pi/agent/models.json` ou mescle com o ar
 {
   "providers": {
     "litellm": {
-      "baseUrl": "https://SEU-LITELLM/v1",
+      "baseUrl": "__LITELLM_BASE_URL__/v1",
       "api": "openai-completions",
       "apiKey": "$LITELLM_API_KEY",
       "headers": { "x-litellm-tags": "$BENCH_TAG" },
@@ -150,7 +157,7 @@ Copie `pi-models.example.json` para `~/.pi/agent/models.json` ou mescle com o ar
       ]
     },
     "litellm-anthropic": {
-      "baseUrl": "https://SEU-LITELLM",
+      "baseUrl": "__LITELLM_BASE_URL__",
       "api": "anthropic-messages",
       "apiKey": "$LITELLM_API_KEY",
       "headers": { "x-litellm-tags": "$BENCH_TAG" },
@@ -164,7 +171,7 @@ Copie `pi-models.example.json` para `~/.pi/agent/models.json` ou mescle com o ar
 
 ### OpenCode
 
-Use `opencode.example.json` como config global ou do projeto. Os exemplos oficiais mostram `{env:VAR}` em `apiKey`. Não achei exemplo oficial com `{env:...}` dentro de `headers`. **Confirme no LiteLLM se a tag chega.** Modelo no config: `litellm/MODELO`.
+Com a imagem Docker, o entrypoint gera o config. Sem Docker, use `opencode.example.json` como config global ou do projeto, trocando `__LITELLM_BASE_URL__`. Os exemplos oficiais mostram `{env:VAR}` em `apiKey`. Não achei exemplo oficial com `{env:...}` dentro de `headers`. **Confirme no LiteLLM se a tag chega.** Modelo no config: `litellm/MODELO`.
 
 ```json
 {
@@ -174,7 +181,7 @@ Use `opencode.example.json` como config global ou do projeto. Os exemplos oficia
       "npm": "@ai-sdk/openai-compatible",
       "name": "LiteLLM",
       "options": {
-        "baseURL": "https://SEU-LITELLM/v1",
+        "baseURL": "__LITELLM_BASE_URL__/v1",
         "apiKey": "{env:LITELLM_API_KEY}",
         "headers": { "x-litellm-tags": "{env:BENCH_TAG}" }
       },
@@ -190,13 +197,13 @@ Use `opencode.example.json` como config global ou do projeto. Os exemplos oficia
 
 ### Codex CLI
 
-Adicione o trecho ao `~/.codex/config.toml`. Prefira um `CODEX_HOME` dedicado ao benchmark. `env_http_headers` mapeia header → nome da env var. **Confirme o nome dessas chaves na documentação da sua versão do Codex.** O comando usa `--full-auto` (sandbox com escrita no workspace). Se a tarefa precisar de rede (ex.: `npm ci`), deixe isso no `setup`, que roda antes do agente.
+Com a imagem Docker, o entrypoint gera o `config.toml`. Sem Docker, adicione o trecho ao `~/.codex/config.toml` (ou a um `CODEX_HOME` dedicado), trocando `__LITELLM_BASE_URL__`. `env_http_headers` mapeia header → nome da env var. **Confirme o nome dessas chaves na documentação da sua versão do Codex.** O comando usa `--dangerously-bypass-approvals-and-sandbox`: o isolamento vem do container. O sandbox interno do Codex usa recursos do kernel que costumam falhar dentro de containers sem privilégios.
 
 ```toml
-# Trecho para ~/.codex/config.toml (ou CODEX_HOME dedicado ao benchmark)
+# Trecho para ~/.codex/config.toml (troque o placeholder de base_url pela URL do proxy; a imagem Docker faz isso sozinha)
 [model_providers.litellm]
 name = "LiteLLM"
-base_url = "https://SEU-LITELLM/v1"
+base_url = "__LITELLM_BASE_URL__/v1"
 env_key = "LITELLM_API_KEY"                         # nome da env var com a chave
 wire_api = "responses"                              # use "chat" se seu LiteLLM não expõe /responses
 env_http_headers = { "x-litellm-tags" = "BENCH_TAG" }  # header <- valor da env var BENCH_TAG
@@ -245,20 +252,48 @@ O que o script faz em cada execução:
 
 O que o script **não** resolve sozinho: sem sandbox, o agente roda com o seu usuário e consegue ler qualquer arquivo seu (incluindo `~/.ssh`) e alterar os resultados. Por isso `run` exige `sandbox.prefix` ou `--allow-unsandboxed`.
 
-### `sandbox.prefix`
+### Sandbox com Docker
 
-Comando colocado na frente do agente, do `setup` e do `test`. Placeholders: `{workdir}` e `{env_file}`, um arquivo `KEY=valor` com permissão 0600, apagado logo após cada passo. Exemplo com Docker, montando só o workdir no mesmo caminho:
+`sandbox.prefix` é o comando colocado na frente do agente, do `setup` e do `test`. Placeholders: `{workdir}` e `{env_file}`. O `env_file` é um arquivo `KEY=valor` com permissão 0600, apagado logo após cada passo. `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL` e `TMPDIR` do host não entram nele: o container usa os da imagem.
 
-```json
-"sandbox": {
-  "prefix": ["docker", "run", "--rm", "-i",
-             "--env-file", "{env_file}",
-             "-v", "{workdir}:{workdir}", "-w", "{workdir}",
-             "IMAGEM-COM-OS-CLIS"]
-}
+A imagem `sandbox/Dockerfile` tem:
+- Python 3.12, Node.js 22, `git` e `tini`;
+- Claude Code, Pi, OpenCode e Codex CLI, via npm. O Pi é instalado com `--ignore-scripts`, como recomenda a documentação dele;
+- Cursor CLI, opcional, com `--build-arg INSTALL_CURSOR=true`;
+- o usuário `agent`, sem privilégios, com o mesmo UID/GID do host. Assim os arquivos do workdir continuam seus;
+- um entrypoint que gera os configs de Pi, OpenCode e Codex a partir de `LITELLM_BASE_URL`. Por isso `LITELLM_BASE_URL` está em `env_passthrough`.
+
+```bash
+docker build -f sandbox/Dockerfile -t harness-bench-agents   --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
+# versões fixas para resultados reproduzíveis:
+#   --build-arg CLAUDE_CODE_VERSION=... --build-arg PI_VERSION=...
+#   --build-arg OPENCODE_VERSION=... --build-arg CODEX_VERSION=...
 ```
 
-A imagem precisa ter os CLIs dos harnesses, `git`, `sh` e o que os testes usam. Configure a autenticação dos CLIs por variável de ambiente (LiteLLM), não por arquivos do seu HOME. Com o `HOME` da imagem, cada CLI começa com configuração limpa, o que também deixa a comparação mais justa.
+O `prefix` dos configs de exemplo monta só o workdir, no mesmo caminho, e limita o container:
+
+```json
+"prefix": ["docker", "run", "--rm", "--env-file", "{env_file}",
+           "-v", "{workdir}:{workdir}", "-w", "{workdir}",
+           "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+           "--pids-limit", "512", "--memory", "4g", "--cpus", "2",
+           "harness-bench-agents"]
+```
+
+- Os CLIs se autenticam por variável de ambiente (LiteLLM). Seu `~/.claude`, `~/.ssh` e afins não entram no container. Cada CLI começa com configuração limpa, o que também deixa a comparação mais justa.
+- O `.dockerignore` deixa fora do build context tudo que não é necessário (configs, resultados, tarefas).
+- **Rede**: o container tem saída livre para a internet, porque precisa alcançar o LiteLLM. Para restringir a saída só ao LiteLLM, use uma rede Docker com proxy de egress, ou o OpenSandbox (abaixo).
+- Valide com `python3 tests/docker_e2e.py`. O teste roda agentes falsos dentro do container e confere HOME, UID, segredos e o resultado dos testes.
+
+### Por que não OpenSandbox (por enquanto)
+
+O [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox) é uma boa opção quando o controle de rede importa: tem allowlist de egress por domínio, aplicada em DNS e rede. Mas ele não encaixa no modelo de prefixo deste script:
+
+- exige um servidor (`opensandbox-server`) e cria sandboxes por API (`osb sandbox create`, `osb command run <id>`);
+- os arquivos entram e saem por upload/download, não por bind mount (o suporte a volumes do host não foi confirmado);
+- o cliente é o SDK Python `opensandbox`, uma dependência externa, e este script usa só a biblioteca padrão.
+
+Integrar exigiria um backend próprio: criar sandbox, enviar workdir, rodar, baixar o resultado e destruir. Vale a pena se a política da empresa exigir egress restrito.
 
 ## Como escolher tarefas
 
@@ -570,12 +605,17 @@ def wrap(cfg, argv, workdir, env_file):
     return [p.format(**fields) for p in prefix] + argv
 
 
+# Host-specific values that would break a container (host PATH, home, user, temp dir).
+# The sandbox image provides its own.
+HOST_ONLY_ENV = {"PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR"}
+
+
 def write_env_file(env, path):
     """Docker --env-file format; 0600; deleted after the run."""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         for k, v in env.items():
-            if "\n" not in v:
+            if k not in HOST_ONLY_ENV and "\n" not in v:
                 f.write(f"{k}={v}\n")
 
 
@@ -1165,10 +1205,33 @@ if __name__ == "__main__":
   "cost_source": "litellm",
   "output_dir": "results-litellm",
   "sandbox": {
-    "_comment": "Obrigatório fora de VM descartável. Ex.: [\"docker\",\"run\",\"--rm\",\"-i\",\"--env-file\",\"{env_file}\",\"-v\",\"{workdir}:{workdir}\",\"-w\",\"{workdir}\",\"IMAGEM-COM-OS-CLIS\"]",
-    "prefix": []
+    "_comment": "Imagem de sandbox/Dockerfile. Sem Docker, deixe prefix vazio e use --allow-unsandboxed só em VM descartável.",
+    "prefix": [
+      "docker",
+      "run",
+      "--rm",
+      "--env-file",
+      "{env_file}",
+      "-v",
+      "{workdir}:{workdir}",
+      "-w",
+      "{workdir}",
+      "--cap-drop",
+      "ALL",
+      "--security-opt",
+      "no-new-privileges",
+      "--pids-limit",
+      "512",
+      "--memory",
+      "4g",
+      "--cpus",
+      "2",
+      "harness-bench-agents"
+    ]
   },
-  "env_passthrough": [],
+  "env_passthrough": [
+    "LITELLM_BASE_URL"
+  ],
   "litellm": {
     "base_url": "${LITELLM_BASE_URL}",
     "api_key": "${LITELLM_SPEND_KEY}"
@@ -1229,7 +1292,7 @@ if __name__ == "__main__":
         "codex",
         "exec",
         "--json",
-        "--full-auto",
+        "--dangerously-bypass-approvals-and-sandbox",
         "--skip-git-repo-check",
         "-c",
         "model_provider=litellm",
@@ -1321,10 +1384,33 @@ if __name__ == "__main__":
   "cost_source": "auto",
   "output_dir": "results",
   "sandbox": {
-    "_comment": "Obrigatório fora de VM descartável. Ex.: [\"docker\",\"run\",\"--rm\",\"-i\",\"--env-file\",\"{env_file}\",\"-v\",\"{workdir}:{workdir}\",\"-w\",\"{workdir}\",\"IMAGEM-COM-OS-CLIS\"]",
-    "prefix": []
+    "_comment": "Imagem de sandbox/Dockerfile. Sem Docker, deixe prefix vazio e use --allow-unsandboxed só em VM descartável.",
+    "prefix": [
+      "docker",
+      "run",
+      "--rm",
+      "--env-file",
+      "{env_file}",
+      "-v",
+      "{workdir}:{workdir}",
+      "-w",
+      "{workdir}",
+      "--cap-drop",
+      "ALL",
+      "--security-opt",
+      "no-new-privileges",
+      "--pids-limit",
+      "512",
+      "--memory",
+      "4g",
+      "--cpus",
+      "2",
+      "harness-bench-agents"
+    ]
   },
-  "env_passthrough": [],
+  "env_passthrough": [
+    "LITELLM_BASE_URL"
+  ],
   "litellm": {
     "base_url": "${LITELLM_BASE_URL}",
     "api_key": "${LITELLM_SPEND_KEY}"
@@ -1376,7 +1462,10 @@ if __name__ == "__main__":
         "--model",
         "{model}",
         "{prompt}"
-      ]
+      ],
+      "env": {
+        "CURSOR_API_KEY": "${CURSOR_API_KEY}"
+      }
     },
     "opencode": {
       "parser": "opencode",
@@ -1399,7 +1488,7 @@ if __name__ == "__main__":
         "codex",
         "exec",
         "--json",
-        "--full-auto",
+        "--dangerously-bypass-approvals-and-sandbox",
         "--skip-git-repo-check",
         "-c",
         "model_provider=litellm",
@@ -1789,7 +1878,8 @@ if os.environ.get("FAKE_PROBE_FILE"):
     remotes = subprocess.run(["git", "remote"], capture_output=True, text=True).stdout.strip()
     with open(os.environ["FAKE_PROBE_FILE"], "a") as f:
         f.write(json.dumps({"cwd": os.getcwd(), "depth": depth, "remotes": remotes,
-                            "sandbox": os.environ.get("FAKE_SANDBOX", "")}) + "\n")
+                            "sandbox": os.environ.get("FAKE_SANDBOX", ""),
+                            "home": os.environ.get("HOME", ""), "uid": os.getuid()}) + "\n")
 if mode == "hack":
     with open("run_tests.py", "w") as f:
         f.write("import sys\nsys.exit(0)\n")
@@ -1877,6 +1967,196 @@ def serve(port=0):
     return srv, srv.server_address[1]
 ```
 
+## Sandbox
+
+`sandbox/Dockerfile`:
+
+```dockerfile
+# Sandbox image for harness-bench: coding-agent CLIs + git + Python 3.12 + Node.js 22.
+#
+# Build (from the repo root; UID/GID must match the host user that owns the workdir):
+#   docker build -f sandbox/Dockerfile -t harness-bench-agents \
+#     --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
+#
+# Pin CLI versions for reproducible runs, e.g. --build-arg CLAUDE_CODE_VERSION=2.1.0
+FROM node:22-bookworm-slim AS node
+
+FROM python:3.12-slim-bookworm
+
+# Node.js runtime from the official image (the npm CLIs below need it).
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+ && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
+
+ARG UID=1000
+ARG GID=1000
+ARG CLAUDE_CODE_VERSION=latest
+ARG PI_VERSION=latest
+ARG OPENCODE_VERSION=latest
+ARG CODEX_VERSION=latest
+ARG INSTALL_CURSOR=false
+
+# git: workdir baseline/diff; tini: PID 1. Python 3.12 comes from the base image.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      git ca-certificates curl bash tini \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g --no-fund --no-audit \
+      "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+      "opencode-ai@${OPENCODE_VERSION}" \
+      "@openai/codex@${CODEX_VERSION}" \
+ && npm install -g --no-fund --no-audit --ignore-scripts \
+      "@earendil-works/pi-coding-agent@${PI_VERSION}" \
+ && npm cache clean --force
+
+# Unprivileged user with the host UID/GID so files written in the bind-mounted
+# workdir stay owned by the host user.
+RUN if getent passwd "${UID}" >/dev/null; then userdel -r "$(getent passwd "${UID}" | cut -d: -f1)"; fi \
+ && if ! getent group "${GID}" >/dev/null; then groupadd -g "${GID}" agent; fi \
+ && useradd -m -u "${UID}" -g "${GID}" -s /bin/bash agent
+
+# Harness config templates. entrypoint.sh renders them with LITELLM_BASE_URL at start.
+COPY pi-models.example.json      /opt/harness-bench/templates/pi-models.json
+COPY opencode.example.json       /opt/harness-bench/templates/opencode.json
+COPY codex-config.example.toml   /opt/harness-bench/templates/codex-config.toml
+COPY sandbox/entrypoint.sh       /usr/local/bin/harness-bench-entrypoint
+RUN chmod 0755 /usr/local/bin/harness-bench-entrypoint
+
+USER agent
+ENV HOME=/home/agent \
+    PATH=/home/agent/.local/bin:/usr/local/bin:/usr/bin:/bin \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# Cursor CLI is optional: the LiteLLM-only benchmark does not use it.
+RUN if [ "${INSTALL_CURSOR}" = "true" ]; then curl -fsSL https://cursor.com/install | bash; fi
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/harness-bench-entrypoint"]
+CMD ["bash"]
+```
+
+`sandbox/entrypoint.sh`:
+
+```sh
+#!/bin/sh
+# Render harness configs from templates, then run the given command.
+# Needs LITELLM_BASE_URL (proxy root, no /v1), e.g. https://litellm.example.com
+set -eu
+
+render() {  # template -> destination, replacing __LITELLM_BASE_URL__
+    mkdir -p "$(dirname "$2")"
+    sed "s#__LITELLM_BASE_URL__#${LITELLM_BASE_URL%/}#g" "$1" > "$2"
+}
+
+if [ -n "${LITELLM_BASE_URL:-}" ]; then
+    t=/opt/harness-bench/templates
+    render "$t/pi-models.json"     "$HOME/.pi/agent/models.json"
+    render "$t/opencode.json"      "$HOME/.config/opencode/opencode.json"
+    render "$t/codex-config.toml"  "${CODEX_HOME:-$HOME/.codex}/config.toml"
+fi
+
+exec "$@"
+```
+
+`.dockerignore`:
+
+```
+# Build context allowlist: configs, results and tasks never reach the Docker daemon.
+*
+!sandbox/
+!pi-models.example.json
+!opencode.example.json
+!codex-config.example.toml
+```
+
+`tests/docker_e2e.py`:
+
+```python
+#!/usr/bin/env python3
+"""End-to-end test of the Docker sandbox with fake agents (no API keys, no network calls).
+
+Needs the image: docker build -f sandbox/Dockerfile -t harness-bench-agents \\
+                   --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
+Run: python3 tests/docker_e2e.py   (exit 0 = pass)
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+IMAGE = os.environ.get("HB_IMAGE", "harness-bench-agents")
+
+
+def check(cond, msg):
+    if not cond:
+        sys.exit(f"FAIL: {msg}")
+    print(f"ok   {msg}")
+
+
+def main():
+    if subprocess.run(["docker", "image", "inspect", IMAGE], capture_output=True).returncode:
+        sys.exit(f"image {IMAGE} not found; build it first (see docstring)")
+    tmp = Path(tempfile.mkdtemp(prefix="hb-docker-"))
+    shared = tmp / "shared"  # probe/tag files written from inside the container
+    shared.mkdir()
+    try:
+        for f in ("harness_bench.py",):
+            shutil.copy(ROOT / f, tmp)
+        shutil.copytree(ROOT / "tasks" / "fizzbuzz", tmp / "tasks" / "fizzbuzz")
+        env = dict(os.environ, FAKE_TAGS_FILE=str(shared / "tags.txt"),
+                   FAKE_PROBE_FILE=str(shared / "probe.jsonl"),
+                   SECRET_CANARY="must-not-leak", FAKE_API_KEY="sk-test-agent-key-0123456789")
+        agent = str(ROOT / "tests" / "fake_agent.py")
+        prefix = ["docker", "run", "--rm", "--env-file", "{env_file}",
+                  "-v", "{workdir}:{workdir}", "-w", "{workdir}",
+                  "-v", f"{ROOT / 'tests'}:{ROOT / 'tests'}:ro",
+                  "-v", f"{shared}:{shared}",
+                  "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+                  "--pids-limit", "256", "--memory", "1g", IMAGE]
+        cfg = {
+            "reps": 1,
+            "sandbox": {"prefix": prefix},
+            "harnesses": {
+                k: {"parser": k, "command": ["python3", agent, k, mode],
+                    "env": {"FAKE_TAGS_FILE": "${FAKE_TAGS_FILE}", "FAKE_PROBE_FILE": "${FAKE_PROBE_FILE}",
+                            "FAKE_API_KEY": "${FAKE_API_KEY}"}}
+                for k, mode in (("claude", "fix"), ("pi", "nofix"))},
+            "matrix": [{"harness": "claude", "model": "m"}, {"harness": "pi", "model": "p/m"}],
+            "tasks": [{"id": "fizzbuzz", "repo": "tasks/fizzbuzz/repo", "prompt": "fix it",
+                       "hidden_tests": "tasks/fizzbuzz/hidden_tests",
+                       "test": "python3 -m unittest -q test_hidden.py"}],
+        }
+        (tmp / "config.json").write_text(json.dumps(cfg))
+        p = subprocess.run([sys.executable, "harness_bench.py", "run", "--config", "config.json"],
+                           cwd=tmp, env=env, capture_output=True, text=True)
+        if p.returncode:
+            sys.exit(f"FAIL: run\n{p.stdout}\n{p.stderr}")
+        rows = {r["harness"]: r for r in map(json.loads, (tmp / "results/results.jsonl").read_text().splitlines())}
+        check(rows["claude"]["passed"] and not rows["pi"]["passed"], "tests run inside container decide pass/fail")
+        check(all(r["sandboxed"] and r["agent_rc"] == 0 for r in rows.values()), "agents ran sandboxed, no secret leak")
+        probes = [json.loads(x) for x in (shared / "probe.jsonl").read_text().splitlines()]
+        check(all(pr["home"] == "/home/agent" for pr in probes), "container HOME, not host HOME")
+        check(all(pr["uid"] == os.getuid() for pr in probes), "container uid matches host uid")
+        check(all(pr["depth"] == "1" for pr in probes), "git baseline visible inside container")
+        logs = tmp / "results" / "logs"
+        check("sk-test-agent-key" not in "".join(f.read_text() for f in logs.glob("*.agent.stderr")),
+              "secrets redacted in logs")
+        check(not list(Path(tempfile.gettempdir()).glob("harness-bench-work-*/.*.env")), "env files removed")
+        print("\nPASS")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()
+```
+
 ## Referências
 
 - Claude Code + LiteLLM (headers e tags): https://docs.litellm.ai/docs/tutorials/claude_code_customer_tracking
@@ -1885,6 +2165,7 @@ def serve(port=0):
 - Pi JSON mode: https://cdn.jsdelivr.net/npm/@earendil-works/pi-coding-agent@0.81.1/docs/json.md
 - OpenCode + LiteLLM: https://docs.litellm.ai/docs/tutorials/opencode_integration
 - OpenCode stream JSON: https://littlebearapps.com/help/untether/opencode-stream-json-cheatsheet/
+- OpenSandbox: https://github.com/opensandbox-group/OpenSandbox
 - Codex exec JSONL: https://codex.danielvaughan.com/2026/04/08/codex-exec-jsonl-reference/
 - Cursor CLI output format: https://cursor.com/docs/cli/reference/output-format
 - Cursor CLI parameters: https://cursor.com/docs/cli/reference/parameters

@@ -5,7 +5,7 @@
       "npm": "@ai-sdk/openai-compatible",
       "name": "LiteLLM",
       "options": {
-        "baseURL": "https://SEU-LITELLM/v1",
+        "baseURL": "__LITELLM_BASE_URL__/v1",
         "apiKey": "{env:LITELLM_API_KEY}",
         "headers": { "x-litellm-tags": "{env:BENCH_TAG}" }
       },

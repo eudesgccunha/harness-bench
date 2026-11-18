@@ -8,6 +8,7 @@ Benchmark de **harness × modelo** para agentes de código. Métrica principal: 
 - `harness_bench_litellm.py`: wrapper fino sobre o motor. Remove harnesses com `parser: cursor` e força o custo LiteLLM. Lógica nova vai para o motor; o wrapper só filtra o config e encadeia comandos.
 - `HARNESS_BENCH.md`: arquivo **gerado** por `scripts/build_md.py`. Edite o gerador e regenere o arquivo.
 - `tests/`: `fake_agent.py` imita a saída JSON de cada CLI e sonda vazamentos (env, histórico git, adulteração de testes). `fake_litellm.py` imita `/spend/logs/v2`, e `smoke.py` testa tudo ponta a ponta.
+- `sandbox/`: `Dockerfile` da imagem com os CLIs e `entrypoint.sh`, que gera os configs dos harnesses a partir dos `*.example.*` com `LITELLM_BASE_URL`. `.dockerignore` é uma allowlist: arquivo novo usado no build precisa entrar nela.
 - `*.example.*`: configs de exemplo do benchmark (`config*.json`) e de cada harness apontando para o LiteLLM (Pi, OpenCode, Codex).
 
 ## Regras
@@ -39,4 +40,4 @@ Verificada contra a documentação e fontes da comunidade em nov/2026. O formato
 
 ## Pronto quando
 
-`python3 tests/smoke.py` termina com `PASS` e `python3 scripts/build_md.py` regenerou o `HARNESS_BENCH.md`.
+`python3 tests/smoke.py` termina com `PASS` e `python3 scripts/build_md.py` regenerou o `HARNESS_BENCH.md`. Se você mexeu em `sandbox/`, em `wrap()` ou no env file, reconstrua a imagem e rode `python3 tests/docker_e2e.py` até `PASS`.

@@ -1,7 +1,7 @@
 {
   "providers": {
     "litellm": {
-      "baseUrl": "https://SEU-LITELLM/v1",
+      "baseUrl": "__LITELLM_BASE_URL__/v1",
       "api": "openai-completions",
       "apiKey": "$LITELLM_API_KEY",
       "headers": { "x-litellm-tags": "$BENCH_TAG" },
@@ -11,7 +11,7 @@
       ]
     },
     "litellm-anthropic": {
-      "baseUrl": "https://SEU-LITELLM",
+      "baseUrl": "__LITELLM_BASE_URL__",
       "api": "anthropic-messages",
       "apiKey": "$LITELLM_API_KEY",
       "headers": { "x-litellm-tags": "$BENCH_TAG" },

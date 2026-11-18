@@ -4,10 +4,33 @@
   "cost_source": "auto",
   "output_dir": "results",
   "sandbox": {
-    "_comment": "Obrigatório fora de VM descartável. Ex.: [\"docker\",\"run\",\"--rm\",\"-i\",\"--env-file\",\"{env_file}\",\"-v\",\"{workdir}:{workdir}\",\"-w\",\"{workdir}\",\"IMAGEM-COM-OS-CLIS\"]",
-    "prefix": []
+    "_comment": "Imagem de sandbox/Dockerfile. Sem Docker, deixe prefix vazio e use --allow-unsandboxed só em VM descartável.",
+    "prefix": [
+      "docker",
+      "run",
+      "--rm",
+      "--env-file",
+      "{env_file}",
+      "-v",
+      "{workdir}:{workdir}",
+      "-w",
+      "{workdir}",
+      "--cap-drop",
+      "ALL",
+      "--security-opt",
+      "no-new-privileges",
+      "--pids-limit",
+      "512",
+      "--memory",
+      "4g",
+      "--cpus",
+      "2",
+      "harness-bench-agents"
+    ]
   },
-  "env_passthrough": [],
+  "env_passthrough": [
+    "LITELLM_BASE_URL"
+  ],
   "litellm": {
     "base_url": "${LITELLM_BASE_URL}",
     "api_key": "${LITELLM_SPEND_KEY}"
@@ -59,7 +82,10 @@
         "--model",
         "{model}",
         "{prompt}"
-      ]
+      ],
+      "env": {
+        "CURSOR_API_KEY": "${CURSOR_API_KEY}"
+      }
     },
     "opencode": {
       "parser": "opencode",
@@ -82,7 +108,7 @@
         "codex",
         "exec",
         "--json",
-        "--full-auto",
+        "--dangerously-bypass-approvals-and-sandbox",
         "--skip-git-repo-check",
         "-c",
         "model_provider=litellm",

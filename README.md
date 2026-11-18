@@ -31,7 +31,7 @@ python3 harness_bench_litellm.py run --config config.litellm.json
 
 O resultado fica em `results-litellm/summary.md`.
 
-Antes, configure cada harness para usar o LiteLLM e enviar a tag da execução. Os arquivos de exemplo são `pi-models.example.json`, `opencode.example.json` e `codex-config.example.toml`. Para o Claude Code, o próprio config cuida disso.
+Com a imagem Docker, os configs de Pi, OpenCode e Codex são gerados no container a partir de `LITELLM_BASE_URL`. Sem Docker, use `pi-models.example.json`, `opencode.example.json` e `codex-config.example.toml`, trocando `__LITELLM_BASE_URL__`. Para o Claude Code, o próprio config cuida disso.
 
 ## Dois scripts
 
@@ -53,6 +53,13 @@ Os agentes rodam **sem pedir aprovação** e os testes executam código escrito 
 - arquivos de teste protegidos contra adulteração;
 - diff de auditoria e logs sem segredos.
 
-O resto depende de sandbox. O `run` exige `sandbox.prefix` (ex.: `docker run ...`) ou `--allow-unsandboxed`, que só deve ser usado dentro de uma VM descartável. Detalhes na seção "Segurança" do [`HARNESS_BENCH.md`](HARNESS_BENCH.md).
+O resto depende de sandbox. O `run` exige `sandbox.prefix` ou `--allow-unsandboxed`, que só deve ser usado dentro de uma VM descartável. Os configs de exemplo já usam a imagem de `sandbox/Dockerfile`, que tem todos os CLIs:
+
+```bash
+docker build -f sandbox/Dockerfile -t harness-bench-agents \
+  --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
+python3 tests/docker_e2e.py
+```
+ Detalhes na seção "Segurança" do [`HARNESS_BENCH.md`](HARNESS_BENCH.md).
 
 O `.gitignore` já exclui configs locais, resultados e tarefas reais. Não force a inclusão desses arquivos.

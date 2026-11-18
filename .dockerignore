@@ -1,0 +1,6 @@
+# Build context allowlist: configs, results and tasks never reach the Docker daemon.
+*
+!sandbox/
+!pi-models.example.json
+!opencode.example.json
+!codex-config.example.toml

@@ -4,7 +4,7 @@ from pathlib import Path
 b=Path(__file__).resolve().parent.parent
 R=lambda f:(b/f).read_text()
 py,pyl,cfgl,cfg,pim,ocj,cdx,fz,th=map(R,['harness_bench.py','harness_bench_litellm.py','config.litellm.example.json','config.example.json','pi-models.example.json','opencode.example.json','codex-config.example.toml','tasks/fizzbuzz/repo/fizzbuzz.py','tasks/fizzbuzz/hidden_tests/test_hidden.py'])
-smoke,fagent,flite=map(R,['tests/smoke.py','tests/fake_agent.py','tests/fake_litellm.py'])
+smoke,fagent,flite,dock,entry,de2e,dign=map(R,['tests/smoke.py','tests/fake_agent.py','tests/fake_litellm.py','sandbox/Dockerfile','sandbox/entrypoint.sh','tests/docker_e2e.py','.dockerignore'])
 md=f'''# harness-bench: custo por tarefa resolvida (harness × modelo)
 
 Script para comparar pares **harness × modelo** em tarefas reais do seu código. Ele mede taxa de acerto, tokens e **custo por tarefa resolvida**.
@@ -63,7 +63,10 @@ harness-bench/
 ├── harness_bench_litellm.py     # versão só LiteLLM (sem Cursor)
 ├── README.md / AGENTS.md
 ├── scripts/build_md.py          # gera este HARNESS_BENCH.md
+├── sandbox/Dockerfile           # imagem do sandbox com os CLIs
+├── sandbox/entrypoint.sh        # renderiza configs dos harnesses com LITELLM_BASE_URL
 ├── tests/smoke.py               # teste ponta a ponta com agentes e LiteLLM falsos
+├── tests/docker_e2e.py          # mesmo fluxo dentro do container
 ├── config.json                  # copie de config.example.json
 ├── config.litellm.json          # copie de config.litellm.example.json
 ├── pi-models.example.json       # vai para ~/.pi/agent/models.json
@@ -87,6 +90,11 @@ cp config.example.json config.json   # troque os placeholders de modelo, preço 
 
 # 0. Teste offline do próprio script (sem rede, sem CLIs reais)
 python3 tests/smoke.py
+
+# 0b. Imagem do sandbox (uma vez por máquina) e teste do container
+docker build -f sandbox/Dockerfile -t harness-bench-agents \
+  --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
+python3 tests/docker_e2e.py
 
 # 1. Confira os comandos gerados (não gasta nada)
 python3 harness_bench.py run --config config.json --dry-run
@@ -137,7 +145,7 @@ O `{{run_tag}}` é trocado pela tag de cada execução. Os guias da LiteLLM dive
 
 ### Pi
 
-Copie `pi-models.example.json` para `~/.pi/agent/models.json` ou mescle com o arquivo existente. Pi aceita `headers` por provider, e `$BENCH_TAG` é lido do ambiente.
+Com a imagem Docker, nada a fazer: o entrypoint gera `~/.pi/agent/models.json` a partir de `pi-models.example.json`. Sem Docker, copie o arquivo para `~/.pi/agent/models.json` e troque `__LITELLM_BASE_URL__` pela URL do proxy. Pi aceita `headers` por provider, e `$BENCH_TAG` é lido do ambiente.
 
 - Modelos Claude: use o provider `litellm-anthropic` (`api: anthropic-messages`). Pela API OpenAI-compatível, o prompt caching da Anthropic pode não funcionar, o que encarece e distorce a comparação.
 - Modelos GPT e Gemini: use o provider `litellm` (`openai-completions`).
@@ -148,14 +156,14 @@ Copie `pi-models.example.json` para `~/.pi/agent/models.json` ou mescle com o ar
 
 ### OpenCode
 
-Use `opencode.example.json` como config global ou do projeto. Os exemplos oficiais mostram `{{env:VAR}}` em `apiKey`. Não achei exemplo oficial com `{{env:...}}` dentro de `headers`. **Confirme no LiteLLM se a tag chega.** Modelo no config: `litellm/MODELO`.
+Com a imagem Docker, o entrypoint gera o config. Sem Docker, use `opencode.example.json` como config global ou do projeto, trocando `__LITELLM_BASE_URL__`. Os exemplos oficiais mostram `{{env:VAR}}` em `apiKey`. Não achei exemplo oficial com `{{env:...}}` dentro de `headers`. **Confirme no LiteLLM se a tag chega.** Modelo no config: `litellm/MODELO`.
 
 ```json
 {ocj}```
 
 ### Codex CLI
 
-Adicione o trecho ao `~/.codex/config.toml`. Prefira um `CODEX_HOME` dedicado ao benchmark. `env_http_headers` mapeia header → nome da env var. **Confirme o nome dessas chaves na documentação da sua versão do Codex.** O comando usa `--full-auto` (sandbox com escrita no workspace). Se a tarefa precisar de rede (ex.: `npm ci`), deixe isso no `setup`, que roda antes do agente.
+Com a imagem Docker, o entrypoint gera o `config.toml`. Sem Docker, adicione o trecho ao `~/.codex/config.toml` (ou a um `CODEX_HOME` dedicado), trocando `__LITELLM_BASE_URL__`. `env_http_headers` mapeia header → nome da env var. **Confirme o nome dessas chaves na documentação da sua versão do Codex.** O comando usa `--dangerously-bypass-approvals-and-sandbox`: o isolamento vem do container. O sandbox interno do Codex usa recursos do kernel que costumam falhar dentro de containers sem privilégios.
 
 ```toml
 {cdx}```
@@ -203,20 +211,49 @@ O que o script faz em cada execução:
 
 O que o script **não** resolve sozinho: sem sandbox, o agente roda com o seu usuário e consegue ler qualquer arquivo seu (incluindo `~/.ssh`) e alterar os resultados. Por isso `run` exige `sandbox.prefix` ou `--allow-unsandboxed`.
 
-### `sandbox.prefix`
+### Sandbox com Docker
 
-Comando colocado na frente do agente, do `setup` e do `test`. Placeholders: `{{workdir}}` e `{{env_file}}`, um arquivo `KEY=valor` com permissão 0600, apagado logo após cada passo. Exemplo com Docker, montando só o workdir no mesmo caminho:
+`sandbox.prefix` é o comando colocado na frente do agente, do `setup` e do `test`. Placeholders: `{{workdir}}` e `{{env_file}}`. O `env_file` é um arquivo `KEY=valor` com permissão 0600, apagado logo após cada passo. `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL` e `TMPDIR` do host não entram nele: o container usa os da imagem.
 
-```json
-"sandbox": {{
-  "prefix": ["docker", "run", "--rm", "-i",
-             "--env-file", "{{env_file}}",
-             "-v", "{{workdir}}:{{workdir}}", "-w", "{{workdir}}",
-             "IMAGEM-COM-OS-CLIS"]
-}}
+A imagem `sandbox/Dockerfile` tem:
+- Python 3.12, Node.js 22, `git` e `tini`;
+- Claude Code, Pi, OpenCode e Codex CLI, via npm. O Pi é instalado com `--ignore-scripts`, como recomenda a documentação dele;
+- Cursor CLI, opcional, com `--build-arg INSTALL_CURSOR=true`;
+- o usuário `agent`, sem privilégios, com o mesmo UID/GID do host. Assim os arquivos do workdir continuam seus;
+- um entrypoint que gera os configs de Pi, OpenCode e Codex a partir de `LITELLM_BASE_URL`. Por isso `LITELLM_BASE_URL` está em `env_passthrough`.
+
+```bash
+docker build -f sandbox/Dockerfile -t harness-bench-agents \
+  --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
+# versões fixas para resultados reproduzíveis:
+#   --build-arg CLAUDE_CODE_VERSION=... --build-arg PI_VERSION=...
+#   --build-arg OPENCODE_VERSION=... --build-arg CODEX_VERSION=...
 ```
 
-A imagem precisa ter os CLIs dos harnesses, `git`, `sh` e o que os testes usam. Configure a autenticação dos CLIs por variável de ambiente (LiteLLM), não por arquivos do seu HOME. Com o `HOME` da imagem, cada CLI começa com configuração limpa, o que também deixa a comparação mais justa.
+O `prefix` dos configs de exemplo monta só o workdir, no mesmo caminho, e limita o container:
+
+```json
+"prefix": ["docker", "run", "--rm", "--env-file", "{{env_file}}",
+           "-v", "{{workdir}}:{{workdir}}", "-w", "{{workdir}}",
+           "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+           "--pids-limit", "512", "--memory", "4g", "--cpus", "2",
+           "harness-bench-agents"]
+```
+
+- Os CLIs se autenticam por variável de ambiente (LiteLLM). Seu `~/.claude`, `~/.ssh` e afins não entram no container. Cada CLI começa com configuração limpa, o que também deixa a comparação mais justa.
+- O `.dockerignore` deixa fora do build context tudo que não é necessário (configs, resultados, tarefas).
+- **Rede**: o container tem saída livre para a internet, porque precisa alcançar o LiteLLM. Para restringir a saída só ao LiteLLM, use uma rede Docker com proxy de egress, ou o OpenSandbox (abaixo).
+- Valide com `python3 tests/docker_e2e.py`. O teste roda agentes falsos dentro do container e confere HOME, UID, segredos e o resultado dos testes.
+
+### Por que não OpenSandbox (por enquanto)
+
+O [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox) é uma boa opção quando o controle de rede importa: tem allowlist de egress por domínio, aplicada em DNS e rede. Mas ele não encaixa no modelo de prefixo deste script:
+
+- exige um servidor (`opensandbox-server`) e cria sandboxes por API (`osb sandbox create`, `osb command run <id>`);
+- os arquivos entram e saem por upload/download, não por bind mount (o suporte a volumes do host não foi confirmado);
+- o cliente é o SDK Python `opensandbox`, uma dependência externa, e este script usa só a biblioteca padrão.
+
+Integrar exigiria um backend próprio: criar sandbox, enviar workdir, rodar, baixar o resultado e destruir. Vale a pena se a política da empresa exigir egress restrito.
 
 ## Como escolher tarefas
 
@@ -285,6 +322,28 @@ Rode `python3 tests/smoke.py`. Ele usa agentes e LiteLLM falsos para validar os 
 ```python
 {flite}```
 
+## Sandbox
+
+`sandbox/Dockerfile`:
+
+```dockerfile
+{dock}```
+
+`sandbox/entrypoint.sh`:
+
+```sh
+{entry}```
+
+`.dockerignore`:
+
+```
+{dign}```
+
+`tests/docker_e2e.py`:
+
+```python
+{de2e}```
+
 ## Referências
 
 - Claude Code + LiteLLM (headers e tags): https://docs.litellm.ai/docs/tutorials/claude_code_customer_tracking
@@ -293,6 +352,7 @@ Rode `python3 tests/smoke.py`. Ele usa agentes e LiteLLM falsos para validar os 
 - Pi JSON mode: https://cdn.jsdelivr.net/npm/@earendil-works/pi-coding-agent@0.81.1/docs/json.md
 - OpenCode + LiteLLM: https://docs.litellm.ai/docs/tutorials/opencode_integration
 - OpenCode stream JSON: https://littlebearapps.com/help/untether/opencode-stream-json-cheatsheet/
+- OpenSandbox: https://github.com/opensandbox-group/OpenSandbox
 - Codex exec JSONL: https://codex.danielvaughan.com/2026/04/08/codex-exec-jsonl-reference/
 - Cursor CLI output format: https://cursor.com/docs/cli/reference/output-format
 - Cursor CLI parameters: https://cursor.com/docs/cli/reference/parameters

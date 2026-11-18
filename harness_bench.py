@@ -289,12 +289,17 @@ def wrap(cfg, argv, workdir, env_file):
     return [p.format(**fields) for p in prefix] + argv
 
 
+# Host-specific values that would break a container (host PATH, home, user, temp dir).
+# The sandbox image provides its own.
+HOST_ONLY_ENV = {"PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR"}
+
+
 def write_env_file(env, path):
     """Docker --env-file format; 0600; deleted after the run."""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         for k, v in env.items():
-            if "\n" not in v:
+            if k not in HOST_ONLY_ENV and "\n" not in v:
                 f.write(f"{k}={v}\n")
 
 
