@@ -1,0 +1,7 @@
+# Trecho para ~/.codex/config.toml (ou CODEX_HOME dedicado ao benchmark)
+[model_providers.litellm]
+name = "LiteLLM"
+base_url = "https://SEU-LITELLM/v1"
+env_key = "LITELLM_API_KEY"                         # nome da env var com a chave
+wire_api = "responses"                              # use "chat" se seu LiteLLM não expõe /responses
+env_http_headers = { "x-litellm-tags" = "BENCH_TAG" }  # header <- valor da env var BENCH_TAG

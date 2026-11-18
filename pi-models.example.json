@@ -1,0 +1,23 @@
+{
+  "providers": {
+    "litellm": {
+      "baseUrl": "https://SEU-LITELLM/v1",
+      "api": "openai-completions",
+      "apiKey": "$LITELLM_API_KEY",
+      "headers": { "x-litellm-tags": "$BENCH_TAG" },
+      "models": [
+        { "id": "GPT_MODEL" },
+        { "id": "GEMINI_MODEL" }
+      ]
+    },
+    "litellm-anthropic": {
+      "baseUrl": "https://SEU-LITELLM",
+      "api": "anthropic-messages",
+      "apiKey": "$LITELLM_API_KEY",
+      "headers": { "x-litellm-tags": "$BENCH_TAG" },
+      "models": [
+        { "id": "CLAUDE_MODEL" }
+      ]
+    }
+  }
+}

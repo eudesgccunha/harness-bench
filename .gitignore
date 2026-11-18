@@ -1,0 +1,16 @@
+# config local (pode ter URLs e nomes internos)
+config.json
+
+# saídas: logs contêm código e respostas dos agentes
+results/
+results-litellm/
+work/
+.cache/
+
+# tarefas reais ficam fora do repo (só o exemplo fizzbuzz entra)
+tasks/*
+!tasks/fizzbuzz/
+
+__pycache__/
+.env
+config.litellm.json

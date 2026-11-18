@@ -1,0 +1,132 @@
+{
+  "reps": 3,
+  "timeout": 1800,
+  "cost_source": "litellm",
+  "output_dir": "results-litellm",
+  "work_dir": "work",
+  "litellm": {
+    "base_url": "${LITELLM_BASE_URL}",
+    "api_key": "${LITELLM_SPEND_KEY}"
+  },
+  "harnesses": {
+    "claude-code": {
+      "parser": "claude",
+      "command": [
+        "claude",
+        "-p",
+        "{prompt}",
+        "--model",
+        "{model}",
+        "--output-format",
+        "json",
+        "--dangerously-skip-permissions"
+      ],
+      "env": {
+        "ANTHROPIC_BASE_URL": "${LITELLM_BASE_URL}",
+        "ANTHROPIC_AUTH_TOKEN": "${LITELLM_API_KEY}",
+        "ANTHROPIC_CUSTOM_HEADERS": "x-litellm-tags: {run_tag}"
+      }
+    },
+    "pi": {
+      "parser": "pi",
+      "command": [
+        "pi",
+        "--mode",
+        "json",
+        "--provider",
+        "{provider}",
+        "--model",
+        "{model_name}",
+        "{prompt}"
+      ]
+    },
+    "opencode": {
+      "parser": "opencode",
+      "command": [
+        "opencode",
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "{model}",
+        "{prompt}"
+      ]
+    },
+    "codex": {
+      "parser": "codex",
+      "command": [
+        "codex",
+        "exec",
+        "--json",
+        "--full-auto",
+        "--skip-git-repo-check",
+        "-c",
+        "model_provider=litellm",
+        "-m",
+        "{model}",
+        "{prompt}"
+      ]
+    }
+  },
+  "matrix": [
+    {
+      "harness": "claude-code",
+      "model": "CLAUDE_MODEL",
+      "price": "claude"
+    },
+    {
+      "harness": "pi",
+      "model": "litellm-anthropic/CLAUDE_MODEL",
+      "price": "claude"
+    },
+    {
+      "harness": "opencode",
+      "model": "litellm/CLAUDE_MODEL",
+      "price": "claude"
+    },
+    {
+      "harness": "codex",
+      "model": "GPT_MODEL",
+      "price": "gpt"
+    },
+    {
+      "harness": "pi",
+      "model": "litellm/GPT_MODEL",
+      "price": "gpt"
+    },
+    {
+      "harness": "opencode",
+      "model": "litellm/GPT_MODEL",
+      "price": "gpt"
+    },
+    {
+      "harness": "pi",
+      "model": "litellm/GEMINI_MODEL",
+      "price": "gemini"
+    },
+    {
+      "harness": "opencode",
+      "model": "litellm/GEMINI_MODEL",
+      "price": "gemini"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "fizzbuzz",
+      "repo": "tasks/fizzbuzz/repo",
+      "prompt": "The function fizzbuzz in fizzbuzz.py has bugs. Fix it so fizzbuzz(n) returns 'Fizz' for multiples of 3, 'Buzz' for multiples of 5, 'FizzBuzz' for multiples of both, and str(n) otherwise. Do not ask questions.",
+      "hidden_tests": "tasks/fizzbuzz/hidden_tests",
+      "test": "python3 -m unittest -q test_hidden.py"
+    },
+    {
+      "id": "exemplo-repo-real",
+      "repo": "git@github.com:SUA-ORG/SEU-REPO.git",
+      "ref": "COMMIT_ANTES_DO_FIX",
+      "setup": "npm ci",
+      "prompt": "Descreva aqui o bug ou a feature, como numa issue real.",
+      "hidden_tests": "tasks/exemplo-repo-real/hidden_tests",
+      "test": "npx vitest run tests/hidden",
+      "timeout": 2400
+    }
+  ]
+}

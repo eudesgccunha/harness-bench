@@ -1,0 +1,19 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "litellm": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "LiteLLM",
+      "options": {
+        "baseURL": "https://SEU-LITELLM/v1",
+        "apiKey": "{env:LITELLM_API_KEY}",
+        "headers": { "x-litellm-tags": "{env:BENCH_TAG}" }
+      },
+      "models": {
+        "CLAUDE_MODEL": {},
+        "GPT_MODEL": {},
+        "GEMINI_MODEL": {}
+      }
+    }
+  }
+}
