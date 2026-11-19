@@ -293,7 +293,7 @@ O [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox) é uma boa op�
 - os arquivos entram e saem por upload/download, não por bind mount (o suporte a volumes do host não foi confirmado);
 - o cliente é o SDK Python `opensandbox`, uma dependência externa, e este script usa só a biblioteca padrão.
 
-Integrar exigiria um backend próprio: criar sandbox, enviar workdir, rodar, baixar o resultado e destruir. Vale a pena se a política da empresa exigir egress restrito.
+Integrar exigiria um backend próprio: criar sandbox, enviar workdir, rodar, baixar o resultado e destruir. Vale a pena quando você precisa restringir o egress dos agentes.
 
 ## Como escolher tarefas
 

@@ -1,9 +1,10 @@
-# config local (pode ter URLs e nomes internos)
-config.json
+# configs locais (podem ter URLs privadas e nomes de modelos/repos); só os exemplos entram
+config*.json
+!config*.example.json
+.env
 
 # saídas: logs contêm código e respostas dos agentes
-results/
-results-litellm/
+results*/
 work/
 .cache/
 
@@ -12,5 +13,3 @@ tasks/*
 !tasks/fizzbuzz/
 
 __pycache__/
-.env
-config.litellm.json
