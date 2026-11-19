@@ -1,14 +1,14 @@
-# configs locais (podem ter URLs privadas e nomes de modelos/repos); só os exemplos entram
+# local configs (may hold private URLs and model/repo names); only the examples are tracked
 config*.json
 !config*.example.json
 .env
 
-# saídas: logs contêm código e respostas dos agentes
+# outputs: logs contain code and agent responses
 results*/
 work/
 .cache/
 
-# tarefas reais ficam fora do repo (só o exemplo fizzbuzz entra)
+# real tasks stay out of the repo (only the fizzbuzz example is tracked)
 tasks/*
 !tasks/fizzbuzz/
 

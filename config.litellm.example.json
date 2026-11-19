@@ -4,7 +4,7 @@
   "cost_source": "litellm",
   "output_dir": "results-litellm",
   "sandbox": {
-    "_comment": "Imagem de sandbox/Dockerfile. Sem Docker, deixe prefix vazio e use --allow-unsandboxed só em VM descartável.",
+    "_comment": "Image from sandbox/Dockerfile. Without Docker, leave prefix empty and use --allow-unsandboxed only inside a disposable VM.",
     "prefix": [
       "docker",
       "run",
@@ -156,12 +156,12 @@
       "protected_paths": []
     },
     {
-      "id": "exemplo-repo-real",
-      "repo": "git@github.com:SUA-ORG/SEU-REPO.git",
-      "ref": "COMMIT_ANTES_DO_FIX",
+      "id": "example-real-repo",
+      "repo": "git@github.com:YOUR-ORG/YOUR-REPO.git",
+      "ref": "COMMIT_BEFORE_THE_FIX",
       "setup": "npm ci",
-      "prompt": "Descreva aqui o bug ou a feature, como numa issue real.",
-      "hidden_tests": "tasks/exemplo-repo-real/hidden_tests",
+      "prompt": "Describe the bug or feature here, as in a real issue.",
+      "hidden_tests": "tasks/example-real-repo/hidden_tests",
       "test": "npx vitest run tests/hidden",
       "timeout": 2400,
       "protected_paths": [

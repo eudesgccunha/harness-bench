@@ -720,11 +720,11 @@ def cmd_report(args, cfg, base):
         w.writeheader()
         w.writerows(table)
 
-    head = ("| # | Harness | Modelo | Resolvidas | Taxa | Custo/resolvida | Custo/execução "
-            "| Custo/1M tokens | Tokens/resolvida | Tokens/execução | Cache hit | Turnos | Tempo (s) "
-            "| Fonte custo |")
-    lines = [f"# Harness x modelo — {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-             "", f"Fonte de custo: `{cost_source}` (auto = litellm > computed > reported). Ordenado por custo por tarefa resolvida.", "",
+    head = ("| # | Harness | Model | Solved | Pass rate | Cost/solved | Cost/run "
+            "| Cost/1M tokens | Tokens/solved | Tokens/run | Cache hit | Turns | Time (s) "
+            "| Cost source |")
+    lines = [f"# Harness x model — {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+             "", f"Cost source: `{cost_source}` (auto = litellm > computed > reported). Sorted by cost per solved task.", "",
              head, "|" + "---|" * 14]
     for i, t in enumerate(table, 1):
         lines.append(
@@ -735,15 +735,15 @@ def cmd_report(args, cfg, base):
             f"| {t['avg_wall_s']:.0f} | {t['cost_source']} |")
     bad = [t for t in table if t["parse_failures"]]
     if bad:
-        lines += ["", "**Atenção:** sem dados de tokens do harness em: "
+        lines += ["", "**Warning:** no token data from the harness for: "
                   + ", ".join(f"{t['harness']}/{t['model']} ({t['parse_failures']})" for t in bad)
-                  + ". Veja `results/logs/*.agent.jsonl`."]
+                  + ". See `results/logs/*.agent.jsonl`."]
 
     # per-task pass matrix
     tasks = sorted({r["task"] for r in rows})
     pairs = [(t["harness"], t["model"]) for t in table]
-    lines += ["", "## Por tarefa (resolvidas/execuções)", "",
-              "| Tarefa | " + " | ".join(f"{h}<br>{m}" for h, m in pairs) + " |",
+    lines += ["", "## Per task (solved/runs)", "",
+              "| Task | " + " | ".join(f"{h}<br>{m}" for h, m in pairs) + " |",
               "|---|" + "---|" * len(pairs)]
     for task in tasks:
         cells = []

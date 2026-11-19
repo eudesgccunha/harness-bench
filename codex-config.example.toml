@@ -1,7 +1,7 @@
-# Trecho para ~/.codex/config.toml (troque o placeholder de base_url pela URL do proxy; a imagem Docker faz isso sozinha)
+# Snippet for ~/.codex/config.toml (replace the base_url placeholder with the proxy URL; the Docker image does this for you)
 [model_providers.litellm]
 name = "LiteLLM"
 base_url = "__LITELLM_BASE_URL__/v1"
-env_key = "LITELLM_API_KEY"                         # nome da env var com a chave
-wire_api = "responses"                              # use "chat" se seu LiteLLM não expõe /responses
-env_http_headers = { "x-litellm-tags" = "BENCH_TAG" }  # header <- valor da env var BENCH_TAG
+env_key = "LITELLM_API_KEY"                         # name of the env var holding the key
+wire_api = "responses"                              # use "chat" if your LiteLLM does not expose /responses
+env_http_headers = { "x-litellm-tags" = "BENCH_TAG" }  # header <- value of the BENCH_TAG env var
