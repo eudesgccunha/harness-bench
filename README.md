@@ -42,6 +42,8 @@ With the Docker image, the Pi, OpenCode and Codex configs are generated inside t
 
 ## Full documentation
 
+Guides for running a benchmark, machine setup and the roadmap: [`docs/`](docs/README.md).
+
 [`HARNESS_BENCH.md`](HARNESS_BENCH.md) covers the step-by-step setup, the config for each harness, what to check in LiteLLM, the rules for a fair comparison and the complete source code. You can rebuild the project from that file alone.
 
 ## Security
