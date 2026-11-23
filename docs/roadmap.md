@@ -82,3 +82,7 @@ A `scrub` command that removes emails, home paths, hostnames and key-shaped stri
 ## M15. Egress restriction
 
 A Docker network with an egress proxy that allows only the LiteLLM host (see "Why not OpenSandbox (yet)" in `HARNESS_BENCH.md`). It reduces the risk of a prompt injection leaking data.
+
+## M16. Skills axis
+
+Measure whether a skill or an `AGENTS.md` block changes solve rate and cost, with a no-skill control and a paired comparison. Needs M1, M3 and M11 first. Full design: [skills-axis.md](skills-axis.md).
