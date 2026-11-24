@@ -12,6 +12,7 @@ Usage:
   python3 harness_bench_litellm.py reconcile --config config.litellm.json
   python3 harness_bench_litellm.py report    --config config.litellm.json
 """
+
 import argparse
 import json
 import sys
@@ -55,10 +56,12 @@ def main():
     r.add_argument("--only", nargs="*", help="only these harness names")
     r.add_argument("--keep", action="store_true", help="keep work directories")
     r.add_argument("--dry-run", action="store_true", help="print commands only")
-    r.add_argument("--allow-unsandboxed", action="store_true",
-                   help="run without sandbox.prefix (only inside a disposable VM)")
-    r.add_argument("--settle", type=int, default=60,
-                   help="seconds to wait for LiteLLM to write spend logs before reconcile")
+    r.add_argument(
+        "--allow-unsandboxed", action="store_true", help="run without sandbox.prefix (only inside a disposable VM)"
+    )
+    r.add_argument(
+        "--settle", type=int, default=60, help="seconds to wait for LiteLLM to write spend logs before reconcile"
+    )
     for name in ("reconcile", "report"):
         s = sub.add_parser(name)
         s.add_argument("--config", required=True)

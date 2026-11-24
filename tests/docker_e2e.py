@@ -5,6 +5,7 @@ Needs the image: docker build -f sandbox/Dockerfile -t harness-bench-agents \\
                    --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
 Run: python3 tests/docker_e2e.py   (exit 0 = pass)
 """
+
 import json
 import os
 import shutil
@@ -33,32 +34,72 @@ def main():
         for f in ("harness_bench.py",):
             shutil.copy(ROOT / f, tmp)
         shutil.copytree(ROOT / "tasks" / "fizzbuzz", tmp / "tasks" / "fizzbuzz")
-        env = dict(os.environ, FAKE_TAGS_FILE=str(shared / "tags.txt"),
-                   FAKE_PROBE_FILE=str(shared / "probe.jsonl"),
-                   SECRET_CANARY="must-not-leak", FAKE_API_KEY="sk-test-agent-key-0123456789")
+        env = dict(
+            os.environ,
+            FAKE_TAGS_FILE=str(shared / "tags.txt"),
+            FAKE_PROBE_FILE=str(shared / "probe.jsonl"),
+            SECRET_CANARY="must-not-leak",
+            FAKE_API_KEY="sk-test-agent-key-0123456789",
+        )
         agent = str(ROOT / "tests" / "fake_agent.py")
-        prefix = ["docker", "run", "--rm", "--env-file", "{env_file}",
-                  "-v", "{workdir}:{workdir}", "-w", "{workdir}",
-                  "-v", f"{ROOT / 'tests'}:{ROOT / 'tests'}:ro",
-                  "-v", f"{shared}:{shared}",
-                  "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-                  "--pids-limit", "256", "--memory", "1g", IMAGE]
+        prefix = [
+            "docker",
+            "run",
+            "--rm",
+            "--env-file",
+            "{env_file}",
+            "-v",
+            "{workdir}:{workdir}",
+            "-w",
+            "{workdir}",
+            "-v",
+            f"{ROOT / 'tests'}:{ROOT / 'tests'}:ro",
+            "-v",
+            f"{shared}:{shared}",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--pids-limit",
+            "256",
+            "--memory",
+            "1g",
+            IMAGE,
+        ]
         cfg = {
             "reps": 1,
             "sandbox": {"prefix": prefix},
             "harnesses": {
-                k: {"parser": k, "command": ["python3", agent, k, mode],
-                    "env": {"FAKE_TAGS_FILE": "${FAKE_TAGS_FILE}", "FAKE_PROBE_FILE": "${FAKE_PROBE_FILE}",
-                            "FAKE_API_KEY": "${FAKE_API_KEY}"}}
-                for k, mode in (("claude", "fix"), ("pi", "nofix"))},
+                k: {
+                    "parser": k,
+                    "command": ["python3", agent, k, mode],
+                    "env": {
+                        "FAKE_TAGS_FILE": "${FAKE_TAGS_FILE}",
+                        "FAKE_PROBE_FILE": "${FAKE_PROBE_FILE}",
+                        "FAKE_API_KEY": "${FAKE_API_KEY}",
+                    },
+                }
+                for k, mode in (("claude", "fix"), ("pi", "nofix"))
+            },
             "matrix": [{"harness": "claude", "model": "m"}, {"harness": "pi", "model": "p/m"}],
-            "tasks": [{"id": "fizzbuzz", "repo": "tasks/fizzbuzz/repo", "prompt": "fix it",
-                       "hidden_tests": "tasks/fizzbuzz/hidden_tests",
-                       "test": "python3 -m unittest -q test_hidden.py"}],
+            "tasks": [
+                {
+                    "id": "fizzbuzz",
+                    "repo": "tasks/fizzbuzz/repo",
+                    "prompt": "fix it",
+                    "hidden_tests": "tasks/fizzbuzz/hidden_tests",
+                    "test": "python3 -m unittest -q test_hidden.py",
+                }
+            ],
         }
         (tmp / "config.json").write_text(json.dumps(cfg))
-        p = subprocess.run([sys.executable, "harness_bench.py", "run", "--config", "config.json"],
-                           cwd=tmp, env=env, capture_output=True, text=True)
+        p = subprocess.run(
+            [sys.executable, "harness_bench.py", "run", "--config", "config.json"],
+            cwd=tmp,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
         if p.returncode:
             sys.exit(f"FAIL: run\n{p.stdout}\n{p.stderr}")
         rows = {r["harness"]: r for r in map(json.loads, (tmp / "results/results.jsonl").read_text().splitlines())}
@@ -69,8 +110,10 @@ def main():
         check(all(pr["uid"] == os.getuid() for pr in probes), "container uid matches host uid")
         check(all(pr["depth"] == "1" for pr in probes), "git baseline visible inside container")
         logs = tmp / "results" / "logs"
-        check("sk-test-agent-key" not in "".join(f.read_text() for f in logs.glob("*.agent.stderr")),
-              "secrets redacted in logs")
+        check(
+            "sk-test-agent-key" not in "".join(f.read_text() for f in logs.glob("*.agent.stderr")),
+            "secrets redacted in logs",
+        )
         check(not list(Path(tempfile.gettempdir()).glob("harness-bench-work-*/.*.env")), "env files removed")
         print("\nPASS")
     finally:

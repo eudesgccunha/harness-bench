@@ -9,6 +9,7 @@ Usage:
   python3 harness_bench.py reconcile --config config.json   # pull real spend from LiteLLM
   python3 harness_bench.py report --config config.json
 """
+
 import argparse
 import csv
 import json
@@ -31,6 +32,7 @@ if sys.version_info < (3, 12):
 
 
 # ---------------------------------------------------------------- helpers
+
 
 def num(d, *keys):
     """First numeric value found under any of keys, else 0."""
@@ -56,8 +58,15 @@ def json_lines(text):
 
 
 def empty_usage():
-    return {"input": 0, "output": 0, "reasoning": 0, "cache_read": 0,
-            "cache_write": 0, "cost_reported": None, "turns": 0}
+    return {
+        "input": 0,
+        "output": 0,
+        "reasoning": 0,
+        "cache_read": 0,
+        "cache_write": 0,
+        "cost_reported": None,
+        "turns": 0,
+    }
 
 
 def expand_env(value):
@@ -66,6 +75,7 @@ def expand_env(value):
 
 # ---------------------------------------------------------------- parsers
 # Each parser takes the agent stdout and returns a usage dict or None.
+
 
 def parse_claude(stdout):
     """claude -p --output-format json (single result object; stream-json also works)."""
@@ -195,21 +205,29 @@ def parse_codex(stdout):
     return u
 
 
-PARSERS = {"claude": parse_claude, "opencode": parse_opencode, "pi": parse_pi,
-           "cursor": parse_cursor, "codex": parse_codex}
+PARSERS = {
+    "claude": parse_claude,
+    "opencode": parse_opencode,
+    "pi": parse_pi,
+    "cursor": parse_cursor,
+    "codex": parse_codex,
+}
 
 
 # ---------------------------------------------------------------- cost
+
 
 def computed_cost(u, price):
     """Cost from token counts and a USD per 1M tokens price entry."""
     if not price or not any(v for k, v in price.items() if not k.startswith("_")):
         return None  # missing or all-zero price entry: fall back to reported cost
     out_price = price.get("output", 0)
-    return (u["input"] * price.get("input", 0)
-            + (u["output"] + u["reasoning"]) * out_price
-            + u["cache_read"] * price.get("cache_read", price.get("input", 0))
-            + u["cache_write"] * price.get("cache_write", price.get("input", 0))) / 1e6
+    return (
+        u["input"] * price.get("input", 0)
+        + (u["output"] + u["reasoning"]) * out_price
+        + u["cache_read"] * price.get("cache_read", price.get("input", 0))
+        + u["cache_write"] * price.get("cache_write", price.get("input", 0))
+    ) / 1e6
 
 
 # ---------------------------------------------------------------- safety helpers
@@ -217,8 +235,7 @@ def computed_cost(u, price):
 # Environment the agent and the setup/test commands get. Everything else (cloud
 # credentials, tokens, SSH agent, the LiteLLM spend key) stays out unless a harness
 # names it explicitly in its "env" block.
-BASE_ENV = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE",
-            "TERM", "TZ", "TMPDIR")
+BASE_ENV = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ", "TMPDIR")
 SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]")
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
@@ -266,9 +283,10 @@ def validate_config(cfg):
     for name in cfg["harnesses"]:
         if SAFE_NAME.search(name):
             sys.exit(f"invalid harness name {name!r}")
-    leaked = spend_key_vars(cfg) & (set(cfg.get("env_passthrough", []))
-                                    | {v for h in cfg["harnesses"].values()
-                                       for val in h.get("env", {}).values() for v in env_var_names(val)})
+    leaked = spend_key_vars(cfg) & (
+        set(cfg.get("env_passthrough", []))
+        | {v for h in cfg["harnesses"].values() for val in h.get("env", {}).values() for v in env_var_names(val)}
+    )
     if leaked:
         sys.exit(f"LiteLLM spend key {sorted(leaked)} must not be passed to agents")
 
@@ -305,11 +323,13 @@ def write_env_file(env, path):
 
 # ---------------------------------------------------------------- run
 
+
 def run_proc(argv, cwd, env, timeout):
     """Run argv without a shell; return (rc, timed_out, stdout, stderr)."""
     try:
-        p = subprocess.run(argv, cwd=cwd, env=env, timeout=timeout, stdin=subprocess.DEVNULL,
-                           capture_output=True, text=True)
+        p = subprocess.run(
+            argv, cwd=cwd, env=env, timeout=timeout, stdin=subprocess.DEVNULL, capture_output=True, text=True
+        )
         return p.returncode, False, p.stdout, p.stderr
     except subprocess.TimeoutExpired as e:
         out = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
@@ -318,8 +338,7 @@ def run_proc(argv, cwd, env, timeout):
 
 
 def git(*args, cwd=None):
-    subprocess.run(["git", *args], cwd=cwd, check=True, stdin=subprocess.DEVNULL,
-                   capture_output=True, text=True)
+    subprocess.run(["git", *args], cwd=cwd, check=True, stdin=subprocess.DEVNULL, capture_output=True, text=True)
 
 
 def is_git_source(src):
@@ -349,13 +368,13 @@ def prepare_workdir(task, base, workdir):
 
 def make_baseline(workdir):
     """Single commit with the state the agent starts from (after setup). Returns its SHA."""
-    ident = ["-c", "user.name=harness-bench", "-c", "user.email=bench@localhost",
-             "-c", "commit.gpgsign=false"]
+    ident = ["-c", "user.name=harness-bench", "-c", "user.email=bench@localhost", "-c", "commit.gpgsign=false"]
     git("init", "--quiet", "-b", "main", cwd=workdir)
     git("add", "-A", cwd=workdir)
     git(*ident, "commit", "--quiet", "--allow-empty", "-m", "baseline", cwd=workdir)
-    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=workdir, capture_output=True,
-                          text=True, check=True).stdout.strip()
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=workdir, capture_output=True, text=True, check=True
+    ).stdout.strip()
 
 
 def _remove(path):
@@ -394,8 +413,13 @@ def save_diff(workdir, baseline, path, limit=2_000_000):
     """Everything the agent changed vs baseline, including new files (for audit)."""
     try:
         git("add", "-A", cwd=workdir)
-        p = subprocess.run(["git", "diff", "--cached", "--stat", "--patch", baseline],
-                           cwd=workdir, capture_output=True, text=True, timeout=300)
+        p = subprocess.run(
+            ["git", "diff", "--cached", "--stat", "--patch", baseline],
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
         text = p.stdout if p.returncode == 0 else f"git diff failed (agent changed .git?):\n{p.stderr}"
     except (subprocess.SubprocessError, OSError) as e:
         text = f"git diff failed (agent changed .git?): {e}"
@@ -404,8 +428,7 @@ def save_diff(workdir, baseline, path, limit=2_000_000):
 
 def build_cmd(template, model, prompt):
     provider, _, model_name = model.partition("/") if "/" in model else ("", "", model)
-    fields = {"model": model, "provider": provider, "model_name": model_name,
-              "prompt": prompt}
+    fields = {"model": model, "provider": provider, "model_name": model_name, "prompt": prompt}
     return [part.format(**fields) for part in template]
 
 
@@ -433,9 +456,11 @@ def cmd_run(args, cfg, base):
     validate_config(cfg)
     sandboxed = bool((cfg.get("sandbox") or {}).get("prefix"))
     if not sandboxed and not args.dry_run and not args.allow_unsandboxed:
-        sys.exit("No sandbox configured. Agents run without approval prompts and the test\n"
-                 "command executes agent-written code as your user. Set sandbox.prefix in the\n"
-                 "config (see HARNESS_BENCH.md) or pass --allow-unsandboxed inside a disposable VM.")
+        sys.exit(
+            "No sandbox configured. Agents run without approval prompts and the test\n"
+            "command executes agent-written code as your user. Set sandbox.prefix in the\n"
+            "config (see HARNESS_BENCH.md) or pass --allow-unsandboxed inside a disposable VM."
+        )
     out_dir = base / cfg.get("output_dir", "results")
     out_dir.mkdir(parents=True, exist_ok=True)
     logs_dir = out_dir / "logs"
@@ -471,8 +496,7 @@ def cmd_run(args, cfg, base):
                 run_tag = f"bench-{datetime.now().strftime('%Y%m%d%H%M%S')}-{tag}"
                 cmd_env = base_env(cfg)
                 agent_env = dict(cmd_env, BENCH_TAG=run_tag)  # Pi/OpenCode/Codex send it as x-litellm-tags
-                harness_env = {k: expand_env(v).replace("{run_tag}", run_tag)
-                               for k, v in h.get("env", {}).items()}
+                harness_env = {k: expand_env(v).replace("{run_tag}", run_tag) for k, v in h.get("env", {}).items()}
                 agent_env.update(harness_env)
                 secrets = secrets_all + [v for v in harness_env.values() if v != run_tag]
                 if workdir.exists():
@@ -484,7 +508,8 @@ def cmd_run(args, cfg, base):
                     write_env_file(env, env_file)
                     try:
                         rc, to, out, err = run_proc(
-                            wrap(cfg, ["sh", "-c", command], workdir, env_file), workdir, env, timeout)
+                            wrap(cfg, ["sh", "-c", command], workdir, env_file), workdir, env, timeout
+                        )
                     finally:
                         env_file.unlink(missing_ok=True)
                     (logs_dir / log_name).write_text(redact(out + "\n--- stderr ---\n" + err, secrets))
@@ -504,8 +529,11 @@ def cmd_run(args, cfg, base):
                 write_env_file(agent_env, env_file)
                 try:
                     rc, timed_out, stdout, stderr = run_proc(
-                        wrap(cfg, cmd, workdir, env_file), workdir, agent_env,
-                        task.get("timeout", cfg.get("timeout", 1800)))
+                        wrap(cfg, cmd, workdir, env_file),
+                        workdir,
+                        agent_env,
+                        task.get("timeout", cfg.get("timeout", 1800)),
+                    )
                 finally:
                     env_file.unlink(missing_ok=True)
                 wall = time.time() - t0
@@ -522,26 +550,34 @@ def cmd_run(args, cfg, base):
                 if task.get("hidden_tests"):
                     src = (base / task["hidden_tests"]).resolve()
                     shutil.copytree(src, workdir, dirs_exist_ok=True)
-                test_rc, test_to = step(task["test"], cmd_env, task.get("test_timeout", 900),
-                                        f"{tag}.test.log")
+                test_rc, test_to = step(task["test"], cmd_env, task.get("test_timeout", 900), f"{tag}.test.log")
 
                 row = {
                     "ts": datetime.now(UTC).isoformat(timespec="seconds"),
-                    "task": task["id"], "harness": hname, "model": model, "rep": rep,
+                    "task": task["id"],
+                    "harness": hname,
+                    "model": model,
+                    "rep": rep,
                     "passed": test_rc == 0 and not test_to,
-                    "agent_rc": rc, "agent_timed_out": timed_out,
-                    "wall_s": round(wall, 1), "parse_ok": parse_ok,
-                    "run_tag": run_tag, "t_start": t0, "t_end": t0 + wall,
+                    "agent_rc": rc,
+                    "agent_timed_out": timed_out,
+                    "wall_s": round(wall, 1),
+                    "parse_ok": parse_ok,
+                    "run_tag": run_tag,
+                    "t_start": t0,
+                    "t_end": t0 + wall,
                     "sandboxed": sandboxed,
                     **usage,
                     "cost_computed": computed_cost(usage, price) if parse_ok else None,
                 }
                 with results_path.open("a") as f:
                     f.write(json.dumps(row) + "\n")
-                print(f"done  {tag} passed={row['passed']} tokens="
-                      f"{usage['input'] + usage['output'] + usage['reasoning'] + usage['cache_read'] + usage['cache_write']}"
-                      f" cost={row['cost_computed'] if row['cost_computed'] is not None else usage['cost_reported']}",
-                      flush=True)
+                print(
+                    f"done  {tag} passed={row['passed']} tokens="
+                    f"{usage['input'] + usage['output'] + usage['reasoning'] + usage['cache_read'] + usage['cache_write']}"
+                    f" cost={row['cost_computed'] if row['cost_computed'] is not None else usage['cost_reported']}",
+                    flush=True,
+                )
                 if not args.keep:
                     rmtree_inside(workdir, work_root)
     if work_root and not args.keep and not cfg.get("work_dir"):
@@ -551,6 +587,7 @@ def cmd_run(args, cfg, base):
 
 
 # ---------------------------------------------------------------- LiteLLM
+
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Never follow redirects: the Authorization header must not reach another host."""
@@ -581,9 +618,12 @@ def litellm_rows(base_url, key, start, end):
     try:
         rows, page = [], 1
         while True:
-            data = litellm_get(base_url, key, "/spend/logs/v2", {
-                "start_date": start.strftime(fmt), "end_date": end.strftime(fmt),
-                "page": page, "page_size": 1000})
+            data = litellm_get(
+                base_url,
+                key,
+                "/spend/logs/v2",
+                {"start_date": start.strftime(fmt), "end_date": end.strftime(fmt), "page": page, "page_size": 1000},
+            )
             batch = data.get("data", []) if isinstance(data, dict) else data
             rows += batch
             total_pages = data.get("total_pages", 1) if isinstance(data, dict) else 1
@@ -592,9 +632,12 @@ def litellm_rows(base_url, key, start, end):
             page += 1
     except Exception as e:  # noqa: BLE001
         print(f"/spend/logs/v2 failed ({e}); trying legacy /spend/logs")
-    data = litellm_get(base_url, key, "/spend/logs", {
-        "start_date": start.strftime("%Y-%m-%d"),
-        "end_date": (end).strftime("%Y-%m-%d"), "summarize": "false"})
+    data = litellm_get(
+        base_url,
+        key,
+        "/spend/logs",
+        {"start_date": start.strftime("%Y-%m-%d"), "end_date": (end).strftime("%Y-%m-%d"), "summarize": "false"},
+    )
     return data.get("data", []) if isinstance(data, dict) else data
 
 
@@ -637,12 +680,15 @@ def cmd_reconcile(args, cfg, base):
     results_path.write_text("".join(json.dumps(r) + "\n" for r in runs))
     print(f"LiteLLM: {len(logs)} log rows, {matched}/{len(runs)} runs matched by tag")
     if matched < len(tagged):
-        print("Unmatched runs: harness did not send x-litellm-tags, run not via LiteLLM "
-              "(e.g. Cursor), or logs not written yet.")
+        print(
+            "Unmatched runs: harness did not send x-litellm-tags, run not via LiteLLM "
+            "(e.g. Cursor), or logs not written yet."
+        )
     cmd_report(args, cfg, base)
 
 
 # ---------------------------------------------------------------- report
+
 
 def fmt_money(v):
     if v is None:
@@ -664,8 +710,7 @@ def aggregate(rows, cost_source):
     for (h, m), rs in groups.items():
         n = len(rs)
         solved = sum(1 for r in rs if r["passed"])
-        tokens = sum(r["input"] + r["output"] + r.get("reasoning", 0)
-                     + r["cache_read"] + r["cache_write"] for r in rs)
+        tokens = sum(r["input"] + r["output"] + r.get("reasoning", 0) + r["cache_read"] + r["cache_write"] for r in rs)
         fresh_in = sum(r["input"] for r in rs)
         cache_read = sum(r["cache_read"] for r in rs)
 
@@ -682,26 +727,32 @@ def aggregate(rows, cost_source):
         costs = [c for c, _ in picked]
         cost = None if any(c is None for c in costs) else sum(costs)
         sources = sorted({src for _, src in picked if src})
-        table.append({
-            "harness": h, "model": m, "cost_source": "+".join(sources) or "n/a",
-            "runs": n, "solved": solved,
-            "pass_rate": solved / n,
-            "tokens_total": tokens,
-            "tokens_per_run": tokens / n,
-            "tokens_per_solved": tokens / solved if solved else math.inf,
-            "cache_hit": cache_read / (cache_read + fresh_in) if cache_read + fresh_in else 0,
-            "cost_total": cost,
-            "cost_per_run": cost / n if cost is not None else None,
-            "cost_per_solved": (cost / solved if solved else math.inf) if cost is not None else None,
-            "cost_per_1m_tokens": cost / tokens * 1e6 if cost is not None and tokens else None,
-            "avg_turns": sum(r["turns"] for r in rs) / n,
-            "avg_wall_s": sum(r["wall_s"] for r in rs) / n,
-            "parse_failures": sum(1 for r in rs if not r["parse_ok"]),
-        })
+        table.append(
+            {
+                "harness": h,
+                "model": m,
+                "cost_source": "+".join(sources) or "n/a",
+                "runs": n,
+                "solved": solved,
+                "pass_rate": solved / n,
+                "tokens_total": tokens,
+                "tokens_per_run": tokens / n,
+                "tokens_per_solved": tokens / solved if solved else math.inf,
+                "cache_hit": cache_read / (cache_read + fresh_in) if cache_read + fresh_in else 0,
+                "cost_total": cost,
+                "cost_per_run": cost / n if cost is not None else None,
+                "cost_per_solved": (cost / solved if solved else math.inf) if cost is not None else None,
+                "cost_per_1m_tokens": cost / tokens * 1e6 if cost is not None and tokens else None,
+                "avg_turns": sum(r["turns"] for r in rs) / n,
+                "avg_wall_s": sum(r["wall_s"] for r in rs) / n,
+                "parse_failures": sum(1 for r in rs if not r["parse_ok"]),
+            }
+        )
 
     def sort_key(t):
         c = t["cost_per_solved"]
         return (c is None, c if c is not None else 0, -t["pass_rate"])
+
     table.sort(key=sort_key)
     return table
 
@@ -720,31 +771,46 @@ def cmd_report(args, cfg, base):
         w.writeheader()
         w.writerows(table)
 
-    head = ("| # | Harness | Model | Solved | Pass rate | Cost/solved | Cost/run "
-            "| Cost/1M tokens | Tokens/solved | Tokens/run | Cache hit | Turns | Time (s) "
-            "| Cost source |")
-    lines = [f"# Harness x model — {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-             "", f"Cost source: `{cost_source}` (auto = litellm > computed > reported). Sorted by cost per solved task.", "",
-             head, "|" + "---|" * 14]
+    head = (
+        "| # | Harness | Model | Solved | Pass rate | Cost/solved | Cost/run "
+        "| Cost/1M tokens | Tokens/solved | Tokens/run | Cache hit | Turns | Time (s) "
+        "| Cost source |"
+    )
+    lines = [
+        f"# Harness x model — {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "",
+        f"Cost source: `{cost_source}` (auto = litellm > computed > reported). Sorted by cost per solved task.",
+        "",
+        head,
+        "|" + "---|" * 14,
+    ]
     for i, t in enumerate(table, 1):
         lines.append(
             f"| {i} | {t['harness']} | {t['model']} | {t['solved']}/{t['runs']} "
             f"| {t['pass_rate']:.0%} | {fmt_money(t['cost_per_solved'])} | {fmt_money(t['cost_per_run'])} "
             f"| {fmt_money(t['cost_per_1m_tokens'])} | {fmt_int(t['tokens_per_solved'])} "
             f"| {fmt_int(t['tokens_per_run'])} | {t['cache_hit']:.0%} | {t['avg_turns']:.1f} "
-            f"| {t['avg_wall_s']:.0f} | {t['cost_source']} |")
+            f"| {t['avg_wall_s']:.0f} | {t['cost_source']} |"
+        )
     bad = [t for t in table if t["parse_failures"]]
     if bad:
-        lines += ["", "**Warning:** no token data from the harness for: "
-                  + ", ".join(f"{t['harness']}/{t['model']} ({t['parse_failures']})" for t in bad)
-                  + ". See `results/logs/*.agent.jsonl`."]
+        lines += [
+            "",
+            "**Warning:** no token data from the harness for: "
+            + ", ".join(f"{t['harness']}/{t['model']} ({t['parse_failures']})" for t in bad)
+            + ". See `results/logs/*.agent.jsonl`.",
+        ]
 
     # per-task pass matrix
     tasks = sorted({r["task"] for r in rows})
     pairs = [(t["harness"], t["model"]) for t in table]
-    lines += ["", "## Per task (solved/runs)", "",
-              "| Task | " + " | ".join(f"{h}<br>{m}" for h, m in pairs) + " |",
-              "|---|" + "---|" * len(pairs)]
+    lines += [
+        "",
+        "## Per task (solved/runs)",
+        "",
+        "| Task | " + " | ".join(f"{h}<br>{m}" for h, m in pairs) + " |",
+        "|---|" + "---|" * len(pairs),
+    ]
     for task in tasks:
         cells = []
         for h, m in pairs:
@@ -760,6 +826,7 @@ def cmd_report(args, cfg, base):
 
 # ---------------------------------------------------------------- main
 
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -769,8 +836,9 @@ def main():
     r.add_argument("--only", nargs="*", help="only these harness names")
     r.add_argument("--keep", action="store_true", help="keep work directories")
     r.add_argument("--dry-run", action="store_true", help="print commands only")
-    r.add_argument("--allow-unsandboxed", action="store_true",
-                   help="run without sandbox.prefix (only inside a disposable VM)")
+    r.add_argument(
+        "--allow-unsandboxed", action="store_true", help="run without sandbox.prefix (only inside a disposable VM)"
+    )
     p = sub.add_parser("report")
     p.add_argument("--config", required=True)
     p.add_argument("--cost-source", choices=["auto", "litellm", "computed", "reported"])

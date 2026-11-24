@@ -1,5 +1,6 @@
 """Fake LiteLLM /spend/logs/v2 for tests: 2 rows of $0.01 per tag in FAKE_TAGS_FILE,
 plus one unrelated row that must be ignored."""
+
 import json
 import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -15,8 +16,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         path = os.environ["FAKE_TAGS_FILE"]
         tags = open(path).read().split() if os.path.exists(path) else []
-        rows = [{"request_tags": json.dumps([t]), "spend": 0.01,
-                 "prompt_tokens": 100, "completion_tokens": 10} for t in tags for _ in range(2)]
+        rows = [
+            {"request_tags": json.dumps([t]), "spend": 0.01, "prompt_tokens": 100, "completion_tokens": 10}
+            for t in tags
+            for _ in range(2)
+        ]
         rows.append({"request_tags": ["unrelated"], "spend": 9.0, "prompt_tokens": 1})
         body = json.dumps({"data": rows, "total_pages": 1}).encode()
         self.send_response(200)

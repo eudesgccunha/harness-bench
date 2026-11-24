@@ -327,6 +327,7 @@ Usage:
   python3 harness_bench.py reconcile --config config.json   # pull real spend from LiteLLM
   python3 harness_bench.py report --config config.json
 """
+
 import argparse
 import csv
 import json
@@ -349,6 +350,7 @@ if sys.version_info < (3, 12):
 
 
 # ---------------------------------------------------------------- helpers
+
 
 def num(d, *keys):
     """First numeric value found under any of keys, else 0."""
@@ -374,8 +376,15 @@ def json_lines(text):
 
 
 def empty_usage():
-    return {"input": 0, "output": 0, "reasoning": 0, "cache_read": 0,
-            "cache_write": 0, "cost_reported": None, "turns": 0}
+    return {
+        "input": 0,
+        "output": 0,
+        "reasoning": 0,
+        "cache_read": 0,
+        "cache_write": 0,
+        "cost_reported": None,
+        "turns": 0,
+    }
 
 
 def expand_env(value):
@@ -384,6 +393,7 @@ def expand_env(value):
 
 # ---------------------------------------------------------------- parsers
 # Each parser takes the agent stdout and returns a usage dict or None.
+
 
 def parse_claude(stdout):
     """claude -p --output-format json (single result object; stream-json also works)."""
@@ -513,21 +523,29 @@ def parse_codex(stdout):
     return u
 
 
-PARSERS = {"claude": parse_claude, "opencode": parse_opencode, "pi": parse_pi,
-           "cursor": parse_cursor, "codex": parse_codex}
+PARSERS = {
+    "claude": parse_claude,
+    "opencode": parse_opencode,
+    "pi": parse_pi,
+    "cursor": parse_cursor,
+    "codex": parse_codex,
+}
 
 
 # ---------------------------------------------------------------- cost
+
 
 def computed_cost(u, price):
     """Cost from token counts and a USD per 1M tokens price entry."""
     if not price or not any(v for k, v in price.items() if not k.startswith("_")):
         return None  # missing or all-zero price entry: fall back to reported cost
     out_price = price.get("output", 0)
-    return (u["input"] * price.get("input", 0)
-            + (u["output"] + u["reasoning"]) * out_price
-            + u["cache_read"] * price.get("cache_read", price.get("input", 0))
-            + u["cache_write"] * price.get("cache_write", price.get("input", 0))) / 1e6
+    return (
+        u["input"] * price.get("input", 0)
+        + (u["output"] + u["reasoning"]) * out_price
+        + u["cache_read"] * price.get("cache_read", price.get("input", 0))
+        + u["cache_write"] * price.get("cache_write", price.get("input", 0))
+    ) / 1e6
 
 
 # ---------------------------------------------------------------- safety helpers
@@ -535,8 +553,7 @@ def computed_cost(u, price):
 # Environment the agent and the setup/test commands get. Everything else (cloud
 # credentials, tokens, SSH agent, the LiteLLM spend key) stays out unless a harness
 # names it explicitly in its "env" block.
-BASE_ENV = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE",
-            "TERM", "TZ", "TMPDIR")
+BASE_ENV = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ", "TMPDIR")
 SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]")
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
@@ -584,9 +601,10 @@ def validate_config(cfg):
     for name in cfg["harnesses"]:
         if SAFE_NAME.search(name):
             sys.exit(f"invalid harness name {name!r}")
-    leaked = spend_key_vars(cfg) & (set(cfg.get("env_passthrough", []))
-                                    | {v for h in cfg["harnesses"].values()
-                                       for val in h.get("env", {}).values() for v in env_var_names(val)})
+    leaked = spend_key_vars(cfg) & (
+        set(cfg.get("env_passthrough", []))
+        | {v for h in cfg["harnesses"].values() for val in h.get("env", {}).values() for v in env_var_names(val)}
+    )
     if leaked:
         sys.exit(f"LiteLLM spend key {sorted(leaked)} must not be passed to agents")
 
@@ -623,11 +641,13 @@ def write_env_file(env, path):
 
 # ---------------------------------------------------------------- run
 
+
 def run_proc(argv, cwd, env, timeout):
     """Run argv without a shell; return (rc, timed_out, stdout, stderr)."""
     try:
-        p = subprocess.run(argv, cwd=cwd, env=env, timeout=timeout, stdin=subprocess.DEVNULL,
-                           capture_output=True, text=True)
+        p = subprocess.run(
+            argv, cwd=cwd, env=env, timeout=timeout, stdin=subprocess.DEVNULL, capture_output=True, text=True
+        )
         return p.returncode, False, p.stdout, p.stderr
     except subprocess.TimeoutExpired as e:
         out = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
@@ -636,8 +656,7 @@ def run_proc(argv, cwd, env, timeout):
 
 
 def git(*args, cwd=None):
-    subprocess.run(["git", *args], cwd=cwd, check=True, stdin=subprocess.DEVNULL,
-                   capture_output=True, text=True)
+    subprocess.run(["git", *args], cwd=cwd, check=True, stdin=subprocess.DEVNULL, capture_output=True, text=True)
 
 
 def is_git_source(src):
@@ -667,13 +686,13 @@ def prepare_workdir(task, base, workdir):
 
 def make_baseline(workdir):
     """Single commit with the state the agent starts from (after setup). Returns its SHA."""
-    ident = ["-c", "user.name=harness-bench", "-c", "user.email=bench@localhost",
-             "-c", "commit.gpgsign=false"]
+    ident = ["-c", "user.name=harness-bench", "-c", "user.email=bench@localhost", "-c", "commit.gpgsign=false"]
     git("init", "--quiet", "-b", "main", cwd=workdir)
     git("add", "-A", cwd=workdir)
     git(*ident, "commit", "--quiet", "--allow-empty", "-m", "baseline", cwd=workdir)
-    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=workdir, capture_output=True,
-                          text=True, check=True).stdout.strip()
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=workdir, capture_output=True, text=True, check=True
+    ).stdout.strip()
 
 
 def _remove(path):
@@ -712,8 +731,13 @@ def save_diff(workdir, baseline, path, limit=2_000_000):
     """Everything the agent changed vs baseline, including new files (for audit)."""
     try:
         git("add", "-A", cwd=workdir)
-        p = subprocess.run(["git", "diff", "--cached", "--stat", "--patch", baseline],
-                           cwd=workdir, capture_output=True, text=True, timeout=300)
+        p = subprocess.run(
+            ["git", "diff", "--cached", "--stat", "--patch", baseline],
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
         text = p.stdout if p.returncode == 0 else f"git diff failed (agent changed .git?):\n{p.stderr}"
     except (subprocess.SubprocessError, OSError) as e:
         text = f"git diff failed (agent changed .git?): {e}"
@@ -722,8 +746,7 @@ def save_diff(workdir, baseline, path, limit=2_000_000):
 
 def build_cmd(template, model, prompt):
     provider, _, model_name = model.partition("/") if "/" in model else ("", "", model)
-    fields = {"model": model, "provider": provider, "model_name": model_name,
-              "prompt": prompt}
+    fields = {"model": model, "provider": provider, "model_name": model_name, "prompt": prompt}
     return [part.format(**fields) for part in template]
 
 
@@ -751,9 +774,11 @@ def cmd_run(args, cfg, base):
     validate_config(cfg)
     sandboxed = bool((cfg.get("sandbox") or {}).get("prefix"))
     if not sandboxed and not args.dry_run and not args.allow_unsandboxed:
-        sys.exit("No sandbox configured. Agents run without approval prompts and the test\n"
-                 "command executes agent-written code as your user. Set sandbox.prefix in the\n"
-                 "config (see HARNESS_BENCH.md) or pass --allow-unsandboxed inside a disposable VM.")
+        sys.exit(
+            "No sandbox configured. Agents run without approval prompts and the test\n"
+            "command executes agent-written code as your user. Set sandbox.prefix in the\n"
+            "config (see HARNESS_BENCH.md) or pass --allow-unsandboxed inside a disposable VM."
+        )
     out_dir = base / cfg.get("output_dir", "results")
     out_dir.mkdir(parents=True, exist_ok=True)
     logs_dir = out_dir / "logs"
@@ -789,8 +814,7 @@ def cmd_run(args, cfg, base):
                 run_tag = f"bench-{datetime.now().strftime('%Y%m%d%H%M%S')}-{tag}"
                 cmd_env = base_env(cfg)
                 agent_env = dict(cmd_env, BENCH_TAG=run_tag)  # Pi/OpenCode/Codex send it as x-litellm-tags
-                harness_env = {k: expand_env(v).replace("{run_tag}", run_tag)
-                               for k, v in h.get("env", {}).items()}
+                harness_env = {k: expand_env(v).replace("{run_tag}", run_tag) for k, v in h.get("env", {}).items()}
                 agent_env.update(harness_env)
                 secrets = secrets_all + [v for v in harness_env.values() if v != run_tag]
                 if workdir.exists():
@@ -802,7 +826,8 @@ def cmd_run(args, cfg, base):
                     write_env_file(env, env_file)
                     try:
                         rc, to, out, err = run_proc(
-                            wrap(cfg, ["sh", "-c", command], workdir, env_file), workdir, env, timeout)
+                            wrap(cfg, ["sh", "-c", command], workdir, env_file), workdir, env, timeout
+                        )
                     finally:
                         env_file.unlink(missing_ok=True)
                     (logs_dir / log_name).write_text(redact(out + "\n--- stderr ---\n" + err, secrets))
@@ -822,8 +847,11 @@ def cmd_run(args, cfg, base):
                 write_env_file(agent_env, env_file)
                 try:
                     rc, timed_out, stdout, stderr = run_proc(
-                        wrap(cfg, cmd, workdir, env_file), workdir, agent_env,
-                        task.get("timeout", cfg.get("timeout", 1800)))
+                        wrap(cfg, cmd, workdir, env_file),
+                        workdir,
+                        agent_env,
+                        task.get("timeout", cfg.get("timeout", 1800)),
+                    )
                 finally:
                     env_file.unlink(missing_ok=True)
                 wall = time.time() - t0
@@ -840,26 +868,34 @@ def cmd_run(args, cfg, base):
                 if task.get("hidden_tests"):
                     src = (base / task["hidden_tests"]).resolve()
                     shutil.copytree(src, workdir, dirs_exist_ok=True)
-                test_rc, test_to = step(task["test"], cmd_env, task.get("test_timeout", 900),
-                                        f"{tag}.test.log")
+                test_rc, test_to = step(task["test"], cmd_env, task.get("test_timeout", 900), f"{tag}.test.log")
 
                 row = {
                     "ts": datetime.now(UTC).isoformat(timespec="seconds"),
-                    "task": task["id"], "harness": hname, "model": model, "rep": rep,
+                    "task": task["id"],
+                    "harness": hname,
+                    "model": model,
+                    "rep": rep,
                     "passed": test_rc == 0 and not test_to,
-                    "agent_rc": rc, "agent_timed_out": timed_out,
-                    "wall_s": round(wall, 1), "parse_ok": parse_ok,
-                    "run_tag": run_tag, "t_start": t0, "t_end": t0 + wall,
+                    "agent_rc": rc,
+                    "agent_timed_out": timed_out,
+                    "wall_s": round(wall, 1),
+                    "parse_ok": parse_ok,
+                    "run_tag": run_tag,
+                    "t_start": t0,
+                    "t_end": t0 + wall,
                     "sandboxed": sandboxed,
                     **usage,
                     "cost_computed": computed_cost(usage, price) if parse_ok else None,
                 }
                 with results_path.open("a") as f:
                     f.write(json.dumps(row) + "\n")
-                print(f"done  {tag} passed={row['passed']} tokens="
-                      f"{usage['input'] + usage['output'] + usage['reasoning'] + usage['cache_read'] + usage['cache_write']}"
-                      f" cost={row['cost_computed'] if row['cost_computed'] is not None else usage['cost_reported']}",
-                      flush=True)
+                print(
+                    f"done  {tag} passed={row['passed']} tokens="
+                    f"{usage['input'] + usage['output'] + usage['reasoning'] + usage['cache_read'] + usage['cache_write']}"
+                    f" cost={row['cost_computed'] if row['cost_computed'] is not None else usage['cost_reported']}",
+                    flush=True,
+                )
                 if not args.keep:
                     rmtree_inside(workdir, work_root)
     if work_root and not args.keep and not cfg.get("work_dir"):
@@ -869,6 +905,7 @@ def cmd_run(args, cfg, base):
 
 
 # ---------------------------------------------------------------- LiteLLM
+
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Never follow redirects: the Authorization header must not reach another host."""
@@ -899,9 +936,12 @@ def litellm_rows(base_url, key, start, end):
     try:
         rows, page = [], 1
         while True:
-            data = litellm_get(base_url, key, "/spend/logs/v2", {
-                "start_date": start.strftime(fmt), "end_date": end.strftime(fmt),
-                "page": page, "page_size": 1000})
+            data = litellm_get(
+                base_url,
+                key,
+                "/spend/logs/v2",
+                {"start_date": start.strftime(fmt), "end_date": end.strftime(fmt), "page": page, "page_size": 1000},
+            )
             batch = data.get("data", []) if isinstance(data, dict) else data
             rows += batch
             total_pages = data.get("total_pages", 1) if isinstance(data, dict) else 1
@@ -910,9 +950,12 @@ def litellm_rows(base_url, key, start, end):
             page += 1
     except Exception as e:  # noqa: BLE001
         print(f"/spend/logs/v2 failed ({e}); trying legacy /spend/logs")
-    data = litellm_get(base_url, key, "/spend/logs", {
-        "start_date": start.strftime("%Y-%m-%d"),
-        "end_date": (end).strftime("%Y-%m-%d"), "summarize": "false"})
+    data = litellm_get(
+        base_url,
+        key,
+        "/spend/logs",
+        {"start_date": start.strftime("%Y-%m-%d"), "end_date": (end).strftime("%Y-%m-%d"), "summarize": "false"},
+    )
     return data.get("data", []) if isinstance(data, dict) else data
 
 
@@ -955,12 +998,15 @@ def cmd_reconcile(args, cfg, base):
     results_path.write_text("".join(json.dumps(r) + "\n" for r in runs))
     print(f"LiteLLM: {len(logs)} log rows, {matched}/{len(runs)} runs matched by tag")
     if matched < len(tagged):
-        print("Unmatched runs: harness did not send x-litellm-tags, run not via LiteLLM "
-              "(e.g. Cursor), or logs not written yet.")
+        print(
+            "Unmatched runs: harness did not send x-litellm-tags, run not via LiteLLM "
+            "(e.g. Cursor), or logs not written yet."
+        )
     cmd_report(args, cfg, base)
 
 
 # ---------------------------------------------------------------- report
+
 
 def fmt_money(v):
     if v is None:
@@ -982,8 +1028,7 @@ def aggregate(rows, cost_source):
     for (h, m), rs in groups.items():
         n = len(rs)
         solved = sum(1 for r in rs if r["passed"])
-        tokens = sum(r["input"] + r["output"] + r.get("reasoning", 0)
-                     + r["cache_read"] + r["cache_write"] for r in rs)
+        tokens = sum(r["input"] + r["output"] + r.get("reasoning", 0) + r["cache_read"] + r["cache_write"] for r in rs)
         fresh_in = sum(r["input"] for r in rs)
         cache_read = sum(r["cache_read"] for r in rs)
 
@@ -1000,26 +1045,32 @@ def aggregate(rows, cost_source):
         costs = [c for c, _ in picked]
         cost = None if any(c is None for c in costs) else sum(costs)
         sources = sorted({src for _, src in picked if src})
-        table.append({
-            "harness": h, "model": m, "cost_source": "+".join(sources) or "n/a",
-            "runs": n, "solved": solved,
-            "pass_rate": solved / n,
-            "tokens_total": tokens,
-            "tokens_per_run": tokens / n,
-            "tokens_per_solved": tokens / solved if solved else math.inf,
-            "cache_hit": cache_read / (cache_read + fresh_in) if cache_read + fresh_in else 0,
-            "cost_total": cost,
-            "cost_per_run": cost / n if cost is not None else None,
-            "cost_per_solved": (cost / solved if solved else math.inf) if cost is not None else None,
-            "cost_per_1m_tokens": cost / tokens * 1e6 if cost is not None and tokens else None,
-            "avg_turns": sum(r["turns"] for r in rs) / n,
-            "avg_wall_s": sum(r["wall_s"] for r in rs) / n,
-            "parse_failures": sum(1 for r in rs if not r["parse_ok"]),
-        })
+        table.append(
+            {
+                "harness": h,
+                "model": m,
+                "cost_source": "+".join(sources) or "n/a",
+                "runs": n,
+                "solved": solved,
+                "pass_rate": solved / n,
+                "tokens_total": tokens,
+                "tokens_per_run": tokens / n,
+                "tokens_per_solved": tokens / solved if solved else math.inf,
+                "cache_hit": cache_read / (cache_read + fresh_in) if cache_read + fresh_in else 0,
+                "cost_total": cost,
+                "cost_per_run": cost / n if cost is not None else None,
+                "cost_per_solved": (cost / solved if solved else math.inf) if cost is not None else None,
+                "cost_per_1m_tokens": cost / tokens * 1e6 if cost is not None and tokens else None,
+                "avg_turns": sum(r["turns"] for r in rs) / n,
+                "avg_wall_s": sum(r["wall_s"] for r in rs) / n,
+                "parse_failures": sum(1 for r in rs if not r["parse_ok"]),
+            }
+        )
 
     def sort_key(t):
         c = t["cost_per_solved"]
         return (c is None, c if c is not None else 0, -t["pass_rate"])
+
     table.sort(key=sort_key)
     return table
 
@@ -1038,31 +1089,46 @@ def cmd_report(args, cfg, base):
         w.writeheader()
         w.writerows(table)
 
-    head = ("| # | Harness | Model | Solved | Pass rate | Cost/solved | Cost/run "
-            "| Cost/1M tokens | Tokens/solved | Tokens/run | Cache hit | Turns | Time (s) "
-            "| Cost source |")
-    lines = [f"# Harness x model — {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-             "", f"Cost source: `{cost_source}` (auto = litellm > computed > reported). Sorted by cost per solved task.", "",
-             head, "|" + "---|" * 14]
+    head = (
+        "| # | Harness | Model | Solved | Pass rate | Cost/solved | Cost/run "
+        "| Cost/1M tokens | Tokens/solved | Tokens/run | Cache hit | Turns | Time (s) "
+        "| Cost source |"
+    )
+    lines = [
+        f"# Harness x model — {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "",
+        f"Cost source: `{cost_source}` (auto = litellm > computed > reported). Sorted by cost per solved task.",
+        "",
+        head,
+        "|" + "---|" * 14,
+    ]
     for i, t in enumerate(table, 1):
         lines.append(
             f"| {i} | {t['harness']} | {t['model']} | {t['solved']}/{t['runs']} "
             f"| {t['pass_rate']:.0%} | {fmt_money(t['cost_per_solved'])} | {fmt_money(t['cost_per_run'])} "
             f"| {fmt_money(t['cost_per_1m_tokens'])} | {fmt_int(t['tokens_per_solved'])} "
             f"| {fmt_int(t['tokens_per_run'])} | {t['cache_hit']:.0%} | {t['avg_turns']:.1f} "
-            f"| {t['avg_wall_s']:.0f} | {t['cost_source']} |")
+            f"| {t['avg_wall_s']:.0f} | {t['cost_source']} |"
+        )
     bad = [t for t in table if t["parse_failures"]]
     if bad:
-        lines += ["", "**Warning:** no token data from the harness for: "
-                  + ", ".join(f"{t['harness']}/{t['model']} ({t['parse_failures']})" for t in bad)
-                  + ". See `results/logs/*.agent.jsonl`."]
+        lines += [
+            "",
+            "**Warning:** no token data from the harness for: "
+            + ", ".join(f"{t['harness']}/{t['model']} ({t['parse_failures']})" for t in bad)
+            + ". See `results/logs/*.agent.jsonl`.",
+        ]
 
     # per-task pass matrix
     tasks = sorted({r["task"] for r in rows})
     pairs = [(t["harness"], t["model"]) for t in table]
-    lines += ["", "## Per task (solved/runs)", "",
-              "| Task | " + " | ".join(f"{h}<br>{m}" for h, m in pairs) + " |",
-              "|---|" + "---|" * len(pairs)]
+    lines += [
+        "",
+        "## Per task (solved/runs)",
+        "",
+        "| Task | " + " | ".join(f"{h}<br>{m}" for h, m in pairs) + " |",
+        "|---|" + "---|" * len(pairs),
+    ]
     for task in tasks:
         cells = []
         for h, m in pairs:
@@ -1078,6 +1144,7 @@ def cmd_report(args, cfg, base):
 
 # ---------------------------------------------------------------- main
 
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1087,8 +1154,9 @@ def main():
     r.add_argument("--only", nargs="*", help="only these harness names")
     r.add_argument("--keep", action="store_true", help="keep work directories")
     r.add_argument("--dry-run", action="store_true", help="print commands only")
-    r.add_argument("--allow-unsandboxed", action="store_true",
-                   help="run without sandbox.prefix (only inside a disposable VM)")
+    r.add_argument(
+        "--allow-unsandboxed", action="store_true", help="run without sandbox.prefix (only inside a disposable VM)"
+    )
     p = sub.add_parser("report")
     p.add_argument("--config", required=True)
     p.add_argument("--cost-source", choices=["auto", "litellm", "computed", "reported"])
@@ -1123,6 +1191,7 @@ Usage:
   python3 harness_bench_litellm.py reconcile --config config.litellm.json
   python3 harness_bench_litellm.py report    --config config.litellm.json
 """
+
 import argparse
 import json
 import sys
@@ -1166,10 +1235,12 @@ def main():
     r.add_argument("--only", nargs="*", help="only these harness names")
     r.add_argument("--keep", action="store_true", help="keep work directories")
     r.add_argument("--dry-run", action="store_true", help="print commands only")
-    r.add_argument("--allow-unsandboxed", action="store_true",
-                   help="run without sandbox.prefix (only inside a disposable VM)")
-    r.add_argument("--settle", type=int, default=60,
-                   help="seconds to wait for LiteLLM to write spend logs before reconcile")
+    r.add_argument(
+        "--allow-unsandboxed", action="store_true", help="run without sandbox.prefix (only inside a disposable VM)"
+    )
+    r.add_argument(
+        "--settle", type=int, default=60, help="seconds to wait for LiteLLM to write spend logs before reconcile"
+    )
     for name in ("reconcile", "report"):
         s = sub.add_parser(name)
         s.add_argument("--config", required=True)
@@ -1667,6 +1738,7 @@ Run `python3 tests/smoke.py`. It uses fake agents and a fake LiteLLM to check th
 
 Run: python3 tests/smoke.py   (exit 0 = pass)
 """
+
 import json
 import os
 import shutil
@@ -1705,8 +1777,9 @@ def run(tmp, *args, config="config.json", expect_ok=True):
 
 
 def git(cwd, *args):
-    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=cwd,
-                   check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=cwd, check=True, capture_output=True
+    )
 
 
 def make_git_task(tmp):
@@ -1716,12 +1789,12 @@ def make_git_task(tmp):
     (repo / "run_tests.py").write_text(
         "import sys, unittest\n"
         "r = unittest.main(module='test_hidden', exit=False).result\n"
-        "sys.exit(0 if r.wasSuccessful() else 1)\n")
+        "sys.exit(0 if r.wasSuccessful() else 1)\n"
+    )
     git(repo, "init", "-q", "-b", "main")
     git(repo, "add", "-A")
     git(repo, "commit", "-qm", "buggy")
-    buggy = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True,
-                           text=True).stdout.strip()
+    buggy = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
     (repo / "fizzbuzz.py").write_text("def fizzbuzz(n):\n    return 'SOLUTION'\n")
     git(repo, "commit", "-qam", "the fix")
     return str(repo), buggy
@@ -1734,23 +1807,37 @@ def main():
             shutil.copy(ROOT / f, tmp)
         shutil.copytree(ROOT / "tasks" / "fizzbuzz", tmp / "tasks" / "fizzbuzz")
         tags_file, probe_file = tmp / "tags.txt", tmp / "probe.jsonl"
-        os.environ.update(FAKE_TAGS_FILE=str(tags_file), FAKE_PROBE_FILE=str(probe_file),
-                          FAKE_KEY=fake_litellm.KEY, SECRET_CANARY="must-not-leak",
-                          FAKE_API_KEY=API_KEY)
+        os.environ.update(
+            FAKE_TAGS_FILE=str(tags_file),
+            FAKE_PROBE_FILE=str(probe_file),
+            FAKE_KEY=fake_litellm.KEY,
+            SECRET_CANARY="must-not-leak",
+            FAKE_API_KEY=API_KEY,
+        )
 
         srv, port = fake_litellm.serve()
         threading.Thread(target=srv.serve_forever, daemon=True).start()
 
         def harness(kind, mode="{model_name}"):
-            return {"parser": kind, "command": [PY, AGENT, kind, mode],
-                    "env": {"ANTHROPIC_CUSTOM_HEADERS": "x-litellm-tags: {run_tag}",
-                            "FAKE_TAGS_FILE": "${FAKE_TAGS_FILE}",
-                            "FAKE_PROBE_FILE": "${FAKE_PROBE_FILE}",
-                            "FAKE_API_KEY": "${FAKE_API_KEY}"}}
+            return {
+                "parser": kind,
+                "command": [PY, AGENT, kind, mode],
+                "env": {
+                    "ANTHROPIC_CUSTOM_HEADERS": "x-litellm-tags: {run_tag}",
+                    "FAKE_TAGS_FILE": "${FAKE_TAGS_FILE}",
+                    "FAKE_PROBE_FILE": "${FAKE_PROBE_FILE}",
+                    "FAKE_API_KEY": "${FAKE_API_KEY}",
+                },
+            }
 
         test_cmd = f"{PY} -m unittest -q test_hidden.py"
-        fizz = {"id": "fizzbuzz", "repo": "tasks/fizzbuzz/repo", "prompt": "fix it",
-                "hidden_tests": "tasks/fizzbuzz/hidden_tests", "test": test_cmd}
+        fizz = {
+            "id": "fizzbuzz",
+            "repo": "tasks/fizzbuzz/repo",
+            "prompt": "fix it",
+            "hidden_tests": "tasks/fizzbuzz/hidden_tests",
+            "test": test_cmd,
+        }
         cfg = {
             "reps": 1,
             "litellm": {"base_url": f"http://127.0.0.1:{port}", "api_key": "${FAKE_KEY}"},
@@ -1778,9 +1865,13 @@ def main():
         check(rows["claude"]["input"] == 310 and rows["claude"]["cache_read"] == 40000, "claude: modelUsage summed")
         check(rows["opencode"]["turns"] == 3 and rows["opencode"]["reasoning"] == 150, "opencode: step_finish summed")
         check(rows["pi"]["turns"] == 3 and rows["pi"]["input"] == 2400, "pi: only message_end counted")
-        check(rows["codex"]["input"] == 5000 and rows["codex"]["cache_read"] == 15000, "codex: cached is subset of input")
+        check(
+            rows["codex"]["input"] == 5000 and rows["codex"]["cache_read"] == 15000, "codex: cached is subset of input"
+        )
         check(abs(rows["codex"]["cost_computed"] - 0.0735) < 1e-9, "codex: computed cost from prices")
-        check(not rows["cursor"]["parse_ok"] and rows["cursor"]["cost_computed"] is None, "cursor: no usage, no fake $0")
+        check(
+            not rows["cursor"]["parse_ok"] and rows["cursor"]["cost_computed"] is None, "cursor: no usage, no fake $0"
+        )
         logs = tmp / "results" / "logs"
         stderr_logs = "".join(f.read_text() for f in logs.glob("*.agent.stderr"))
         check(API_KEY not in stderr_logs and "***REDACTED***" in stderr_logs, "logs: harness secrets redacted")
@@ -1806,13 +1897,23 @@ def main():
         # --- git history, protected paths, sandbox prefix
         repo, buggy = make_git_task(tmp)
         probe_file.unlink()
-        hist = {"id": "hist", "repo": repo, "ref": buggy, "prompt": "fix it",
-                "hidden_tests": "tasks/fizzbuzz/hidden_tests", "test": f"{PY} run_tests.py",
-                "protected_paths": ["run_tests.py", "tests_infra"]}
-        cfg2 = dict(cfg, output_dir="results-sec", tasks=[hist],
-                    harnesses={"claude": harness("claude", "hack")},
-                    matrix=[{"harness": "claude", "model": "m"}],
-                    sandbox={"prefix": ["env", "FAKE_SANDBOX={workdir}"]})
+        hist = {
+            "id": "hist",
+            "repo": repo,
+            "ref": buggy,
+            "prompt": "fix it",
+            "hidden_tests": "tasks/fizzbuzz/hidden_tests",
+            "test": f"{PY} run_tests.py",
+            "protected_paths": ["run_tests.py", "tests_infra"],
+        }
+        cfg2 = dict(
+            cfg,
+            output_dir="results-sec",
+            tasks=[hist],
+            harnesses={"claude": harness("claude", "hack")},
+            matrix=[{"harness": "claude", "model": "m"}],
+            sandbox={"prefix": ["env", "FAKE_SANDBOX={workdir}"]},
+        )
         (tmp / "config2.json").write_text(json.dumps(cfg2))
         run(tmp, "harness_bench.py", "run", config="config2.json")
         pr = json.loads(probe_file.read_text().splitlines()[0])
@@ -1824,9 +1925,11 @@ def main():
         check("run_tests.py" in diff and "conftest.py" in diff, "audit diff shows tampering")
 
         # --- config validation and URL policy
-        for bad, why in ((dict(fizz, id="/etc"), "absolute task id"),
-                         (dict(fizz, id="../x"), "traversal task id"),
-                         (dict(fizz, ref="--upload-pack=x"), "option-like git ref")):
+        for bad, why in (
+            (dict(fizz, id="/etc"), "absolute task id"),
+            (dict(fizz, id="../x"), "traversal task id"),
+            (dict(fizz, ref="--upload-pack=x"), "option-like git ref"),
+        ):
             (tmp / "bad.json").write_text(json.dumps(dict(cfg, tasks=[bad])))
             p = run(tmp, "harness_bench.py", "run", "--allow-unsandboxed", config="bad.json", expect_ok=False)
             check(p.returncode != 0, f"rejects {why}")
@@ -1834,8 +1937,11 @@ def main():
         (tmp / "bad.json").write_text(json.dumps(leak))
         p = run(tmp, "harness_bench.py", "run", "--allow-unsandboxed", config="bad.json", expect_ok=False)
         check(p.returncode != 0 and "spend key" in p.stderr, "rejects passing spend key to agents")
-        for url, ok in (("https://litellm.example.com", True), ("http://localhost:4000", True),
-                        ("http://litellm.example.com", False)):
+        for url, ok in (
+            ("https://litellm.example.com", True),
+            ("http://localhost:4000", True),
+            ("http://litellm.example.com", False),
+        ):
             try:
                 hb.check_litellm_url(url)
                 passed = True
@@ -1863,6 +1969,7 @@ Security probes: exits 9 if the LiteLLM spend key or SECRET_CANARY reached the a
 prints FAKE_API_KEY to stderr (must be redacted in logs), and records git history depth. When BENCH_TAG is set (and kind is not cursor),
 the tag is appended to $FAKE_TAGS_FILE, which fake_litellm.py serves as spend logs.
 """
+
 import json
 import os
 import sys
@@ -1875,13 +1982,23 @@ for leaked in ("FAKE_KEY", "SECRET_CANARY"):
 print(f"debug key={os.environ.get('FAKE_API_KEY', '')}", file=sys.stderr)
 if os.environ.get("FAKE_PROBE_FILE"):
     import subprocess
-    depth = subprocess.run(["git", "rev-list", "--all", "--count"], capture_output=True,
-                           text=True).stdout.strip()
+
+    depth = subprocess.run(["git", "rev-list", "--all", "--count"], capture_output=True, text=True).stdout.strip()
     remotes = subprocess.run(["git", "remote"], capture_output=True, text=True).stdout.strip()
     with open(os.environ["FAKE_PROBE_FILE"], "a") as f:
-        f.write(json.dumps({"cwd": os.getcwd(), "depth": depth, "remotes": remotes,
-                            "sandbox": os.environ.get("FAKE_SANDBOX", ""),
-                            "home": os.environ.get("HOME", ""), "uid": os.getuid()}) + "\n")
+        f.write(
+            json.dumps(
+                {
+                    "cwd": os.getcwd(),
+                    "depth": depth,
+                    "remotes": remotes,
+                    "sandbox": os.environ.get("FAKE_SANDBOX", ""),
+                    "home": os.environ.get("HOME", ""),
+                    "uid": os.getuid(),
+                }
+            )
+            + "\n"
+        )
 if mode == "hack":
     with open("run_tests.py", "w") as f:
         f.write("import sys\nsys.exit(0)\n")
@@ -1889,37 +2006,73 @@ if mode == "hack":
     with open("tests_infra/conftest.py", "w") as f:
         f.write("# planted\n")
     import subprocess
-    subprocess.run(["git", "-c", "user.name=x", "-c", "user.email=x@x", "commit", "-qam", "hack"],
-                   capture_output=True)
+
+    subprocess.run(["git", "-c", "user.name=x", "-c", "user.email=x@x", "commit", "-qam", "hack"], capture_output=True)
 if fix:
     with open("fizzbuzz.py", "w") as f:
-        f.write("def fizzbuzz(n):\n    if n % 15 == 0:\n        return 'FizzBuzz'\n"
-                "    if n % 3 == 0:\n        return 'Fizz'\n    if n % 5 == 0:\n"
-                "        return 'Buzz'\n    return str(n)\n")
+        f.write(
+            "def fizzbuzz(n):\n    if n % 15 == 0:\n        return 'FizzBuzz'\n"
+            "    if n % 3 == 0:\n        return 'Fizz'\n    if n % 5 == 0:\n"
+            "        return 'Buzz'\n    return str(n)\n"
+        )
 
 if kind == "claude":
-    print(json.dumps({"type": "result", "num_turns": 4, "total_cost_usd": 0.05,
-                      "usage": {"input_tokens": 10, "output_tokens": 500},
-                      "modelUsage": {
-                          "main": {"inputTokens": 10, "outputTokens": 500,
-                                   "cacheReadInputTokens": 40000, "cacheCreationInputTokens": 12000},
-                          "helper": {"inputTokens": 300, "outputTokens": 20}}}))
+    print(
+        json.dumps(
+            {
+                "type": "result",
+                "num_turns": 4,
+                "total_cost_usd": 0.05,
+                "usage": {"input_tokens": 10, "output_tokens": 500},
+                "modelUsage": {
+                    "main": {
+                        "inputTokens": 10,
+                        "outputTokens": 500,
+                        "cacheReadInputTokens": 40000,
+                        "cacheCreationInputTokens": 12000,
+                    },
+                    "helper": {"inputTokens": 300, "outputTokens": 20},
+                },
+            }
+        )
+    )
 elif kind == "opencode":
     print("progress text that is not JSON")
     for _ in range(3):
-        print(json.dumps({"type": "step_finish", "part": {"cost": 0.004, "tokens": {
-            "input": 2000, "output": 150, "reasoning": 50, "cache": {"read": 8000, "write": 0}}}}))
+        print(
+            json.dumps(
+                {
+                    "type": "step_finish",
+                    "part": {
+                        "cost": 0.004,
+                        "tokens": {"input": 2000, "output": 150, "reasoning": 50, "cache": {"read": 8000, "write": 0}},
+                    },
+                }
+            )
+        )
 elif kind == "codex":
     print(json.dumps({"type": "thread.started"}))
-    print(json.dumps({"type": "turn.completed", "usage": {
-        "input_tokens": 20000, "cached_input_tokens": 15000,
-        "output_tokens": 900, "reasoning_output_tokens": 400}}))
+    print(
+        json.dumps(
+            {
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 20000,
+                    "cached_input_tokens": 15000,
+                    "output_tokens": 900,
+                    "reasoning_output_tokens": 400,
+                },
+            }
+        )
+    )
 elif kind == "cursor":
     print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "ok"}))
 elif kind == "pi":
     print(json.dumps({"type": "session", "version": 3}))
-    msg = {"role": "assistant", "usage": {"input": 800, "output": 120, "cacheRead": 1500,
-                                          "cacheWrite": 0, "cost": {"total": 0.001}}}
+    msg = {
+        "role": "assistant",
+        "usage": {"input": 800, "output": 120, "cacheRead": 1500, "cacheWrite": 0, "cost": {"total": 0.001}},
+    }
     for _ in range(3):  # same usage on 3 event types: only message_end must count
         for typ in ("message_update", "message_end", "turn_end"):
             print(json.dumps({"type": typ, "message": msg}))
@@ -1936,6 +2089,7 @@ if os.environ.get("BENCH_TAG") and kind != "cursor":
 ```python
 """Fake LiteLLM /spend/logs/v2 for tests: 2 rows of $0.01 per tag in FAKE_TAGS_FILE,
 plus one unrelated row that must be ignored."""
+
 import json
 import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -1951,8 +2105,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         path = os.environ["FAKE_TAGS_FILE"]
         tags = open(path).read().split() if os.path.exists(path) else []
-        rows = [{"request_tags": json.dumps([t]), "spend": 0.01,
-                 "prompt_tokens": 100, "completion_tokens": 10} for t in tags for _ in range(2)]
+        rows = [
+            {"request_tags": json.dumps([t]), "spend": 0.01, "prompt_tokens": 100, "completion_tokens": 10}
+            for t in tags
+            for _ in range(2)
+        ]
         rows.append({"request_tags": ["unrelated"], "spend": 9.0, "prompt_tokens": 1})
         body = json.dumps({"data": rows, "total_pages": 1}).encode()
         self.send_response(200)
@@ -2083,6 +2240,7 @@ Needs the image: docker build -f sandbox/Dockerfile -t harness-bench-agents \\
                    --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
 Run: python3 tests/docker_e2e.py   (exit 0 = pass)
 """
+
 import json
 import os
 import shutil
@@ -2111,32 +2269,72 @@ def main():
         for f in ("harness_bench.py",):
             shutil.copy(ROOT / f, tmp)
         shutil.copytree(ROOT / "tasks" / "fizzbuzz", tmp / "tasks" / "fizzbuzz")
-        env = dict(os.environ, FAKE_TAGS_FILE=str(shared / "tags.txt"),
-                   FAKE_PROBE_FILE=str(shared / "probe.jsonl"),
-                   SECRET_CANARY="must-not-leak", FAKE_API_KEY="sk-test-agent-key-0123456789")
+        env = dict(
+            os.environ,
+            FAKE_TAGS_FILE=str(shared / "tags.txt"),
+            FAKE_PROBE_FILE=str(shared / "probe.jsonl"),
+            SECRET_CANARY="must-not-leak",
+            FAKE_API_KEY="sk-test-agent-key-0123456789",
+        )
         agent = str(ROOT / "tests" / "fake_agent.py")
-        prefix = ["docker", "run", "--rm", "--env-file", "{env_file}",
-                  "-v", "{workdir}:{workdir}", "-w", "{workdir}",
-                  "-v", f"{ROOT / 'tests'}:{ROOT / 'tests'}:ro",
-                  "-v", f"{shared}:{shared}",
-                  "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-                  "--pids-limit", "256", "--memory", "1g", IMAGE]
+        prefix = [
+            "docker",
+            "run",
+            "--rm",
+            "--env-file",
+            "{env_file}",
+            "-v",
+            "{workdir}:{workdir}",
+            "-w",
+            "{workdir}",
+            "-v",
+            f"{ROOT / 'tests'}:{ROOT / 'tests'}:ro",
+            "-v",
+            f"{shared}:{shared}",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--pids-limit",
+            "256",
+            "--memory",
+            "1g",
+            IMAGE,
+        ]
         cfg = {
             "reps": 1,
             "sandbox": {"prefix": prefix},
             "harnesses": {
-                k: {"parser": k, "command": ["python3", agent, k, mode],
-                    "env": {"FAKE_TAGS_FILE": "${FAKE_TAGS_FILE}", "FAKE_PROBE_FILE": "${FAKE_PROBE_FILE}",
-                            "FAKE_API_KEY": "${FAKE_API_KEY}"}}
-                for k, mode in (("claude", "fix"), ("pi", "nofix"))},
+                k: {
+                    "parser": k,
+                    "command": ["python3", agent, k, mode],
+                    "env": {
+                        "FAKE_TAGS_FILE": "${FAKE_TAGS_FILE}",
+                        "FAKE_PROBE_FILE": "${FAKE_PROBE_FILE}",
+                        "FAKE_API_KEY": "${FAKE_API_KEY}",
+                    },
+                }
+                for k, mode in (("claude", "fix"), ("pi", "nofix"))
+            },
             "matrix": [{"harness": "claude", "model": "m"}, {"harness": "pi", "model": "p/m"}],
-            "tasks": [{"id": "fizzbuzz", "repo": "tasks/fizzbuzz/repo", "prompt": "fix it",
-                       "hidden_tests": "tasks/fizzbuzz/hidden_tests",
-                       "test": "python3 -m unittest -q test_hidden.py"}],
+            "tasks": [
+                {
+                    "id": "fizzbuzz",
+                    "repo": "tasks/fizzbuzz/repo",
+                    "prompt": "fix it",
+                    "hidden_tests": "tasks/fizzbuzz/hidden_tests",
+                    "test": "python3 -m unittest -q test_hidden.py",
+                }
+            ],
         }
         (tmp / "config.json").write_text(json.dumps(cfg))
-        p = subprocess.run([sys.executable, "harness_bench.py", "run", "--config", "config.json"],
-                           cwd=tmp, env=env, capture_output=True, text=True)
+        p = subprocess.run(
+            [sys.executable, "harness_bench.py", "run", "--config", "config.json"],
+            cwd=tmp,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
         if p.returncode:
             sys.exit(f"FAIL: run\n{p.stdout}\n{p.stderr}")
         rows = {r["harness"]: r for r in map(json.loads, (tmp / "results/results.jsonl").read_text().splitlines())}
@@ -2147,8 +2345,10 @@ def main():
         check(all(pr["uid"] == os.getuid() for pr in probes), "container uid matches host uid")
         check(all(pr["depth"] == "1" for pr in probes), "git baseline visible inside container")
         logs = tmp / "results" / "logs"
-        check("sk-test-agent-key" not in "".join(f.read_text() for f in logs.glob("*.agent.stderr")),
-              "secrets redacted in logs")
+        check(
+            "sk-test-agent-key" not in "".join(f.read_text() for f in logs.glob("*.agent.stderr")),
+            "secrets redacted in logs",
+        )
         check(not list(Path(tempfile.gettempdir()).glob("harness-bench-work-*/.*.env")), "env files removed")
         print("\nPASS")
     finally:

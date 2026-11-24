@@ -1,11 +1,37 @@
 #!/usr/bin/env python3
 """Generate HARNESS_BENCH.md (single-file bundle: docs + all source). Run after any change."""
+
 from pathlib import Path
-b=Path(__file__).resolve().parent.parent
-R=lambda f:(b/f).read_text()
-py,pyl,cfgl,cfg,pim,ocj,cdx,fz,th=map(R,['harness_bench.py','harness_bench_litellm.py','config.litellm.example.json','config.example.json','pi-models.example.json','opencode.example.json','codex-config.example.toml','tasks/fizzbuzz/repo/fizzbuzz.py','tasks/fizzbuzz/hidden_tests/test_hidden.py'])
-smoke,fagent,flite,dock,entry,de2e,dign=map(R,['tests/smoke.py','tests/fake_agent.py','tests/fake_litellm.py','sandbox/Dockerfile','sandbox/entrypoint.sh','tests/docker_e2e.py','.dockerignore'])
-md=f'''# harness-bench: cost per solved task (harness × model)
+
+b = Path(__file__).resolve().parent.parent
+R = lambda f: (b / f).read_text()
+py, pyl, cfgl, cfg, pim, ocj, cdx, fz, th = map(
+    R,
+    [
+        "harness_bench.py",
+        "harness_bench_litellm.py",
+        "config.litellm.example.json",
+        "config.example.json",
+        "pi-models.example.json",
+        "opencode.example.json",
+        "codex-config.example.toml",
+        "tasks/fizzbuzz/repo/fizzbuzz.py",
+        "tasks/fizzbuzz/hidden_tests/test_hidden.py",
+    ],
+)
+smoke, fagent, flite, dock, entry, de2e, dign = map(
+    R,
+    [
+        "tests/smoke.py",
+        "tests/fake_agent.py",
+        "tests/fake_litellm.py",
+        "sandbox/Dockerfile",
+        "sandbox/entrypoint.sh",
+        "tests/docker_e2e.py",
+        ".dockerignore",
+    ],
+)
+md = f"""# harness-bench: cost per solved task (harness × model)
 
 A script to compare **harness × model** pairs on real tasks from your own code. It measures pass rate, tokens and **cost per solved task**.
 
@@ -356,6 +382,6 @@ Run `python3 tests/smoke.py`. It uses fake agents and a fake LiteLLM to check th
 - Codex exec JSONL: https://codex.danielvaughan.com/2026/04/08/codex-exec-jsonl-reference/
 - Cursor CLI output format: https://cursor.com/docs/cli/reference/output-format
 - Cursor CLI parameters: https://cursor.com/docs/cli/reference/parameters
-'''
-(b/'HARNESS_BENCH.md').write_text(md)
+"""
+(b / "HARNESS_BENCH.md").write_text(md)
 print(f"wrote {b / 'HARNESS_BENCH.md'} ({len(md.splitlines())} lines)")

@@ -3,6 +3,7 @@
 
 Run: python3 tests/smoke.py   (exit 0 = pass)
 """
+
 import json
 import os
 import shutil
@@ -41,8 +42,9 @@ def run(tmp, *args, config="config.json", expect_ok=True):
 
 
 def git(cwd, *args):
-    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=cwd,
-                   check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=cwd, check=True, capture_output=True
+    )
 
 
 def make_git_task(tmp):
@@ -52,12 +54,12 @@ def make_git_task(tmp):
     (repo / "run_tests.py").write_text(
         "import sys, unittest\n"
         "r = unittest.main(module='test_hidden', exit=False).result\n"
-        "sys.exit(0 if r.wasSuccessful() else 1)\n")
+        "sys.exit(0 if r.wasSuccessful() else 1)\n"
+    )
     git(repo, "init", "-q", "-b", "main")
     git(repo, "add", "-A")
     git(repo, "commit", "-qm", "buggy")
-    buggy = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True,
-                           text=True).stdout.strip()
+    buggy = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
     (repo / "fizzbuzz.py").write_text("def fizzbuzz(n):\n    return 'SOLUTION'\n")
     git(repo, "commit", "-qam", "the fix")
     return str(repo), buggy
@@ -70,23 +72,37 @@ def main():
             shutil.copy(ROOT / f, tmp)
         shutil.copytree(ROOT / "tasks" / "fizzbuzz", tmp / "tasks" / "fizzbuzz")
         tags_file, probe_file = tmp / "tags.txt", tmp / "probe.jsonl"
-        os.environ.update(FAKE_TAGS_FILE=str(tags_file), FAKE_PROBE_FILE=str(probe_file),
-                          FAKE_KEY=fake_litellm.KEY, SECRET_CANARY="must-not-leak",
-                          FAKE_API_KEY=API_KEY)
+        os.environ.update(
+            FAKE_TAGS_FILE=str(tags_file),
+            FAKE_PROBE_FILE=str(probe_file),
+            FAKE_KEY=fake_litellm.KEY,
+            SECRET_CANARY="must-not-leak",
+            FAKE_API_KEY=API_KEY,
+        )
 
         srv, port = fake_litellm.serve()
         threading.Thread(target=srv.serve_forever, daemon=True).start()
 
         def harness(kind, mode="{model_name}"):
-            return {"parser": kind, "command": [PY, AGENT, kind, mode],
-                    "env": {"ANTHROPIC_CUSTOM_HEADERS": "x-litellm-tags: {run_tag}",
-                            "FAKE_TAGS_FILE": "${FAKE_TAGS_FILE}",
-                            "FAKE_PROBE_FILE": "${FAKE_PROBE_FILE}",
-                            "FAKE_API_KEY": "${FAKE_API_KEY}"}}
+            return {
+                "parser": kind,
+                "command": [PY, AGENT, kind, mode],
+                "env": {
+                    "ANTHROPIC_CUSTOM_HEADERS": "x-litellm-tags: {run_tag}",
+                    "FAKE_TAGS_FILE": "${FAKE_TAGS_FILE}",
+                    "FAKE_PROBE_FILE": "${FAKE_PROBE_FILE}",
+                    "FAKE_API_KEY": "${FAKE_API_KEY}",
+                },
+            }
 
         test_cmd = f"{PY} -m unittest -q test_hidden.py"
-        fizz = {"id": "fizzbuzz", "repo": "tasks/fizzbuzz/repo", "prompt": "fix it",
-                "hidden_tests": "tasks/fizzbuzz/hidden_tests", "test": test_cmd}
+        fizz = {
+            "id": "fizzbuzz",
+            "repo": "tasks/fizzbuzz/repo",
+            "prompt": "fix it",
+            "hidden_tests": "tasks/fizzbuzz/hidden_tests",
+            "test": test_cmd,
+        }
         cfg = {
             "reps": 1,
             "litellm": {"base_url": f"http://127.0.0.1:{port}", "api_key": "${FAKE_KEY}"},
@@ -114,9 +130,13 @@ def main():
         check(rows["claude"]["input"] == 310 and rows["claude"]["cache_read"] == 40000, "claude: modelUsage summed")
         check(rows["opencode"]["turns"] == 3 and rows["opencode"]["reasoning"] == 150, "opencode: step_finish summed")
         check(rows["pi"]["turns"] == 3 and rows["pi"]["input"] == 2400, "pi: only message_end counted")
-        check(rows["codex"]["input"] == 5000 and rows["codex"]["cache_read"] == 15000, "codex: cached is subset of input")
+        check(
+            rows["codex"]["input"] == 5000 and rows["codex"]["cache_read"] == 15000, "codex: cached is subset of input"
+        )
         check(abs(rows["codex"]["cost_computed"] - 0.0735) < 1e-9, "codex: computed cost from prices")
-        check(not rows["cursor"]["parse_ok"] and rows["cursor"]["cost_computed"] is None, "cursor: no usage, no fake $0")
+        check(
+            not rows["cursor"]["parse_ok"] and rows["cursor"]["cost_computed"] is None, "cursor: no usage, no fake $0"
+        )
         logs = tmp / "results" / "logs"
         stderr_logs = "".join(f.read_text() for f in logs.glob("*.agent.stderr"))
         check(API_KEY not in stderr_logs and "***REDACTED***" in stderr_logs, "logs: harness secrets redacted")
@@ -142,13 +162,23 @@ def main():
         # --- git history, protected paths, sandbox prefix
         repo, buggy = make_git_task(tmp)
         probe_file.unlink()
-        hist = {"id": "hist", "repo": repo, "ref": buggy, "prompt": "fix it",
-                "hidden_tests": "tasks/fizzbuzz/hidden_tests", "test": f"{PY} run_tests.py",
-                "protected_paths": ["run_tests.py", "tests_infra"]}
-        cfg2 = dict(cfg, output_dir="results-sec", tasks=[hist],
-                    harnesses={"claude": harness("claude", "hack")},
-                    matrix=[{"harness": "claude", "model": "m"}],
-                    sandbox={"prefix": ["env", "FAKE_SANDBOX={workdir}"]})
+        hist = {
+            "id": "hist",
+            "repo": repo,
+            "ref": buggy,
+            "prompt": "fix it",
+            "hidden_tests": "tasks/fizzbuzz/hidden_tests",
+            "test": f"{PY} run_tests.py",
+            "protected_paths": ["run_tests.py", "tests_infra"],
+        }
+        cfg2 = dict(
+            cfg,
+            output_dir="results-sec",
+            tasks=[hist],
+            harnesses={"claude": harness("claude", "hack")},
+            matrix=[{"harness": "claude", "model": "m"}],
+            sandbox={"prefix": ["env", "FAKE_SANDBOX={workdir}"]},
+        )
         (tmp / "config2.json").write_text(json.dumps(cfg2))
         run(tmp, "harness_bench.py", "run", config="config2.json")
         pr = json.loads(probe_file.read_text().splitlines()[0])
@@ -160,9 +190,11 @@ def main():
         check("run_tests.py" in diff and "conftest.py" in diff, "audit diff shows tampering")
 
         # --- config validation and URL policy
-        for bad, why in ((dict(fizz, id="/etc"), "absolute task id"),
-                         (dict(fizz, id="../x"), "traversal task id"),
-                         (dict(fizz, ref="--upload-pack=x"), "option-like git ref")):
+        for bad, why in (
+            (dict(fizz, id="/etc"), "absolute task id"),
+            (dict(fizz, id="../x"), "traversal task id"),
+            (dict(fizz, ref="--upload-pack=x"), "option-like git ref"),
+        ):
             (tmp / "bad.json").write_text(json.dumps(dict(cfg, tasks=[bad])))
             p = run(tmp, "harness_bench.py", "run", "--allow-unsandboxed", config="bad.json", expect_ok=False)
             check(p.returncode != 0, f"rejects {why}")
@@ -170,8 +202,11 @@ def main():
         (tmp / "bad.json").write_text(json.dumps(leak))
         p = run(tmp, "harness_bench.py", "run", "--allow-unsandboxed", config="bad.json", expect_ok=False)
         check(p.returncode != 0 and "spend key" in p.stderr, "rejects passing spend key to agents")
-        for url, ok in (("https://litellm.example.com", True), ("http://localhost:4000", True),
-                        ("http://litellm.example.com", False)):
+        for url, ok in (
+            ("https://litellm.example.com", True),
+            ("http://localhost:4000", True),
+            ("http://litellm.example.com", False),
+        ):
             try:
                 hb.check_litellm_url(url)
                 passed = True
