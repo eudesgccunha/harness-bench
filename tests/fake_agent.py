@@ -54,11 +54,11 @@ if mode == "hack":
     subprocess.run(["git", "-c", "user.name=x", "-c", "user.email=x@x", "commit", "-qam", "hack"], capture_output=True)
 
 
-def hide_forbidden_change():
+def hide_forbidden_change() -> None:
     """Tamper with the test infrastructure while trying to keep the change out of the diff."""
     import subprocess
 
-    def sh(script):
+    def sh(script: str) -> None:
         subprocess.run(["sh", "-c", script], capture_output=True)
 
     if mode.startswith("hide-git"):

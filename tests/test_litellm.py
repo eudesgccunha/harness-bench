@@ -6,6 +6,7 @@ import sys
 import threading
 import unittest
 import urllib.error
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 from unittest import mock
@@ -82,7 +83,7 @@ class LitellmGetTests(ServerTestCase):
 
 
 class LitellmRowsTests(ServerTestCase):
-    START = hb.datetime.fromtimestamp(1_700_000_000, hb.UTC)
+    START = datetime.fromtimestamp(1_700_000_000, UTC)
 
     def rows(self) -> list[Any]:
         rows: list[Any] = hb.litellm_rows(self.server.url, KEY, self.START, self.START)

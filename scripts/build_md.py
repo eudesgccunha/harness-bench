@@ -4,7 +4,12 @@
 from pathlib import Path
 
 b = Path(__file__).resolve().parent.parent
-R = lambda f: (b / f).read_text()
+
+
+def R(f: str) -> str:
+    return (b / f).read_text()
+
+
 py, pyl, cfgl, cfg, pim, ocj, cdx, fz, th = map(
     R,
     [
@@ -82,7 +87,7 @@ HBENCH_TESTS = [
 ]
 
 
-def file_blocks(paths):
+def file_blocks(paths: list[str]) -> str:
     """One heading-less `path` + fenced Python block per file."""
     return "".join(f"`{p}`:\n\n```python\n{R(p)}```\n\n" for p in paths)
 

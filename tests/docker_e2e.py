@@ -18,13 +18,13 @@ ROOT = Path(__file__).resolve().parent.parent
 IMAGE = os.environ.get("HB_IMAGE", "harness-bench-agents")
 
 
-def check(cond, msg):
+def check(cond: object, msg: str) -> None:
     if not cond:
         sys.exit(f"FAIL: {msg}")
     print(f"ok   {msg}")
 
 
-def main():
+def main() -> None:
     if subprocess.run(["docker", "image", "inspect", IMAGE], capture_output=True).returncode:
         sys.exit(f"image {IMAGE} not found; build it first (see docstring)")
     tmp = Path(tempfile.mkdtemp(prefix="hb-docker-"))

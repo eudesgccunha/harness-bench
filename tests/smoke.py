@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tests"))
@@ -24,30 +25,30 @@ PY = fixtures.PY
 API_KEY = "sk-test-agent-key-0123456789"
 
 
-def check(cond, msg):
+def check(cond: object, msg: str) -> None:
     if not cond:
         sys.exit(f"FAIL: {msg}")
     print(f"ok   {msg}")
 
 
-def results(path):
+def results(path: Path) -> list[dict[str, Any]]:
     return [json.loads(x) for x in path.read_text().splitlines() if x.strip()]
 
 
-def run(tmp, *args, config="config.json", expect_ok=True):
+def run(tmp: Path, *args: str, config: str = "config.json", expect_ok: bool = True) -> subprocess.CompletedProcess[str]:
     p = subprocess.run([PY, *args, "--config", config], cwd=tmp, capture_output=True, text=True)
     if expect_ok and p.returncode != 0:
         sys.exit(f"FAIL: {' '.join(args)}\n{p.stdout}\n{p.stderr}")
     return p
 
 
-def git(cwd, *args):
+def git(cwd: Path, *args: str) -> None:
     subprocess.run(
         ["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=cwd, check=True, capture_output=True
     )
 
 
-def make_git_task(tmp):
+def make_git_task(tmp: Path) -> tuple[str, str]:
     """Repo with a buggy commit followed by the fix: the agent must only see the first."""
     repo = tmp / "gitrepo"
     shutil.copytree(ROOT / "tasks" / "fizzbuzz" / "repo", repo)
@@ -65,7 +66,7 @@ def make_git_task(tmp):
     return str(repo), buggy
 
 
-def main():
+def main() -> None:
     tmp = Path(tempfile.mkdtemp(prefix="hb-smoke-"))
     hide_work = Path(tempfile.mkdtemp(prefix="hb-smoke-work-"))
     try:

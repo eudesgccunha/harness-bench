@@ -18,6 +18,7 @@ This is a shim over `python3 -m hbench <command> --litellm ...`.
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 if sys.version_info < (3, 12):
     sys.exit("Python 3.12+ required")
@@ -30,13 +31,13 @@ LITELLM_COMMANDS = {"run", "report", "reconcile"}
 EPILOG = "The LiteLLM profile is applied automatically to run, report and reconcile (same as passing --litellm)."
 
 
-def load_config(path):
+def load_config(path: str | Path) -> tuple[dict[str, Any], Path]:
     """The config with the LiteLLM profile applied, and its directory."""
     cfg_path = Path(path).resolve()
     return apply_litellm_profile(json.loads(cfg_path.read_text())), cfg_path.parent
 
 
-def main():
+def main() -> None:
     argv = sys.argv[1:]
     if argv and argv[0] in LITELLM_COMMANDS:
         argv = [argv[0], "--litellm", *argv[1:]]

@@ -3,13 +3,14 @@ plus one unrelated row that must be ignored."""
 
 import json
 import os
+from typing import Any
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 KEY = "test-key"
 
 
 class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
+    def do_GET(self) -> None:
         if self.headers.get("Authorization") != f"Bearer {KEY}":
             self.send_response(401)
             self.end_headers()
@@ -27,11 +28,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, *args):
+    def log_message(self, format: str, *args: Any) -> None:
         pass
 
 
-def serve(port=0):
+def serve(port: int = 0) -> tuple[HTTPServer, int]:
     """Start server; return (server, port)."""
     srv = HTTPServer(("127.0.0.1", port), Handler)
     return srv, srv.server_address[1]

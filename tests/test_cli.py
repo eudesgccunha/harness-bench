@@ -1,7 +1,9 @@
 """Tests for the single CLI (`python3 -m hbench`), the LiteLLM profile and the two shims."""
 
+import contextlib
 import copy
 import importlib
+import io
 import json
 import shutil
 import subprocess
@@ -181,9 +183,11 @@ class CliDispatchTests(unittest.TestCase):
         self.assertIn("runs matched by tag", self.cli("reconcile"))
 
     def test_cost_source_flag_conflicts_with_the_profile(self) -> None:
-        with fixtures.quiet(), self.assertRaises(SystemExit) as cm:
+        err = io.StringIO()
+        with fixtures.quiet(), contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
             self.cli("report", "--litellm", "--cost-source", "computed")
         self.assertEqual(cm.exception.code, 2)
+        self.assertIn("--cost-source cannot be combined with --litellm", err.getvalue())
 
     def test_report_with_the_profile_forces_the_gateway_cost(self) -> None:
         self.cli("run", "--allow-unsandboxed", "--only", "claude")

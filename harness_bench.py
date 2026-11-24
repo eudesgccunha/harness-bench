@@ -10,6 +10,7 @@ Usage:
   python3 harness_bench.py report --config config.json
 """
 
+import argparse
 import functools
 import json
 import os
@@ -23,11 +24,12 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from email.message import Message
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 if sys.version_info < (3, 12):
     sys.exit("Python 3.12+ required")
@@ -37,45 +39,46 @@ from hbench import runners as _runners  # noqa: E402
 from hbench.core.convert import trial_from_row_lenient, trials_from_rows  # noqa: E402
 from hbench.core.ids import new_run_id, sha256_json  # noqa: E402
 from hbench.core.models import GraderResult, RunInfo, Target  # noqa: E402
-from hbench.graders import GRADERS as GRADERS, Change, GradeContext, compose, grade_plan  # noqa: E402
+from hbench.graders import GRADERS as GRADERS, Change, GradeContext, GradePlan, compose, grade_plan  # noqa: E402
 from hbench.results import RunWriter, apply_gateway_costs  # noqa: E402
 from hbench.runners import PARSERS as PARSERS, empty_usage as empty_usage, json_lines as json_lines  # noqa: E402
 from hbench.runners import num as num, runner_for  # noqa: E402
-from hbench.runners.base import build_argv  # noqa: E402
+from hbench.graders.base import RunStep  # noqa: E402
+from hbench.runners.base import ParseUsage, build_argv  # noqa: E402
 
 VERSION = "0.0.0"
 
-# The parsers live in `hbench.runners`. They are re-exported under the legacy names with a loose return type,
-# because this module and the tests that call it are not strictly typed.
-parse_claude: Callable[[str], Any] = _runners.parse_claude
-parse_opencode: Callable[[str], Any] = _runners.parse_opencode
-parse_pi: Callable[[str], Any] = _runners.parse_pi
-parse_cursor: Callable[[str], Any] = _runners.parse_cursor
-parse_codex: Callable[[str], Any] = _runners.parse_codex
-parse_null: Callable[[str], Any] = _runners.parse_null
+# The parsers live in `hbench.runners`. They are re-exported under the legacy names.
+parse_claude: ParseUsage = _runners.parse_claude
+parse_opencode: ParseUsage = _runners.parse_opencode
+parse_pi: ParseUsage = _runners.parse_pi
+parse_cursor: ParseUsage = _runners.parse_cursor
+parse_codex: ParseUsage = _runners.parse_codex
+parse_null: ParseUsage = _runners.parse_null
 
 
 # ---------------------------------------------------------------- helpers
 
 
-def expand_env(value):
+def expand_env(value: str) -> str:
     return re.sub(r"\$\{(\w+)\}", lambda m: os.environ.get(m.group(1), ""), value)
 
 
 # ---------------------------------------------------------------- cost
 
 
-def computed_cost(u, price):
+def computed_cost(u: Mapping[str, Any], price: Mapping[str, Any] | None) -> float | None:
     """Cost from token counts and a USD per 1M tokens price entry."""
     if not price or not any(v for k, v in price.items() if not k.startswith("_")):
         return None  # missing or all-zero price entry: fall back to reported cost
     out_price = price.get("output", 0)
-    return (
+    cost: float = (
         u["input"] * price.get("input", 0)
         + (u["output"] + u["reasoning"]) * out_price
         + u["cache_read"] * price.get("cache_read", price.get("input", 0))
         + u["cache_write"] * price.get("cache_write", price.get("input", 0))
     ) / 1e6
+    return cost
 
 
 # ---------------------------------------------------------------- safety helpers
@@ -88,16 +91,16 @@ SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]")
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
-def safe(s):
+def safe(s: object) -> str:
     """Filesystem-safe fragment: no separators, no leading dots."""
     return SAFE_NAME.sub("_", str(s)).lstrip(".") or "_"
 
 
-def env_var_names(value):
+def env_var_names(value: str | None) -> set[str]:
     return set(re.findall(r"\$\{(\w+)\}", value or ""))
 
 
-def base_env(cfg):
+def base_env(cfg: Mapping[str, Any]) -> dict[str, str]:
     env = {k: os.environ[k] for k in BASE_ENV if k in os.environ}
     for k in cfg.get("env_passthrough", []):
         if k in os.environ:
@@ -107,23 +110,23 @@ def base_env(cfg):
     return env
 
 
-def spend_key_vars(cfg):
+def spend_key_vars(cfg: Mapping[str, Any]) -> set[str]:
     return env_var_names((cfg.get("litellm") or {}).get("api_key"))
 
 
-def redact(text, secrets):
+def redact(text: str, secrets: Iterable[str]) -> str:
     for s in secrets:
         if s and len(s) >= 8:
             text = text.replace(s, "***REDACTED***")
     return text
 
 
-def check_cost_source(name):
+def check_cost_source(name: str) -> None:
     if name not in report.COST_SOURCES:
         sys.exit(f"invalid cost_source {name!r}: use one of {', '.join(report.COST_SOURCES)}")
 
 
-def report_options(cfg):
+def report_options(cfg: Mapping[str, Any]) -> tuple[float, float]:
     """`(recommend_within_pp, target_ci_width)` from the config, validated; exits with a message naming the key."""
     pp = cfg.get("recommend_within_pp", 5)
     width = cfg.get("target_ci_width", 0.2)
@@ -134,7 +137,7 @@ def report_options(cfg):
     return pp, width
 
 
-def validate_config(cfg):
+def validate_config(cfg: Mapping[str, Any]) -> None:
     check_cost_source(cfg.get("cost_source", "auto"))
     report_options(cfg)
     for task in cfg["tasks"]:
@@ -173,14 +176,14 @@ def validate_config(cfg):
         sys.exit(f"LiteLLM spend key {sorted(leaked)} must not be passed to agents")
 
 
-def rmtree_inside(path, root):
+def rmtree_inside(path: Path | str, root: Path | str) -> None:
     path, root = Path(path).resolve(), Path(root).resolve()
     if path == root or not path.is_relative_to(root):
         raise RuntimeError(f"refusing to delete {path}: outside {root}")
     shutil.rmtree(path, ignore_errors=True)
 
 
-def wrap(cfg, argv, workdir, env_file):
+def wrap(cfg: Mapping[str, Any], argv: list[str], workdir: Path | str, env_file: Path | str) -> list[str]:
     """Prefix a command with the configured sandbox (e.g. docker run ...)."""
     prefix = (cfg.get("sandbox") or {}).get("prefix")
     if not prefix:
@@ -194,7 +197,7 @@ def wrap(cfg, argv, workdir, env_file):
 HOST_ONLY_ENV = {"PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR"}
 
 
-def write_env_file(env, path):
+def write_env_file(env: Mapping[str, str], path: Path) -> None:
     """Docker --env-file format; 0600; deleted after the run."""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
@@ -206,7 +209,7 @@ def write_env_file(env, path):
 # ---------------------------------------------------------------- run
 
 
-def run_proc(argv, cwd, env, timeout):
+def run_proc(argv: list[str], cwd: Path | None, env: Mapping[str, str], timeout: float) -> tuple[int, bool, str, str]:
     """Run argv without a shell; return (rc, timed_out, stdout, stderr)."""
     try:
         p = subprocess.run(
@@ -219,20 +222,20 @@ def run_proc(argv, cwd, env, timeout):
         return -1, True, out, err
 
 
-def git_bin():
+def git_bin() -> str:
     """Absolute path of the git executable; exits with a clear message when it is missing."""
     return shutil.which("git") or sys.exit("git not found on PATH")
 
 
-def git(*args, cwd=None):
+def git(*args: str, cwd: Path | None = None) -> None:
     subprocess.run([git_bin(), *args], cwd=cwd, check=True, stdin=subprocess.DEVNULL, capture_output=True, text=True)
 
 
-def is_git_source(src):
+def is_git_source(src: str) -> bool:
     return src.endswith(".git") or "://" in src or src.startswith("git@") or (Path(src) / ".git").exists()
 
 
-def prepare_workdir(task, base, workdir):
+def prepare_workdir(task: Mapping[str, Any], base: Path, workdir: Path) -> None:
     """Fresh copy of the task repo, without git history.
 
     History is dropped on purpose: a clone at a pre-fix ref still holds the fix commit,
@@ -288,14 +291,14 @@ class GitError(Exception):
 
 
 @functools.cache
-def git_version():
+def git_version() -> tuple[int, int]:
     """`(major, minor)` of the git on PATH."""
     out = subprocess.run([git_bin(), "--version"], capture_output=True, text=True, check=True).stdout
     match = re.search(r"(\d+)\.(\d+)", out)
     return (int(match.group(1)), int(match.group(2))) if match else (0, 0)
 
 
-def git_env(index_file=None):
+def git_env(index_file: Path | str | None = None) -> dict[str, str]:
     """Environment for the hardened git: PATH only, no user or system config, no inherited GIT_* variable.
     `index_file` is the one thing added: a throwaway index for a diff."""
     return {
@@ -307,7 +310,14 @@ def git_env(index_file=None):
     }
 
 
-def hardened_git(git_dir, work_tree, *args, check=False, timeout=300, index_file=None):
+def hardened_git(
+    git_dir: Path,
+    work_tree: Path,
+    *args: str,
+    check: bool = False,
+    timeout: float = 300,
+    index_file: Path | str | None = None,
+) -> subprocess.CompletedProcess[str]:
     """Run git against the baseline `git_dir` (outside the workdir) and the agent's `work_tree`.
 
     The workdir's own `.git` (config, `info/exclude`, index flags, replace refs) is never read: the agent controls
@@ -345,14 +355,14 @@ class Baseline:
     sha: str
 
 
-def write_info_attributes(git_dir):
+def write_info_attributes(git_dir: Path | str) -> None:
     """Write `INFO_ATTRIBUTES` to `<git_dir>/info/attributes`, before the first `git add`."""
     info = Path(git_dir) / "info"
     info.mkdir(parents=True, exist_ok=True)
     (info / "attributes").write_text(INFO_ATTRIBUTES)
 
 
-def make_baseline(workdir, git_dir):
+def make_baseline(workdir: Path, git_dir: Path) -> Baseline:
     """Single commit with the state the agent starts from (after setup), in a git dir outside the workdir.
     Ignore rules do not apply, so files a `.gitignore` lists are part of the baseline too."""
     ident = ["-c", "user.name=harness-bench", "-c", "user.email=bench@localhost", "-c", "commit.gpgsign=false"]
@@ -367,14 +377,14 @@ def make_baseline(workdir, git_dir):
     return Baseline(git_dir=Path(git_dir), workdir=Path(workdir), sha=sha)
 
 
-def _remove(path):
+def _remove(path: Path) -> None:
     if path.is_dir() and not path.is_symlink():
         shutil.rmtree(path)
     elif path.exists() or path.is_symlink():
         path.unlink()
 
 
-def snapshot_protected(task, workdir, snap):
+def snapshot_protected(task: Mapping[str, Any], workdir: Path, snap: Path) -> None:
     """Copy protected paths out of the workdir before the agent runs. The snapshot lives
     outside the workdir, so moving git refs or deleting .git cannot alter it."""
     for rel in task.get("protected_paths", []):
@@ -386,7 +396,7 @@ def snapshot_protected(task, workdir, snap):
             shutil.copy2(src, dst, follow_symlinks=False)
 
 
-def restore_protected(task, workdir, snap):
+def restore_protected(task: Mapping[str, Any], workdir: Path, snap: Path) -> None:
     """Undo agent edits to test infrastructure: put back the snapshot of each protected
     path and delete anything the agent added there."""
     for rel in task.get("protected_paths", []):
@@ -399,7 +409,7 @@ def restore_protected(task, workdir, snap):
             shutil.copy2(saved, target, follow_symlinks=False)
 
 
-def staged_diff(baseline, *flags):
+def staged_diff(baseline: Baseline, *flags: str) -> subprocess.CompletedProcess[str]:
     """`git diff --cached` of everything in the workdir (new files and ignored files included) against baseline.
 
     Every call builds a fresh index from the baseline commit, so flags kept in a stored index (`skip-worktree`,
@@ -435,7 +445,7 @@ def staged_diff(baseline, *flags):
         )
 
 
-def nested_git_entries(workdir):
+def nested_git_entries(workdir: Path) -> list[str]:
     """Paths (relative to the workdir) of every `.git` file, directory or link inside it. After the agent ran there
     should be none: `git add` would treat such a directory as a repository and hide what it holds."""
     found = []
@@ -445,7 +455,7 @@ def nested_git_entries(workdir):
     return sorted(found)
 
 
-def save_diff(baseline, path, limit=2_000_000, secrets=()):
+def save_diff(baseline: Baseline, path: Path, limit: int = 2_000_000, secrets: Iterable[str] = ()) -> None:
     """Everything the agent changed vs baseline, including new files (for audit). A diff that cannot be built is
     reported in the file (stderr redacted with `secrets`), never left empty."""
     nested = nested_git_entries(baseline.workdir)
@@ -470,7 +480,7 @@ UNKNOWN_CHANGES = (Change(path="../unknown-changes", added=0, deleted=0),)
 BINARY_LINES = 10**9
 
 
-def parse_numstat(text):
+def parse_numstat(text: str) -> tuple[Change, ...]:
     """Changes from `git diff --numstat -z --no-renames` output. A binary file (`-`) counts as `BINARY_LINES`."""
     changes = []
     for record in text.split("\0"):
@@ -488,7 +498,7 @@ def parse_numstat(text):
     return tuple(changes)
 
 
-def collect_changes(baseline):
+def collect_changes(baseline: Baseline) -> tuple[Change, ...]:
     """What the agent changed vs baseline as `Change`s (renames show as a delete and an add), for the graders.
     Fails closed with `UNKNOWN_CHANGES` when the diff is unreadable (git cannot add a file, git is too old) or the
     agent left a `.git` in the workdir."""
@@ -501,11 +511,11 @@ def collect_changes(baseline):
         return UNKNOWN_CHANGES
 
 
-def build_cmd(template, model, prompt):
+def build_cmd(template: list[str], model: str, prompt: str) -> list[str]:
     return build_argv(template, model, prompt)
 
 
-def done_keys(results_path):
+def done_keys(results_path: Path) -> set[tuple[Any, ...]]:
     keys = set()
     if results_path.exists():
         for obj in json_lines(results_path.read_text()):
@@ -513,7 +523,7 @@ def done_keys(results_path):
     return keys
 
 
-def resolve_work_root(cfg, base):
+def resolve_work_root(cfg: Mapping[str, Any], base: Path) -> Path:
     """Work directories live outside the benchmark repo, so the agent's cwd does not
     sit next to hidden tests, config and results."""
     if cfg.get("work_dir"):
@@ -525,7 +535,16 @@ def resolve_work_root(cfg, base):
     return Path(tempfile.mkdtemp(prefix="harness-bench-work-"))
 
 
-def run_step(cfg, command, env, timeout, log_path, workdir, env_file, secrets):
+def run_step(
+    cfg: Mapping[str, Any],
+    command: str,
+    env: Mapping[str, str],
+    timeout: float,
+    log_path: Path,
+    workdir: Path,
+    env_file: Path,
+    secrets: Iterable[str],
+) -> tuple[int, bool, str, str]:
     """Run a setup or grader command in the sandbox wrapper and write its redacted log (stdout, then stderr).
     Returns `(rc, timed_out, stdout, stderr)`, both redacted and kept apart: a score is only read from stdout."""
     write_env_file(env, env_file)
@@ -538,7 +557,14 @@ def run_step(cfg, command, env, timeout, log_path, workdir, env_file, secrets):
     return rc, to, out, err
 
 
-def grade_trial(plan, task, base, workdir, changes, run_for):
+def grade_trial(
+    plan: GradePlan,
+    task: Mapping[str, Any],
+    base: Path,
+    workdir: Path,
+    changes: tuple[Change, ...],
+    run_for: Callable[[str], RunStep],
+) -> tuple[bool, list[GraderResult]]:
     """Run the task's graders over the finished workdir and compose them: `(passed, results)`.
 
     `run_for(prefix)` gives a grader its `run`: the engine's `run_step`, with log names starting at `prefix`.
@@ -556,7 +582,7 @@ def grade_trial(plan, task, base, workdir, changes, run_for):
     return passed, results
 
 
-def make_run_info(cfg, only, sandboxed):
+def make_run_info(cfg: Mapping[str, Any], only: Sequence[str] | None, sandboxed: bool) -> RunInfo:
     """Metadata of this `run`. The config hash covers `${VAR}` references, never expanded values."""
     targets = tuple(
         Target(
@@ -582,14 +608,14 @@ def make_run_info(cfg, only, sandboxed):
     )
 
 
-def cmd_run(args, cfg, base):
+def cmd_run(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path) -> None:
     """Run the matrix. The baseline git dirs of the trials live in a private temp dir that is always removed: not in
     `work_dir`, whose names an unsandboxed agent could guess."""
     with tempfile.TemporaryDirectory(prefix="harness-bench-git-") as git_root:
         _run_matrix(args, cfg, base, Path(git_root))
 
 
-def _run_matrix(args, cfg, base, git_root):
+def _run_matrix(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path, git_root: Path) -> None:
     validate_config(cfg)
     sandboxed = bool((cfg.get("sandbox") or {}).get("prefix"))
     if not sandboxed and not args.dry_run and not args.allow_unsandboxed:
@@ -628,7 +654,7 @@ def _run_matrix(args, cfg, base, git_root):
                     continue
                 runner = runner_for(h)
                 cmd = runner.command(model, task["prompt"])
-                if args.dry_run:
+                if work_root is None or writer is None:  # dry run: no work dir and no writer
                     print(shlex.join(cmd))
                     continue
                 tag = f"{safe(task['id'])}__{safe(hname)}__{safe(model)}__r{rep}"
@@ -691,8 +717,15 @@ def _run_matrix(args, cfg, base, git_root):
                 restore_protected(task, workdir, snap)
                 rmtree_inside(snap, work_root)
 
-                def run_for(prefix, tag=tag, workdir=workdir, env_file=env_file, secrets=secrets, cmd_env=cmd_env):
-                    def run(command, timeout, log_name):
+                def run_for(
+                    prefix: str,
+                    tag: str = tag,
+                    workdir: Path = workdir,
+                    env_file: Path = env_file,
+                    secrets: list[str] = secrets,
+                    cmd_env: dict[str, str] = cmd_env,
+                ) -> RunStep:
+                    def run(command: str, timeout: int, log_name: str) -> tuple[int, bool, str, str]:
                         log = logs_dir / f"{tag}.{prefix}{safe(log_name)}.log"
                         return run_step(cfg, command, cmd_env, timeout, log, workdir, env_file, secrets)
 
@@ -754,18 +787,26 @@ def _run_matrix(args, cfg, base, git_root):
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Never follow redirects: the Authorization header must not reach another host."""
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: Message,
+        newurl: str,
+    ) -> None:
         return None
 
 
-def check_litellm_url(base_url):
+def check_litellm_url(base_url: str) -> None:
     u = urllib.parse.urlparse(base_url)
     if u.scheme == "https" or (u.scheme == "http" and u.hostname in LOCAL_HOSTS):
         return
     sys.exit(f"litellm.base_url must use https (http only for localhost): {base_url}")
 
 
-def litellm_get(base_url, key, path, params):
+def litellm_get(base_url: str, key: str, path: str, params: Mapping[str, Any]) -> Any:
     check_litellm_url(base_url)
     url = base_url.rstrip("/") + path + "?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"})
@@ -774,11 +815,12 @@ def litellm_get(base_url, key, path, params):
         return json.loads(r.read().decode())
 
 
-def litellm_rows(base_url, key, start, end):
+def litellm_rows(base_url: str, key: str, start: datetime, end: datetime) -> list[dict[str, Any]]:
     """Individual spend log rows. Tries /spend/logs/v2 (paginated), then legacy /spend/logs."""
     fmt = "%Y-%m-%d %H:%M:%S"
     try:
-        rows, page = [], 1
+        rows: list[dict[str, Any]] = []
+        page = 1
         while True:
             data = litellm_get(
                 base_url,
@@ -800,10 +842,11 @@ def litellm_rows(base_url, key, start, end):
         "/spend/logs",
         {"start_date": start.strftime("%Y-%m-%d"), "end_date": (end).strftime("%Y-%m-%d"), "summarize": "false"},
     )
-    return data.get("data", []) if isinstance(data, dict) else data
+    fallback: list[dict[str, Any]] = data.get("data", []) if isinstance(data, dict) else data
+    return fallback
 
 
-def row_tags(r):
+def row_tags(r: Mapping[str, Any]) -> list[Any]:
     tags = r.get("request_tags") or []
     if isinstance(tags, str):
         try:
@@ -813,7 +856,7 @@ def row_tags(r):
     return tags if isinstance(tags, list) else []
 
 
-def cmd_reconcile(args, cfg, base):
+def cmd_reconcile(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path) -> None:
     lcfg = cfg.get("litellm") or sys.exit("config has no 'litellm' section")
     base_url, key = expand_env(lcfg["base_url"]), expand_env(lcfg["api_key"])
     if not base_url or not key:
@@ -826,7 +869,7 @@ def cmd_reconcile(args, cfg, base):
     start = datetime.fromtimestamp(min(r["t_start"] for r in tagged) - 3600, UTC)
     end = datetime.fromtimestamp(max(r["t_end"] for r in tagged) + 3600, UTC)
     logs = litellm_rows(base_url, key, start, end)
-    by_tag = {}
+    by_tag: dict[Any, list[dict[str, Any]]] = {}
     for row in logs:
         for t in row_tags(row):
             by_tag.setdefault(t, []).append(row)
@@ -855,12 +898,12 @@ def cmd_reconcile(args, cfg, base):
 # ---------------------------------------------------------------- report
 
 
-def aggregate(rows, cost_source):
+def aggregate(rows: Iterable[Mapping[str, Any]], cost_source: str) -> list[dict[str, Any]]:
     """Per harness x model entries from legacy rows (the work is done over contract trials)."""
     return report.aggregate(trials_from_rows(rows), cost_source)
 
 
-def cmd_report(args, cfg, base):
+def cmd_report(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path) -> None:
     out_dir = base / cfg.get("output_dir", "results")
     results_path = out_dir / "results.jsonl"
     if not results_path.exists():
@@ -891,7 +934,7 @@ def cmd_report(args, cfg, base):
 # ---------------------------------------------------------------- main
 
 
-def main():
+def main() -> None:
     """Entry point: the single CLI in `hbench.cli` (same commands and flags as before)."""
     cli.main()
 

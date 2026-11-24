@@ -11,6 +11,7 @@ from unittest import mock
 
 import fixtures
 import harness_bench as hb
+from hbench.graders import Change
 from hbench.graders.diff_constraints import DiffConstraintsGrader
 
 GIT_ID = ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]
@@ -465,7 +466,7 @@ class CollectChangesTests(unittest.TestCase):
         self.assertEqual([(c.path, c.added) for c in hb.collect_changes(baseline)], [("a\tb.txt", 1)])
         self.assertEqual(
             hb.parse_numstat("1\t2\ta\tb\tc.txt\0-\t-\tbin\0"),
-            (hb.Change("a\tb\tc.txt", 1, 2), hb.Change("bin", hb.BINARY_LINES, 0)),
+            (Change("a\tb\tc.txt", 1, 2), Change("bin", hb.BINARY_LINES, 0)),
         )
 
     def test_no_changes_gives_an_empty_tuple(self) -> None:
