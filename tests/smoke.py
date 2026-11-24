@@ -17,10 +17,10 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tests"))
 sys.path.insert(0, str(ROOT))
 import fake_litellm  # noqa: E402
+import fixtures  # noqa: E402
 import harness_bench as hb  # noqa: E402
 
-PY = sys.executable
-AGENT = str(ROOT / "tests" / "fake_agent.py")
+PY = fixtures.PY
 API_KEY = "sk-test-agent-key-0123456789"
 
 
@@ -83,40 +83,16 @@ def main():
         srv, port = fake_litellm.serve()
         threading.Thread(target=srv.serve_forever, daemon=True).start()
 
-        def harness(kind, mode="{model_name}"):
-            return {
-                "parser": kind,
-                "command": [PY, AGENT, kind, mode],
-                "env": {
-                    "ANTHROPIC_CUSTOM_HEADERS": "x-litellm-tags: {run_tag}",
-                    "FAKE_TAGS_FILE": "${FAKE_TAGS_FILE}",
-                    "FAKE_PROBE_FILE": "${FAKE_PROBE_FILE}",
-                    "FAKE_API_KEY": "${FAKE_API_KEY}",
-                },
-            }
-
-        test_cmd = f"{PY} -m unittest -q test_hidden.py"
-        fizz = {
-            "id": "fizzbuzz",
-            "repo": "tasks/fizzbuzz/repo",
-            "prompt": "fix it",
-            "hidden_tests": "tasks/fizzbuzz/hidden_tests",
-            "test": test_cmd,
+        harness_env = {
+            "FAKE_TAGS_FILE": "${FAKE_TAGS_FILE}",
+            "FAKE_PROBE_FILE": "${FAKE_PROBE_FILE}",
+            "FAKE_API_KEY": "${FAKE_API_KEY}",
         }
-        cfg = {
-            "reps": 1,
-            "litellm": {"base_url": f"http://127.0.0.1:{port}", "api_key": "${FAKE_KEY}"},
-            "harnesses": {k: harness(k) for k in ("claude", "opencode", "pi", "codex", "cursor")},
-            "matrix": [
-                {"harness": "claude", "model": "fix"},
-                {"harness": "opencode", "model": "p/nofix"},
-                {"harness": "pi", "model": "p/fix"},
-                {"harness": "codex", "model": "fix", "price": "x"},
-                {"harness": "cursor", "model": "fix", "price": "x"},
-            ],
-            "prices": {"x": {"input": 3, "output": 15}},
-            "tasks": [fizz],
-        }
+        fizz = fixtures.fizzbuzz_task()
+        cfg = dict(
+            fixtures.fake_config(harness_env),
+            litellm={"base_url": f"http://127.0.0.1:{port}", "api_key": "${FAKE_KEY}"},
+        )
         (tmp / "config.json").write_text(json.dumps(cfg))
 
         # --- parsers, cost, reconcile (full script)
@@ -175,7 +151,7 @@ def main():
             cfg,
             output_dir="results-sec",
             tasks=[hist],
-            harnesses={"claude": harness("claude", "hack")},
+            harnesses={"claude": fixtures.harness("claude", harness_env, "hack")},
             matrix=[{"harness": "claude", "model": "m"}],
             sandbox={"prefix": ["env", "FAKE_SANDBOX={workdir}"]},
         )

@@ -1752,10 +1752,10 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tests"))
 sys.path.insert(0, str(ROOT))
 import fake_litellm  # noqa: E402
+import fixtures  # noqa: E402
 import harness_bench as hb  # noqa: E402
 
-PY = sys.executable
-AGENT = str(ROOT / "tests" / "fake_agent.py")
+PY = fixtures.PY
 API_KEY = "sk-test-agent-key-0123456789"
 
 
@@ -1818,40 +1818,16 @@ def main():
         srv, port = fake_litellm.serve()
         threading.Thread(target=srv.serve_forever, daemon=True).start()
 
-        def harness(kind, mode="{model_name}"):
-            return {
-                "parser": kind,
-                "command": [PY, AGENT, kind, mode],
-                "env": {
-                    "ANTHROPIC_CUSTOM_HEADERS": "x-litellm-tags: {run_tag}",
-                    "FAKE_TAGS_FILE": "${FAKE_TAGS_FILE}",
-                    "FAKE_PROBE_FILE": "${FAKE_PROBE_FILE}",
-                    "FAKE_API_KEY": "${FAKE_API_KEY}",
-                },
-            }
-
-        test_cmd = f"{PY} -m unittest -q test_hidden.py"
-        fizz = {
-            "id": "fizzbuzz",
-            "repo": "tasks/fizzbuzz/repo",
-            "prompt": "fix it",
-            "hidden_tests": "tasks/fizzbuzz/hidden_tests",
-            "test": test_cmd,
+        harness_env = {
+            "FAKE_TAGS_FILE": "${FAKE_TAGS_FILE}",
+            "FAKE_PROBE_FILE": "${FAKE_PROBE_FILE}",
+            "FAKE_API_KEY": "${FAKE_API_KEY}",
         }
-        cfg = {
-            "reps": 1,
-            "litellm": {"base_url": f"http://127.0.0.1:{port}", "api_key": "${FAKE_KEY}"},
-            "harnesses": {k: harness(k) for k in ("claude", "opencode", "pi", "codex", "cursor")},
-            "matrix": [
-                {"harness": "claude", "model": "fix"},
-                {"harness": "opencode", "model": "p/nofix"},
-                {"harness": "pi", "model": "p/fix"},
-                {"harness": "codex", "model": "fix", "price": "x"},
-                {"harness": "cursor", "model": "fix", "price": "x"},
-            ],
-            "prices": {"x": {"input": 3, "output": 15}},
-            "tasks": [fizz],
-        }
+        fizz = fixtures.fizzbuzz_task()
+        cfg = dict(
+            fixtures.fake_config(harness_env),
+            litellm={"base_url": f"http://127.0.0.1:{port}", "api_key": "${FAKE_KEY}"},
+        )
         (tmp / "config.json").write_text(json.dumps(cfg))
 
         # --- parsers, cost, reconcile (full script)
@@ -1910,7 +1886,7 @@ def main():
             cfg,
             output_dir="results-sec",
             tasks=[hist],
-            harnesses={"claude": harness("claude", "hack")},
+            harnesses={"claude": fixtures.harness("claude", harness_env, "hack")},
             matrix=[{"harness": "claude", "model": "m"}],
             sandbox={"prefix": ["env", "FAKE_SANDBOX={workdir}"]},
         )
@@ -2124,6 +2100,1218 @@ def serve(port=0):
     """Start server; return (server, port)."""
     srv = HTTPServer(("127.0.0.1", port), Handler)
     return srv, srv.server_address[1]
+```
+
+Golden tests (`python3 -m unittest discover -s tests -p 'test_*.py'`) freeze the `report` and `run` output against files in `tests/golden/`. `tests/test_golden.py`:
+
+```python
+"""Golden (characterization) tests: freeze current CLI output so refactors stay safe.
+
+Run: python3 -m unittest discover -s tests -p 'test_*.py'
+Regenerate goldens only for an intended behavior change: HB_UPDATE_GOLDEN=1.
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fixtures  # noqa: E402
+
+ROOT = fixtures.ROOT
+GOLDEN = ROOT / "tests" / "golden"
+PY = fixtures.PY
+
+
+def make_tmp(test: unittest.TestCase) -> Path:
+    tmp = Path(tempfile.mkdtemp(prefix="hb-golden-"))
+    test.addCleanup(shutil.rmtree, tmp, True)
+    for f in ("harness_bench.py", "harness_bench_litellm.py"):
+        shutil.copy(ROOT / f, tmp)
+    (tmp / "results").mkdir()
+    (tmp / "config.json").write_text('{"output_dir": "results"}')
+    return tmp
+
+
+def run_cli(tmp: Path, script: str, *args: str, config: str = "config.json") -> subprocess.CompletedProcess[str]:
+    return subprocess.run([PY, script, *args, "--config", config], cwd=tmp, capture_output=True, text=True)
+
+
+def mask_summary(md: str) -> str:
+    lines = md.split("\n")
+    lines[0] = "# Harness x model — <masked>"
+    return "\n".join(lines)
+
+
+def mask_row(row: dict[str, Any]) -> dict[str, Any]:
+    row = dict(row)
+    for k in ("ts", "wall_s", "run_tag", "t_start", "t_end"):
+        if k in row:
+            row[k] = "<masked>"
+    return row
+
+
+class GoldenCase(unittest.TestCase):
+    def assert_golden(self, name: str, actual: str) -> None:
+        path = GOLDEN / name
+        if os.environ.get("HB_UPDATE_GOLDEN") == "1":
+            path.write_text(actual)
+            return
+        self.assertTrue(path.exists(), f"missing golden {path}; create with HB_UPDATE_GOLDEN=1")
+        self.assertEqual(path.read_text(), actual)
+
+
+class GoldenReport(GoldenCase):
+    def test_summary_matches_golden(self) -> None:
+        tmp = make_tmp(self)
+        shutil.copy(GOLDEN / "results.jsonl", tmp / "results" / "results.jsonl")
+        p = run_cli(tmp, "harness_bench.py", "report")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assert_golden("summary.md", mask_summary((tmp / "results/summary.md").read_text()))
+        self.assert_golden("summary.csv", (tmp / "results/summary.csv").read_text())
+
+
+class GoldenRun(GoldenCase):
+    def test_results_match_golden(self) -> None:
+        tmp = make_tmp(self)
+        shutil.copytree(ROOT / "tasks" / "fizzbuzz", tmp / "tasks" / "fizzbuzz")
+        cfg = fixtures.fake_config({"FAKE_TAGS_FILE": str(tmp / "tags.txt")})
+        (tmp / "config.json").write_text(json.dumps(cfg))
+        p = run_cli(tmp, "harness_bench.py", "run", "--allow-unsandboxed")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        rows = [json.loads(x) for x in (tmp / "results/results.jsonl").read_text().splitlines() if x.strip()]
+        self.assertEqual(len(rows), 5)
+        actual = "".join(json.dumps(mask_row(r), sort_keys=True) + "\n" for r in rows)
+        self.assert_golden("run.jsonl", actual)
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+`tests/fixtures.py` (shared by the smoke and golden tests):
+
+```python
+"""Shared test fixtures: fake benchmark config, temp dirs, results rows and output capture.
+
+Used by every test module (smoke, golden and the in-process unit tests) so they exercise the
+same setup. Importing it puts the repo root on sys.path, so tests can import the engine directly.
+"""
+
+import contextlib
+import io
+import json
+import shutil
+import sys
+import tempfile
+import unittest
+from collections.abc import Callable, Iterator, Mapping
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))  # lets tests import the engine in-process (coverage sees it directly)
+PY = sys.executable
+AGENT = str(ROOT / "tests" / "fake_agent.py")
+HARNESS_KINDS = ("claude", "opencode", "pi", "codex", "cursor")
+
+
+def prices() -> dict[str, dict[str, int]]:
+    """A fresh price table (one entry, `x`), so callers may mutate it."""
+    return {"x": {"input": 3, "output": 15}}
+
+
+def harness(kind: str, extra_env: Mapping[str, str], mode: str = "{model_name}") -> dict[str, Any]:
+    """Config entry that runs tests/fake_agent.py as harness `kind`."""
+    return {
+        "parser": kind,
+        "command": [PY, AGENT, kind, mode],
+        "env": {"ANTHROPIC_CUSTOM_HEADERS": "x-litellm-tags: {run_tag}", **extra_env},
+    }
+
+
+def fizzbuzz_task() -> dict[str, Any]:
+    """A fresh copy of the fizzbuzz task, so callers may mutate it."""
+    return {
+        "id": "fizzbuzz",
+        "repo": "tasks/fizzbuzz/repo",
+        "prompt": "fix it",
+        "hidden_tests": "tasks/fizzbuzz/hidden_tests",
+        "test": f"{PY} -m unittest -q test_hidden.py",
+    }
+
+
+def matrix() -> list[dict[str, Any]]:
+    """One entry per harness kind; `nofix` makes the agent leave the bug in place."""
+    return [
+        {"harness": "claude", "model": "fix"},
+        {"harness": "opencode", "model": "p/nofix"},
+        {"harness": "pi", "model": "p/fix"},
+        {"harness": "codex", "model": "fix", "price": "x"},
+        {"harness": "cursor", "model": "fix", "price": "x"},
+    ]
+
+
+def fake_config(extra_env: Mapping[str, str]) -> dict[str, Any]:
+    """Full benchmark config with all five fake harnesses; `extra_env` goes into each harness env."""
+    return {
+        "reps": 1,
+        "harnesses": {kind: harness(kind, extra_env) for kind in HARNESS_KINDS},
+        "matrix": matrix(),
+        "prices": prices(),
+        "tasks": [fizzbuzz_task()],
+    }
+
+
+def tmpdir(test: unittest.TestCase) -> Path:
+    """A temp directory removed when `test` finishes."""
+    path = Path(tempfile.mkdtemp(prefix="hb-unit-")).resolve()
+    test.addCleanup(shutil.rmtree, path, True)
+    return path
+
+
+def run_row(**overrides: Any) -> dict[str, Any]:
+    """A complete results.jsonl row (the fields `aggregate` and `reconcile` read)."""
+    row: dict[str, Any] = {
+        "task": "t1",
+        "harness": "h",
+        "model": "m",
+        "rep": 1,
+        "passed": True,
+        "input": 100,
+        "output": 10,
+        "reasoning": 0,
+        "cache_read": 0,
+        "cache_write": 0,
+        "turns": 1,
+        "wall_s": 1.0,
+        "parse_ok": True,
+        "run_tag": "tag-1",
+        "t_start": 1_700_000_000.0,
+        "t_end": 1_700_000_010.0,
+        "cost_reported": None,
+        "cost_computed": None,
+    }
+    row.update(overrides)
+    return row
+
+
+def write_rows(path: Path, *rows: dict[str, Any]) -> None:
+    """Write `rows` as a results.jsonl file at `path`."""
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+
+def read_rows(path: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+@contextlib.contextmanager
+def quiet() -> Iterator[io.StringIO]:
+    """Capture stdout (the engine prints progress); yields the buffer."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        yield buf
+
+
+def call_quiet(fn: Callable[..., Any], *args: Any) -> str:
+    """Call `fn(*args)` with stdout captured and return what it printed."""
+    with quiet() as buf:
+        fn(*args)
+    return buf.getvalue()
+```
+
+Unit tests call the engine in-process (`python3 -m unittest discover -s tests -p 'test_*.py'`), so `make coverage` sees every line.
+
+`tests/test_parsers.py`:
+
+```python
+"""Unit tests for the output parsers, cost helpers and formatting. In-process, no subprocesses."""
+
+import json
+import math
+import unittest
+from typing import Any
+
+import fixtures  # noqa: F401  (puts the repo root on sys.path)
+import harness_bench as hb
+
+
+def jl(*objs: Any) -> str:
+    return "\n".join(json.dumps(o) for o in objs)
+
+
+class NumTests(unittest.TestCase):
+    def test_returns_first_numeric_value_among_keys(self) -> None:
+        self.assertEqual(hb.num({"a": "x", "b": 7}, "a", "b"), 7)
+
+    def test_booleans_are_not_numbers(self) -> None:
+        self.assertEqual(hb.num({"a": True}, "a"), 0)
+
+    def test_non_dict_gives_zero(self) -> None:
+        self.assertEqual(hb.num(None, "a"), 0)
+
+    def test_missing_keys_give_zero(self) -> None:
+        self.assertEqual(hb.num({}, "a"), 0)
+
+
+class JsonLinesTests(unittest.TestCase):
+    def test_skips_non_json_and_malformed_lines(self) -> None:
+        text = 'progress\n{"a": 1}\n{broken\n  {"b": 2}  \n'
+        self.assertEqual(list(hb.json_lines(text)), [{"a": 1}, {"b": 2}])
+
+
+class ExpandEnvTests(unittest.TestCase):
+    def test_unset_variable_expands_to_empty_string(self) -> None:
+        self.assertEqual(hb.expand_env("a-${HB_SURELY_UNSET_VAR}-b"), "a--b")
+
+
+class ClaudeParserTests(unittest.TestCase):
+    def test_sums_model_usage_including_helper_models(self) -> None:
+        out = jl(
+            {
+                "type": "result",
+                "num_turns": 2,
+                "total_cost_usd": 0.5,
+                "modelUsage": {"a": {"inputTokens": 1, "outputTokens": 2}, "b": {"inputTokens": 10}},
+            }
+        )
+        u = hb.parse_claude(out)
+        self.assertEqual((u["input"], u["output"], u["turns"], u["cost_reported"]), (11, 2, 2, 0.5))
+
+    def test_falls_back_to_usage_without_model_usage(self) -> None:
+        out = jl({"type": "result", "usage": {"input_tokens": 5, "output_tokens": 6, "cache_read_input_tokens": 7}})
+        u = hb.parse_claude(out)
+        self.assertEqual((u["input"], u["output"], u["cache_read"]), (5, 6, 7))
+
+    def test_missing_cost_stays_none_not_zero(self) -> None:
+        self.assertIsNone(hb.parse_claude(jl({"type": "result", "usage": {}}))["cost_reported"])
+
+    def test_parses_single_pretty_printed_object(self) -> None:
+        out = json.dumps({"type": "result", "usage": {"input_tokens": 3}}, indent=2)
+        self.assertEqual(hb.parse_claude(out)["input"], 3)
+
+    def test_non_json_output_returns_none(self) -> None:
+        self.assertIsNone(hb.parse_claude("not json"))
+
+    def test_stream_json_uses_the_result_event_and_ignores_others(self) -> None:
+        out = jl({"type": "assistant"}, {"type": "result", "usage": {"input_tokens": 4}})
+        self.assertEqual(hb.parse_claude(out)["input"], 4)
+
+
+class OpencodeParserTests(unittest.TestCase):
+    def test_sums_step_finish_events_and_accepts_dash_spelling(self) -> None:
+        out = jl(
+            {"type": "step_finish", "part": {"cost": 0.1, "tokens": {"input": 1, "cache": {"read": 4, "write": 5}}}},
+            {"type": "step-finish", "tokens": {"input": 2, "cacheRead": 6, "cacheWrite": 7}},
+            {"type": "text"},
+        )
+        u = hb.parse_opencode(out)
+        self.assertEqual((u["input"], u["cache_read"], u["cache_write"], u["turns"]), (3, 10, 12, 2))
+        self.assertAlmostEqual(u["cost_reported"], 0.1)
+
+    def test_no_step_finish_returns_none(self) -> None:
+        self.assertIsNone(hb.parse_opencode(jl({"type": "text"})))
+
+
+class PiParserTests(unittest.TestCase):
+    def test_counts_only_assistant_message_end(self) -> None:
+        usage = {"input": 10, "cost": {"total": 0.25}}
+        out = jl(
+            {"type": "message_end", "message": {"role": "assistant", "usage": usage}},
+            {"type": "message_end", "message": {"role": "user", "usage": usage}},
+            {"type": "message_update", "message": {"role": "assistant", "usage": usage}},
+        )
+        u = hb.parse_pi(out)
+        self.assertEqual((u["input"], u["turns"], u["cost_reported"]), (10, 1, 0.25))
+
+    def test_numeric_cost_is_accepted(self) -> None:
+        out = jl({"type": "message_end", "message": {"role": "assistant", "usage": {"cost": 0.5}}})
+        self.assertEqual(hb.parse_pi(out)["cost_reported"], 0.5)
+
+    def test_absent_cost_is_none_not_zero(self) -> None:
+        out = jl({"type": "message_end", "message": {"role": "assistant", "usage": {"input": 1}}})
+        self.assertIsNone(hb.parse_pi(out)["cost_reported"])
+
+    def test_no_assistant_messages_returns_none(self) -> None:
+        self.assertIsNone(hb.parse_pi(jl({"type": "session"})))
+
+
+class CursorParserTests(unittest.TestCase):
+    def test_result_without_usage_returns_none(self) -> None:
+        self.assertIsNone(hb.parse_cursor(jl({"type": "result", "result": "ok"})))
+
+    def test_no_result_returns_none(self) -> None:
+        self.assertIsNone(hb.parse_cursor("plain text"))
+
+    def test_events_before_the_result_are_ignored(self) -> None:
+        out = jl({"type": "system"}, {"type": "result", "usage": {"inputTokens": 2}})
+        self.assertEqual(hb.parse_cursor(out)["input"], 2)
+
+    def test_usage_fields_and_cost_are_read_when_present(self) -> None:
+        out = jl(
+            {
+                "type": "result",
+                "usage": {"inputTokens": 1, "outputTokens": 2, "cacheReadTokens": 3, "cacheWriteTokens": 4},
+                "total_cost_usd": 0.75,
+            }
+        )
+        u = hb.parse_cursor(out)
+        self.assertEqual((u["input"], u["output"], u["cache_read"], u["cache_write"]), (1, 2, 3, 4))
+        self.assertEqual((u["cost_reported"], u["turns"]), (0.75, 1))
+
+    def test_zero_cost_is_reported_as_none(self) -> None:
+        out = jl({"type": "result", "usage": {"inputTokens": 1}})
+        self.assertIsNone(hb.parse_cursor(out)["cost_reported"])
+
+
+class CodexParserTests(unittest.TestCase):
+    def test_uses_last_cumulative_usage_and_splits_cached_input(self) -> None:
+        out = jl(
+            {"type": "turn.completed", "usage": {"input_tokens": 100, "cached_input_tokens": 40, "output_tokens": 5}},
+            {"type": "turn.completed", "usage": {"input_tokens": 300, "cached_input_tokens": 100, "output_tokens": 9}},
+        )
+        u = hb.parse_codex(out)
+        self.assertEqual((u["input"], u["cache_read"], u["output"], u["turns"]), (200, 100, 9, 2))
+
+    def test_cached_larger_than_input_never_goes_negative(self) -> None:
+        out = jl({"type": "turn.completed", "usage": {"input_tokens": 1, "cached_input_tokens": 5}})
+        self.assertEqual(hb.parse_codex(out)["input"], 0)
+
+    def test_no_completed_turn_returns_none(self) -> None:
+        self.assertIsNone(hb.parse_codex(jl({"type": "thread.started"})))
+
+
+class ComputedCostTests(unittest.TestCase):
+    USAGE = {"input": 1_000_000, "output": 1_000_000, "reasoning": 0, "cache_read": 1_000_000, "cache_write": 0}
+
+    def test_missing_price_gives_none(self) -> None:
+        self.assertIsNone(hb.computed_cost(self.USAGE, None))
+
+    def test_all_zero_price_gives_none_not_zero(self) -> None:
+        self.assertIsNone(hb.computed_cost(self.USAGE, {"input": 0, "output": 0, "_note": "free?"}))
+
+    def test_cache_read_defaults_to_input_price(self) -> None:
+        self.assertAlmostEqual(hb.computed_cost(self.USAGE, {"input": 1, "output": 2}), 4.0)
+
+    def test_explicit_cache_read_price_wins(self) -> None:
+        self.assertAlmostEqual(hb.computed_cost(self.USAGE, {"input": 1, "output": 2, "cache_read": 0.5}), 3.5)
+
+
+class FormatTests(unittest.TestCase):
+    def test_money_none_inf_small_and_large(self) -> None:
+        self.assertEqual(
+            [hb.fmt_money(v) for v in (None, math.inf, 0.12345, 12.345)], ["n/a", "inf", "$0.1235", "$12.35"]
+        )
+
+    def test_int_none_inf_and_grouping(self) -> None:
+        self.assertEqual([hb.fmt_int(v) for v in (None, math.inf, 1234567.4)], ["n/a", "n/a", "1,234,567"])
+
+
+class RowTagsTests(unittest.TestCase):
+    def test_list_is_returned_as_is(self) -> None:
+        self.assertEqual(hb.row_tags({"request_tags": ["a", "b"]}), ["a", "b"])
+
+    def test_json_string_is_decoded(self) -> None:
+        self.assertEqual(hb.row_tags({"request_tags": '["a"]'}), ["a"])
+
+    def test_comma_separated_string_is_split(self) -> None:
+        self.assertEqual(hb.row_tags({"request_tags": "a, b"}), ["a", "b"])
+
+    def test_missing_or_non_list_gives_empty(self) -> None:
+        self.assertEqual((hb.row_tags({}), hb.row_tags({"request_tags": "7"})), ([], []))
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+`tests/test_workspace.py`:
+
+```python
+"""Unit tests for config validation, sandbox wrapping, env files and workdir handling. In-process."""
+
+import os
+import subprocess
+import unittest
+from pathlib import Path
+from typing import Any
+from unittest import mock
+
+import fixtures
+import harness_bench as hb
+
+GIT_ID = ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]
+
+
+def run_git(cwd: Path, *args: str) -> str:
+    p = subprocess.run(["git", *GIT_ID, *args], cwd=cwd, check=True, capture_output=True, text=True)
+    return p.stdout.strip()
+
+
+def base_config(**overrides: Any) -> dict[str, Any]:
+    cfg = fixtures.fake_config({})
+    cfg.update(overrides)
+    return cfg
+
+
+class ValidateConfigTests(unittest.TestCase):
+    def assert_rejected(self, cfg: dict[str, Any], fragment: str) -> None:
+        with self.assertRaises(SystemExit) as cm:
+            hb.validate_config(cfg)
+        self.assertIn(fragment, str(cm.exception.code))
+
+    def test_valid_config_passes(self) -> None:
+        hb.validate_config(base_config())
+
+    def test_task_id_with_separator_is_rejected(self) -> None:
+        cfg = base_config(tasks=[dict(fixtures.fizzbuzz_task(), id="a/b")])
+        self.assert_rejected(cfg, "invalid task id")
+
+    def test_task_id_with_leading_dot_is_rejected(self) -> None:
+        cfg = base_config(tasks=[dict(fixtures.fizzbuzz_task(), id=".hidden")])
+        self.assert_rejected(cfg, "invalid task id")
+
+    def test_option_like_repo_is_rejected(self) -> None:
+        cfg = base_config(tasks=[dict(fixtures.fizzbuzz_task(), repo="--upload-pack=x")])
+        self.assert_rejected(cfg, "must not start with '-'")
+
+    def test_absolute_protected_path_is_rejected(self) -> None:
+        cfg = base_config(tasks=[dict(fixtures.fizzbuzz_task(), protected_paths=["/etc/passwd"])])
+        self.assert_rejected(cfg, "must be relative")
+
+    def test_protected_path_with_parent_reference_is_rejected(self) -> None:
+        cfg = base_config(tasks=[dict(fixtures.fizzbuzz_task(), protected_paths=["a/../b"])])
+        self.assert_rejected(cfg, "must be relative")
+
+    def test_harness_name_with_space_is_rejected(self) -> None:
+        cfg = base_config()
+        cfg["harnesses"]["bad name"] = cfg["harnesses"]["claude"]
+        self.assert_rejected(cfg, "invalid harness name")
+
+    def test_spend_key_in_env_passthrough_is_rejected(self) -> None:
+        cfg = base_config(litellm={"base_url": "https://x", "api_key": "${SPEND}"}, env_passthrough=["SPEND"])
+        self.assert_rejected(cfg, "spend key")
+
+    def test_spend_key_in_harness_env_is_rejected(self) -> None:
+        cfg = base_config(litellm={"base_url": "https://x", "api_key": "${SPEND}"})
+        cfg["harnesses"]["pi"]["env"]["TOKEN"] = "Bearer ${SPEND}"
+        self.assert_rejected(cfg, "spend key")
+
+
+class SafeNameAndRedactTests(unittest.TestCase):
+    def test_safe_replaces_separators_and_strips_leading_dots(self) -> None:
+        self.assertEqual(hb.safe("../a/b c"), "_a_b_c")
+
+    def test_safe_never_returns_empty(self) -> None:
+        self.assertEqual(hb.safe("..."), "_")
+
+    def test_redact_hides_long_secrets_only(self) -> None:
+        text = hb.redact("value=hunter2-hunter2 short=abc", ["hunter2-hunter2", "abc", ""])
+        self.assertEqual(text, "value=***REDACTED*** short=abc")
+
+
+class BaseEnvTests(unittest.TestCase):
+    def test_only_allowlisted_and_passthrough_variables_reach_the_agent(self) -> None:
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.update(HB_PASS="1", HB_SECRET="2", SPEND="3")
+        env = hb.base_env({"env_passthrough": ["HB_PASS", "HB_MISSING"], "litellm": {"api_key": "${SPEND}"}})
+        self.assertEqual(("HB_PASS" in env, "HB_SECRET" in env, "SPEND" in env), (True, False, False))
+
+    def test_spend_key_is_removed_even_when_allowlisted(self) -> None:
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ["TZ"] = "UTC"
+        env = hb.base_env({"litellm": {"api_key": "${TZ}"}})
+        self.assertNotIn("TZ", env)
+
+
+class RmtreeInsideTests(unittest.TestCase):
+    def test_removes_a_directory_inside_root(self) -> None:
+        root = fixtures.tmpdir(self)
+        child = root / "child"
+        child.mkdir()
+        hb.rmtree_inside(child, root)
+        self.assertFalse(child.exists())
+
+    def test_refuses_the_root_itself(self) -> None:
+        root = fixtures.tmpdir(self)
+        with self.assertRaises(RuntimeError):
+            hb.rmtree_inside(root, root)
+        self.assertTrue(root.exists())
+
+    def test_refuses_a_path_outside_root(self) -> None:
+        root, other = fixtures.tmpdir(self), fixtures.tmpdir(self)
+        with self.assertRaises(RuntimeError):
+            hb.rmtree_inside(other, root)
+        self.assertTrue(other.exists())
+
+
+class WrapTests(unittest.TestCase):
+    def test_without_prefix_returns_argv_unchanged(self) -> None:
+        self.assertEqual(hb.wrap({}, ["a", "b"], "/w", "/e"), ["a", "b"])
+
+    def test_prefix_is_formatted_and_prepended(self) -> None:
+        cfg = {"sandbox": {"prefix": ["box", "--env-file", "{env_file}", "-v", "{workdir}:/w"]}}
+        self.assertEqual(hb.wrap(cfg, ["a"], "/w", "/e"), ["box", "--env-file", "/e", "-v", "/w:/w", "a"])
+
+
+class WriteEnvFileTests(unittest.TestCase):
+    def test_file_is_private_and_skips_host_only_and_multiline_values(self) -> None:
+        path = fixtures.tmpdir(self) / "env"
+        hb.write_env_file({"A": "1", "PATH": "/bin", "B": "x\ny", "HOME": "/h"}, path)
+        self.assertEqual((path.read_text(), path.stat().st_mode & 0o777), ("A=1\n", 0o600))
+
+
+class RunProcTests(unittest.TestCase):
+    def test_returns_exit_code_and_streams(self) -> None:
+        code = "import sys; print('out'); print('err', file=sys.stderr); sys.exit(3)"
+        rc, timed_out, out, err = hb.run_proc([fixtures.PY, "-c", code], None, os.environ.copy(), 30)
+        self.assertEqual((rc, timed_out, out.strip(), err.strip()), (3, False, "out", "err"))
+
+    def test_timeout_is_reported_with_partial_output(self) -> None:
+        # The child flushes a readiness line before sleeping; 5 s leaves room for slow interpreter start-up.
+        code = "import sys, time; print('partial', flush=True); print('e', file=sys.stderr, flush=True); time.sleep(60)"
+        rc, timed_out, out, err = hb.run_proc([fixtures.PY, "-c", code], None, os.environ.copy(), 5)
+        self.assertEqual((rc, timed_out, out.strip(), err.strip()), (-1, True, "partial", "e"))
+
+
+class BuildCmdTests(unittest.TestCase):
+    def test_provider_is_split_from_model(self) -> None:
+        cmd = hb.build_cmd(["{provider}", "{model_name}", "{model}", "{prompt}"], "p/m", "go")
+        self.assertEqual(cmd, ["p", "m", "p/m", "go"])
+
+    def test_model_without_provider_has_empty_provider(self) -> None:
+        self.assertEqual(hb.build_cmd(["[{provider}]", "{model_name}"], "m", "go"), ["[]", "m"])
+
+
+class DoneKeysTests(unittest.TestCase):
+    def test_missing_file_gives_no_keys(self) -> None:
+        self.assertEqual(hb.done_keys(fixtures.tmpdir(self) / "none.jsonl"), set())
+
+    def test_keys_identify_task_harness_model_rep(self) -> None:
+        path = fixtures.tmpdir(self) / "r.jsonl"
+        path.write_text('{"task": "t", "harness": "h", "model": "m", "rep": 2}\nnoise\n')
+        self.assertEqual(hb.done_keys(path), {("t", "h", "m", 2)})
+
+
+class ResolveWorkRootTests(unittest.TestCase):
+    def test_work_dir_inside_the_repo_is_rejected(self) -> None:
+        base = fixtures.tmpdir(self)
+        with self.assertRaises(SystemExit) as cm:
+            hb.resolve_work_root({"work_dir": str(base / "work")}, base)
+        self.assertIn("inside the benchmark repo", str(cm.exception.code))
+
+    def test_work_dir_outside_the_repo_is_created(self) -> None:
+        base, outside = fixtures.tmpdir(self), fixtures.tmpdir(self)
+        root = hb.resolve_work_root({"work_dir": str(outside / "w")}, base)
+        self.assertEqual((root, root.is_dir()), (outside / "w", True))
+
+    def test_default_is_a_fresh_temp_dir(self) -> None:
+        root = hb.resolve_work_root({}, fixtures.tmpdir(self))
+        self.addCleanup(root.rmdir)
+        self.assertTrue(root.name.startswith("harness-bench-work-"))
+
+
+class PrepareWorkdirTests(unittest.TestCase):
+    def make_git_repo(self, base: Path) -> tuple[Path, str]:
+        repo = base / "src"
+        repo.mkdir()
+        run_git(repo, "init", "-q", "-b", "main")
+        (repo / "f.txt").write_text("old")
+        run_git(repo, "add", "-A")
+        run_git(repo, "commit", "-qm", "one")
+        old = run_git(repo, "rev-parse", "HEAD")
+        (repo / "f.txt").write_text("new")
+        run_git(repo, "commit", "-qam", "two")
+        return repo, old
+
+    def test_plain_directory_is_copied(self) -> None:
+        base = fixtures.tmpdir(self)
+        (base / "repo").mkdir()
+        (base / "repo" / "a.txt").write_text("a")
+        hb.prepare_workdir({"id": "t", "repo": "repo"}, base, base / "work")
+        self.assertEqual((base / "work" / "a.txt").read_text(), "a")
+
+    def test_git_source_is_checked_out_at_ref_without_history(self) -> None:
+        base = fixtures.tmpdir(self)
+        repo, old = self.make_git_repo(base)
+        hb.prepare_workdir({"id": "t", "repo": str(repo), "ref": old}, base, base / "work")
+        self.assertEqual(((base / "work" / "f.txt").read_text(), (base / "work" / ".git").exists()), ("old", False))
+
+    def test_git_source_without_ref_uses_head_and_reuses_cache(self) -> None:
+        base = fixtures.tmpdir(self)
+        repo, _ = self.make_git_repo(base)
+        task = {"id": "t", "repo": str(repo)}
+        hb.prepare_workdir(task, base, base / "w1")
+        hb.prepare_workdir(task, base, base / "w2")
+        self.assertEqual((base / "w2" / "f.txt").read_text(), "new")
+
+    def test_is_git_source_recognises_urls_and_ssh(self) -> None:
+        self.assertEqual(
+            [hb.is_git_source(s) for s in ("a.git", "https://x/y", "git@h:r", "plain")], [True] * 3 + [False]
+        )
+
+
+class MakeBaselineTests(unittest.TestCase):
+    def test_returns_sha_of_a_single_commit_with_current_files(self) -> None:
+        work = fixtures.tmpdir(self)
+        (work / "a.txt").write_text("a")
+        sha = hb.make_baseline(work)
+        self.assertEqual((sha, run_git(work, "rev-list", "--count", "HEAD")), (run_git(work, "rev-parse", "HEAD"), "1"))
+
+
+class ProtectedPathTests(unittest.TestCase):
+    TASK = {"protected_paths": ["tests_dir", "runner.py", "missing.txt"]}
+
+    def setUp(self) -> None:
+        self.work, self.snap = fixtures.tmpdir(self), fixtures.tmpdir(self)
+        (self.work / "tests_dir").mkdir()
+        (self.work / "tests_dir" / "t.py").write_text("orig")
+        (self.work / "runner.py").write_text("orig")
+
+    def test_restore_undoes_edits_additions_and_deletions(self) -> None:
+        hb.snapshot_protected(self.TASK, self.work, self.snap)
+        (self.work / "tests_dir" / "t.py").write_text("hacked")
+        (self.work / "tests_dir" / "extra.py").write_text("planted")
+        (self.work / "runner.py").unlink()
+        hb.restore_protected(self.TASK, self.work, self.snap)
+        self.assertEqual(
+            (
+                (self.work / "tests_dir" / "t.py").read_text(),
+                (self.work / "tests_dir" / "extra.py").exists(),
+                (self.work / "runner.py").read_text(),
+            ),
+            ("orig", False, "orig"),
+        )
+
+    def test_path_replaced_by_a_symlink_is_restored_as_a_real_file(self) -> None:
+        hb.snapshot_protected(self.TASK, self.work, self.snap)
+        (self.work / "runner.py").unlink()
+        (self.work / "runner.py").symlink_to("/etc/hostname")
+        hb.restore_protected(self.TASK, self.work, self.snap)
+        runner = self.work / "runner.py"
+        self.assertEqual((runner.is_symlink(), runner.read_text()), (False, "orig"))
+
+    def test_path_absent_at_snapshot_time_is_removed_on_restore(self) -> None:
+        hb.snapshot_protected(self.TASK, self.work, self.snap)
+        (self.work / "missing.txt").write_text("planted")
+        hb.restore_protected(self.TASK, self.work, self.snap)
+        self.assertFalse((self.work / "missing.txt").exists())
+
+    def test_symlinked_protected_path_is_snapshotted_as_a_link(self) -> None:
+        (self.work / "runner.py").unlink()
+        (self.work / "runner.py").symlink_to("target")
+        hb.snapshot_protected(self.TASK, self.work, self.snap)
+        self.assertTrue((self.snap / "runner.py").is_symlink())
+
+
+class SaveDiffTests(unittest.TestCase):
+    def test_diff_contains_new_and_changed_files(self) -> None:
+        work, out = fixtures.tmpdir(self), fixtures.tmpdir(self) / "d.diff"
+        (work / "a.txt").write_text("a")
+        baseline = hb.make_baseline(work)
+        (work / "a.txt").write_text("changed")
+        (work / "new.txt").write_text("n")
+        hb.save_diff(work, baseline, out)
+        text = out.read_text()
+        self.assertIn("a.txt", text)
+        self.assertIn("new.txt", text)
+
+    def test_unknown_baseline_is_reported_in_the_diff_file(self) -> None:
+        work, out = fixtures.tmpdir(self), fixtures.tmpdir(self) / "d.diff"
+        (work / "a.txt").write_text("a")
+        hb.make_baseline(work)
+        hb.save_diff(work, "0" * 40, out)
+        self.assertIn("git diff failed", out.read_text())
+
+    def test_directory_that_is_not_a_repo_is_reported_in_the_diff_file(self) -> None:
+        out = fixtures.tmpdir(self) / "d.diff"
+        hb.save_diff(fixtures.tmpdir(self), "abc", out)
+        self.assertIn("git diff failed", out.read_text())
+
+    def test_long_diff_is_truncated(self) -> None:
+        work, out = fixtures.tmpdir(self), fixtures.tmpdir(self) / "d.diff"
+        (work / "a.txt").write_text("a")
+        baseline = hb.make_baseline(work)
+        (work / "a.txt").write_text("b" * 1000)
+        hb.save_diff(work, baseline, out, limit=50)
+        self.assertTrue(out.read_text().endswith("[truncated]"))
+
+
+class CheckLitellmUrlTests(unittest.TestCase):
+    def test_https_and_localhost_http_are_allowed(self) -> None:
+        for url in ("https://litellm.example.com", "http://localhost:4000", "http://127.0.0.1:1"):
+            hb.check_litellm_url(url)
+
+    def test_plain_http_to_a_remote_host_is_rejected(self) -> None:
+        with self.assertRaises(SystemExit):
+            hb.check_litellm_url("http://litellm.example.com")
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+`tests/test_run.py`:
+
+```python
+"""In-process tests for `cmd_run`, `aggregate` and `cmd_report` with the fake agents."""
+
+import argparse
+import shutil
+import unittest
+from pathlib import Path
+from typing import Any
+
+import fixtures
+import harness_bench as hb
+
+
+def args(**overrides: Any) -> argparse.Namespace:
+    values: dict[str, Any] = {
+        "reps": None,
+        "only": None,
+        "keep": False,
+        "dry_run": False,
+        "allow_unsandboxed": True,
+        "no_report": True,
+        "cost_source": None,
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+def rows_of(base: Path) -> list[dict[str, Any]]:
+    return fixtures.read_rows(base / "results" / "results.jsonl")
+
+
+class RunTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.base = fixtures.tmpdir(self)
+        shutil.copytree(fixtures.ROOT / "tasks" / "fizzbuzz", self.base / "tasks" / "fizzbuzz")
+        self.cfg = fixtures.fake_config({"FAKE_TAGS_FILE": str(self.base / "tags.txt")})
+        self.cfg["matrix"] = [{"harness": "claude", "model": "fix"}, {"harness": "pi", "model": "p/nofix"}]
+
+
+class CmdRunTests(RunTestCase):
+    def test_refuses_to_run_without_a_sandbox(self) -> None:
+        with self.assertRaises(SystemExit) as cm:
+            fixtures.call_quiet(hb.cmd_run, args(allow_unsandboxed=False), self.cfg, self.base)
+        self.assertIn("No sandbox configured", str(cm.exception.code))
+
+    def test_dry_run_prints_commands_and_writes_no_results(self) -> None:
+        out = fixtures.call_quiet(hb.cmd_run, args(dry_run=True, allow_unsandboxed=False), self.cfg, self.base)
+        self.assertEqual((out.count("fake_agent.py"), (self.base / "results" / "results.jsonl").exists()), (2, False))
+
+    def test_only_filters_harnesses(self) -> None:
+        fixtures.call_quiet(hb.cmd_run, args(only=["claude"]), self.cfg, self.base)
+        self.assertEqual([r["harness"] for r in rows_of(self.base)], ["claude"])
+
+    def test_reps_argument_overrides_config(self) -> None:
+        fixtures.call_quiet(hb.cmd_run, args(only=["claude"], reps=2), self.cfg, self.base)
+        self.assertEqual([r["rep"] for r in rows_of(self.base)], [1, 2])
+
+    def test_hidden_tests_decide_pass_and_unknown_cost_stays_none(self) -> None:
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        rows = {r["harness"]: r for r in rows_of(self.base)}
+        self.assertEqual(
+            (rows["claude"]["passed"], rows["pi"]["passed"], rows["pi"]["cost_computed"]), (True, False, None)
+        )
+
+    def test_finished_runs_are_skipped_on_resume(self) -> None:
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        out = fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        self.assertEqual((out.count("skip  "), len(rows_of(self.base))), (2, 2))
+
+    def test_agent_timeout_is_recorded_and_fails_the_run(self) -> None:
+        # The agent flushes a readiness line before sleeping; 5 s leaves room for slow interpreter start-up.
+        code = "import time; print('ready', flush=True); time.sleep(60)"
+        self.cfg["harnesses"]["claude"]["command"] = [fixtures.PY, "-c", code]
+        self.cfg["tasks"][0]["timeout"] = 5
+        fixtures.call_quiet(hb.cmd_run, args(only=["claude"]), self.cfg, self.base)
+        row = rows_of(self.base)[0]
+        log = next((self.base / "results" / "logs").glob("*.agent.jsonl")).read_text()
+        self.assertEqual(
+            (row["agent_timed_out"], row["passed"], row["parse_ok"], "ready" in log), (True, False, False, True)
+        )
+
+    def test_setup_command_runs_and_is_logged(self) -> None:
+        self.cfg["tasks"][0]["setup"] = "echo prepared"
+        fixtures.call_quiet(hb.cmd_run, args(only=["claude"]), self.cfg, self.base)
+        logs = list((self.base / "results" / "logs").glob("*.setup.log"))
+        self.assertIn("prepared", logs[0].read_text())
+
+    def test_keep_and_work_dir_leave_the_workdir_in_place(self) -> None:
+        work = fixtures.tmpdir(self) / "work"
+        self.cfg["work_dir"] = str(work)
+        fixtures.call_quiet(hb.cmd_run, args(only=["claude"], keep=True), self.cfg, self.base)
+        self.assertTrue((work / "fizzbuzz__claude__fix__r1" / "fizzbuzz.py").exists())
+
+    def test_leftover_workdir_and_snapshot_from_a_crashed_run_are_replaced(self) -> None:
+        work = fixtures.tmpdir(self) / "work"
+        tag = "fizzbuzz__claude__fix__r1"
+        (work / tag).mkdir(parents=True)
+        (work / tag / "stale.txt").write_text("old")
+        (work / f".{tag}.protected").mkdir()
+        self.cfg["work_dir"] = str(work)
+        fixtures.call_quiet(hb.cmd_run, args(only=["claude"], keep=True), self.cfg, self.base)
+        self.assertEqual((work / tag / "stale.txt").exists(), False)
+
+    def test_report_is_written_unless_suppressed(self) -> None:
+        fixtures.call_quiet(hb.cmd_run, args(only=["claude"], no_report=False), self.cfg, self.base)
+        self.assertTrue((self.base / "results" / "summary.md").exists())
+
+    def test_task_without_hidden_tests_runs_its_own_test_command(self) -> None:
+        task = self.cfg["tasks"][0]
+        task.pop("hidden_tests")
+        task["test"] = "true"
+        fixtures.call_quiet(hb.cmd_run, args(only=["pi"]), self.cfg, self.base)
+        self.assertTrue(rows_of(self.base)[0]["passed"])
+
+    def test_protected_file_is_snapshotted_and_restored_to_its_original_content(self) -> None:
+        original = (fixtures.ROOT / "tasks" / "fizzbuzz" / "repo" / "fizzbuzz.py").read_text()
+        work = fixtures.tmpdir(self) / "work"
+        self.cfg["work_dir"] = str(work)
+        self.cfg["tasks"][0]["protected_paths"] = ["fizzbuzz.py"]
+        fixtures.call_quiet(hb.cmd_run, args(only=["claude"], keep=True), self.cfg, self.base)
+        kept = work / "fizzbuzz__claude__fix__r1" / "fizzbuzz.py"
+        self.assertEqual(kept.read_text(), original)  # the agent's "fix" was reverted, not deleted
+
+    def test_protected_paths_are_restored_before_the_hidden_tests(self) -> None:
+        self.cfg["tasks"][0]["protected_paths"] = ["fizzbuzz.py"]
+        fixtures.call_quiet(hb.cmd_run, args(only=["claude"]), self.cfg, self.base)
+        self.assertFalse(rows_of(self.base)[0]["passed"])  # the "fix" was reverted by the restore
+
+
+class AggregateTests(unittest.TestCase):
+    def test_cost_source_litellm_without_data_gives_none_not_zero(self) -> None:
+        table = hb.aggregate([fixtures.run_row(cost_computed=1.0)], "litellm")
+        self.assertEqual(
+            (table[0]["cost_total"], table[0]["cost_per_solved"], table[0]["cost_source"]), (None, None, "n/a")
+        )
+
+    def test_auto_prefers_litellm_then_computed_then_reported(self) -> None:
+        rows = [
+            fixtures.run_row(rep=1, cost_litellm=1.0, cost_computed=2.0, cost_reported=3.0),
+            fixtures.run_row(rep=2, cost_computed=2.0, cost_reported=3.0),
+            fixtures.run_row(rep=3, cost_reported=3.0),
+        ]
+        table = hb.aggregate(rows, "auto")
+        self.assertEqual((table[0]["cost_total"], table[0]["cost_source"]), (6.0, "computed+litellm+reported"))
+
+    def test_one_unknown_cost_makes_the_pair_unknown(self) -> None:
+        table = hb.aggregate([fixtures.run_row(cost_computed=1.0), fixtures.run_row(rep=2)], "auto")
+        self.assertIsNone(table[0]["cost_total"])
+
+    def test_pairs_without_cost_sort_last(self) -> None:
+        rows = [fixtures.run_row(harness="a"), fixtures.run_row(harness="b", cost_computed=1.0)]
+        self.assertEqual([t["harness"] for t in hb.aggregate(rows, "auto")], ["b", "a"])
+
+
+class CmdReportTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.base = fixtures.tmpdir(self)
+        (self.base / "results").mkdir()
+
+    def test_missing_results_file_exits_with_a_message(self) -> None:
+        with self.assertRaises(SystemExit) as cm:
+            fixtures.call_quiet(hb.cmd_report, args(), {}, self.base)
+        self.assertIn("no results at", str(cm.exception.code))
+
+    def test_empty_results_file_crashes_with_index_error(self) -> None:
+        # CURRENT BEHAVIOR (bug, reported in Phase 0, not fixed): table[0] fails on zero rows.
+        fixtures.write_rows(self.base / "results" / "results.jsonl")
+        with self.assertRaises(IndexError):
+            fixtures.call_quiet(hb.cmd_report, args(), {}, self.base)
+
+    def test_pairs_without_token_data_get_a_warning(self) -> None:
+        fixtures.write_rows(self.base / "results" / "results.jsonl", fixtures.run_row(parse_ok=False))
+        out = fixtures.call_quiet(hb.cmd_report, args(), {}, self.base)
+        self.assertIn("no token data from the harness for: h/m (1)", out)
+
+    def test_cost_source_comes_from_config_when_not_given(self) -> None:
+        fixtures.write_rows(
+            self.base / "results" / "results.jsonl", fixtures.run_row(cost_litellm=2.0, cost_computed=1.0)
+        )
+        fixtures.call_quiet(hb.cmd_report, args(), {"cost_source": "computed"}, self.base)
+        self.assertIn("Cost source: `computed`", (self.base / "results" / "summary.md").read_text())
+
+    def test_task_missing_for_a_pair_is_shown_as_dash(self) -> None:
+        fixtures.write_rows(
+            self.base / "results" / "results.jsonl", fixtures.run_row(task="a"), fixtures.run_row(task="b", harness="g")
+        )
+        fixtures.call_quiet(hb.cmd_report, args(), {}, self.base)
+        self.assertIn("| a | 1/1 | - |", (self.base / "results" / "summary.md").read_text())
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+`tests/test_litellm.py`:
+
+```python
+"""Tests for LiteLLM access, `reconcile` and the LiteLLM-only wrapper, against a local scripted server."""
+
+import json
+import shutil
+import sys
+import threading
+import unittest
+import urllib.error
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Any
+from unittest import mock
+
+import fixtures
+import harness_bench as hb
+import harness_bench_litellm as hbl
+
+KEY = "k-test"
+Reply = tuple[int, Any, dict[str, str]]
+
+
+class ScriptedServer:
+    """Localhost HTTP server answering GET <path> from a table; records (path, params, auth)."""
+
+    def __init__(self) -> None:
+        self.routes: dict[str, list[Reply]] = {}
+        self.requests: list[tuple[str, str, str | None]] = []
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                path, _, query = self.path.partition("?")
+                outer.requests.append((path, query, self.headers.get("Authorization")))
+                replies = outer.routes.get(path)
+                status, body, headers = (
+                    replies.pop(0) if replies and len(replies) > 1 else (replies or [(404, {}, {})])[0]
+                )
+                self.send_response(status)
+                for k, v in headers.items():
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(json.dumps(body).encode())
+
+            def log_message(self, *a: Any) -> None:
+                pass
+
+        self.httpd = HTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        threading.Thread(target=self.httpd.serve_forever, args=(0.01,), daemon=True).start()
+
+    def route(self, path: str, *replies: Reply) -> None:
+        self.routes[path] = list(replies)
+
+    def close(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def ok(body: Any) -> Reply:
+    return 200, body, {}
+
+
+class ServerTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server = ScriptedServer()
+        self.addCleanup(self.server.close)
+
+
+class LitellmGetTests(ServerTestCase):
+    def test_sends_bearer_key_and_decodes_json(self) -> None:
+        self.server.route("/p", ok({"a": 1}))
+        data = hb.litellm_get(self.server.url, KEY, "/p", {"x": "1"})
+        self.assertEqual((data, self.server.requests[0]), ({"a": 1}, ("/p", "x=1", f"Bearer {KEY}")))
+
+    def test_redirects_are_refused(self) -> None:
+        self.server.route("/p", (302, {}, {"Location": "http://example.invalid/steal"}))
+        with self.assertRaises(urllib.error.HTTPError):
+            hb.litellm_get(self.server.url, KEY, "/p", {})
+
+    def test_plain_http_to_remote_host_exits(self) -> None:
+        with self.assertRaises(SystemExit):
+            hb.litellm_get("http://litellm.example.com", KEY, "/p", {})
+
+
+class LitellmRowsTests(ServerTestCase):
+    START = hb.datetime.fromtimestamp(1_700_000_000, hb.UTC)
+
+    def rows(self) -> list[Any]:
+        rows: list[Any] = hb.litellm_rows(self.server.url, KEY, self.START, self.START)
+        return rows
+
+    def test_follows_pages_until_total_pages(self) -> None:
+        self.server.route("/spend/logs/v2", ok({"data": [1], "total_pages": 2}), ok({"data": [2], "total_pages": 2}))
+        self.assertEqual(self.rows(), [1, 2])
+
+    def test_stops_on_an_empty_page(self) -> None:
+        self.server.route("/spend/logs/v2", ok({"data": [], "total_pages": 5}))
+        self.assertEqual(self.rows(), [])
+
+    def test_accepts_a_bare_list_response(self) -> None:
+        self.server.route("/spend/logs/v2", ok([7, 8]))
+        self.assertEqual(self.rows(), [7, 8])
+
+    def test_falls_back_to_legacy_endpoint_when_v2_fails(self) -> None:
+        self.server.route("/spend/logs", ok({"data": ["legacy"]}))
+        with fixtures.quiet() as out:
+            rows = self.rows()
+        self.assertEqual((rows, "trying legacy" in out.getvalue()), (["legacy"], True))
+
+    def test_legacy_endpoint_may_return_a_bare_list(self) -> None:
+        self.server.route("/spend/logs", ok(["l1"]))
+        with fixtures.quiet():
+            self.assertEqual(self.rows(), ["l1"])
+
+
+class ReconcileTests(ServerTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.base = fixtures.tmpdir(self)
+        (self.base / "results").mkdir()
+        self.cfg: dict[str, Any] = {"litellm": {"base_url": self.server.url, "api_key": KEY}}
+
+    def reconcile(self) -> str:
+        with fixtures.quiet() as out:
+            hb.cmd_reconcile(mock.Mock(cost_source=None), self.cfg, self.base)
+        return out.getvalue()
+
+    def test_missing_litellm_section_exits(self) -> None:
+        with self.assertRaises(SystemExit) as cm:
+            hb.cmd_reconcile(mock.Mock(), {}, self.base)
+        self.assertIn("no 'litellm' section", str(cm.exception.code))
+
+    def test_empty_key_exits(self) -> None:
+        self.cfg["litellm"]["api_key"] = "${HB_SURELY_UNSET_VAR}"
+        with self.assertRaises(SystemExit) as cm:
+            hb.cmd_reconcile(mock.Mock(), self.cfg, self.base)
+        self.assertIn("empty", str(cm.exception.code))
+
+    def test_results_without_run_tags_exit(self) -> None:
+        fixtures.write_rows(self.base / "results" / "results.jsonl", fixtures.run_row(run_tag=None))
+        with self.assertRaises(SystemExit) as cm:
+            hb.cmd_reconcile(mock.Mock(), self.cfg, self.base)
+        self.assertIn("no runs with run_tag", str(cm.exception.code))
+
+    def test_matching_rows_add_summed_spend_and_token_counts(self) -> None:
+        fixtures.write_rows(self.base / "results" / "results.jsonl", fixtures.run_row())
+        logs = [
+            {"request_tags": ["tag-1"], "spend": 0.25, "prompt_tokens": 5, "completion_tokens": 1},
+            {"request_tags": json.dumps(["tag-1"]), "spend": 0.5, "prompt_tokens": 6, "completion_tokens": 2},
+            {"request_tags": ["other"], "spend": 9.0},
+        ]
+        self.server.route("/spend/logs/v2", ok({"data": logs, "total_pages": 1}))
+        out = self.reconcile()
+        row = fixtures.read_rows(self.base / "results" / "results.jsonl")[0]
+        self.assertEqual(
+            (row["cost_litellm"], row["litellm_requests"], row["litellm_prompt_tokens"], "1/1 runs matched" in out),
+            (0.75, 2, 11, True),
+        )
+
+    def test_unmatched_tagged_run_gets_no_litellm_cost_and_a_hint(self) -> None:
+        fixtures.write_rows(self.base / "results" / "results.jsonl", fixtures.run_row())
+        self.server.route("/spend/logs/v2", ok({"data": [], "total_pages": 1}))
+        out = self.reconcile()
+        self.assertEqual(
+            ("cost_litellm" in fixtures.read_rows(self.base / "results" / "results.jsonl")[0], "Unmatched runs" in out),
+            (False, True),
+        )
+
+
+class LoadConfigTests(unittest.TestCase):
+    def write(self, cfg: dict[str, Any]) -> str:
+        path = fixtures.tmpdir(self) / "c.json"
+        path.write_text(json.dumps(cfg))
+        return str(path)
+
+    def litellm_config(self) -> dict[str, Any]:
+        cfg = fixtures.fake_config({})
+        cfg["litellm"] = {"base_url": "https://x", "api_key": "${K}"}
+        return cfg
+
+    def test_config_without_litellm_section_exits(self) -> None:
+        with self.assertRaises(SystemExit) as cm:
+            hbl.load_config(self.write(fixtures.fake_config({})))
+        self.assertIn("needs a 'litellm' section", str(cm.exception.code))
+
+    def test_cursor_harness_and_its_matrix_entries_are_dropped(self) -> None:
+        with fixtures.quiet() as out:
+            cfg, _ = hbl.load_config(self.write(self.litellm_config()))
+        self.assertEqual(
+            ("cursor" in cfg["harnesses"], len(cfg["matrix"]), "ignored 1 matrix entries" in out.getvalue()),
+            (False, 4, True),
+        )
+
+    def test_defaults_force_litellm_cost_and_separate_output_dir(self) -> None:
+        with fixtures.quiet():
+            cfg, _ = hbl.load_config(self.write(self.litellm_config()))
+        self.assertEqual((cfg["cost_source"], cfg["output_dir"]), ("litellm", "results-litellm"))
+
+    def test_matrix_entry_for_an_undefined_harness_exits(self) -> None:
+        cfg = self.litellm_config()
+        cfg["matrix"].append({"harness": "ghost", "model": "m"})
+        with fixtures.quiet(), self.assertRaises(SystemExit) as cm:
+            hbl.load_config(self.write(cfg))
+        self.assertIn("undefined harnesses", str(cm.exception.code))
+
+
+class WrapperMainTests(ServerTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.base = fixtures.tmpdir(self)
+        cfg = fixtures.fake_config({})
+        cfg["matrix"] = [{"harness": "claude", "model": "fix"}]
+        cfg["litellm"] = {"base_url": self.server.url, "api_key": KEY}
+        (self.base / "config.json").write_text(json.dumps(cfg))
+        (self.base / "results-litellm").mkdir()
+
+    def main(self, *argv: str) -> str:
+        with mock.patch.object(
+            sys, "argv", ["harness_bench_litellm.py", *argv, "--config", str(self.base / "config.json")]
+        ):
+            with fixtures.quiet() as out:
+                hbl.main()
+        return out.getvalue()
+
+    def argv_run(self, *extra: str) -> str:
+        return self.main("run", "--settle", "0", *extra)
+
+    def test_dry_run_prints_commands_and_skips_reconcile(self) -> None:
+        out = self.argv_run("--dry-run")
+        self.assertEqual(("fake_agent.py" in out, "waiting" in out), (True, False))
+
+    def test_report_command_reads_existing_results(self) -> None:
+        fixtures.write_rows(self.base / "results-litellm" / "results.jsonl", fixtures.run_row(cost_litellm=1.0))
+        self.assertIn("Cost source: `litellm`", self.main("report"))
+
+    def test_reconcile_command_matches_tagged_runs(self) -> None:
+        fixtures.write_rows(self.base / "results-litellm" / "results.jsonl", fixtures.run_row())
+        self.server.route("/spend/logs/v2", ok({"data": [{"request_tags": ["tag-1"], "spend": 1.0}], "total_pages": 1}))
+        self.assertIn("1/1 runs matched", self.main("reconcile"))
+
+    def test_run_survives_a_failing_reconcile_and_prints_the_retry_command(self) -> None:
+        tags = self.base / "tags.txt"
+        cfg = json.loads((self.base / "config.json").read_text())
+        cfg["harnesses"]["claude"]["env"]["FAKE_TAGS_FILE"] = str(tags)
+        cfg["litellm"]["base_url"] = "http://127.0.0.1:1"  # connection refused
+        (self.base / "config.json").write_text(json.dumps(cfg))
+        shutil.copytree(fixtures.ROOT / "tasks" / "fizzbuzz", self.base / "tasks" / "fizzbuzz")
+        out = self.argv_run("--allow-unsandboxed")
+        self.assertEqual(("reconcile failed" in out, "Run later" in out), (True, True))
+
+
+if __name__ == "__main__":
+    unittest.main()
 ```
 
 ## Sandbox

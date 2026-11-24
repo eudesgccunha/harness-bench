@@ -7,8 +7,10 @@
 - `harness_bench.py`: the engine and single source of truth. Contains `run`, `reconcile` (real cost from LiteLLM), `report` and one parser per harness.
 - `harness_bench_litellm.py`: thin wrapper over the engine. Drops harnesses with `parser: cursor` and forces LiteLLM cost. New logic goes into the engine; the wrapper only filters the config and chains commands.
 - `HARNESS_BENCH.md`: **generated** by `scripts/build_md.py`. Edit the generator and regenerate the file.
-- `tests/`: `fake_agent.py` mimics each CLI's JSON output and probes for leaks (env, git history, test tampering). `fake_litellm.py` mimics `/spend/logs/v2`, and `smoke.py` tests everything end to end.
+- `tests/`: `fake_agent.py` mimics each CLI's JSON output and probes for leaks (env, git history, test tampering). `fake_litellm.py` mimics `/spend/logs/v2`, and `smoke.py` tests everything end to end. `test_golden.py` freezes `run` and `report` output against `tests/golden/`. `test_parsers.py`, `test_workspace.py`, `test_run.py` and `test_litellm.py` call the engine in-process (coverage is measured; `fixtures.py` holds the shared fake setup). Test files are typed and checked by mypy.
 - `sandbox/`: `Dockerfile` for the image with the CLIs, and `entrypoint.sh`, which renders the harness configs from the `*.example.*` files using `LITELLM_BASE_URL`. `.dockerignore` is an allowlist: any new file used in the build must be added to it.
+- `docs/evolution-plan.md`: phased plan for the project. Decisions in `docs/adr/`, terms in `CONTEXT.md`, current structure in `docs/architecture.md`, task plans in `docs/superpowers/plans/`.
+- `pyproject.toml`: project metadata for uv, dev dependency group and config for ruff, mypy, bandit and coverage (no runtime dependencies). `uv.lock`: pinned dev tools ([ADR 0004](docs/adr/0004-uv-dev-tooling.md)). `Makefile`: common commands, run `make help`. `.github/workflows/ci.yml`: CI. `.pre-commit-config.yaml` and `.gitleaks.toml`: local hooks and secret scanning.
 - `*.example.*`: example configs for the benchmark (`config*.json`) and for each harness pointing at LiteLLM (Pi, OpenCode, Codex).
 
 ## Rules
@@ -18,6 +20,7 @@
 - Secrets come in only through env (`${VAR}` in the config). `config*.json` (except examples), `results*/` and `.cache/` stay out of git, because they contain internal URLs, code and agent responses.
 - Everything in English: docs, report, CLI messages, example configs, code and comments.
 - Unknown cost is `None`, never `0`. A false `0` sends the pair to the top of the cost ranking.
+- Follow widely accepted engineering practices and design patterns: small cohesive functions and modules, clear interfaces, DRY, YAGNI, PEP 8, type hints on new code. Patterns never override the rules above, and no abstraction goes in before a phase of `docs/evolution-plan.md` needs it.
 - The agent and the task repository are **untrusted**. Every change to `cmd_run` keeps the defenses: workdir outside the repository and without git history; environment from an allowlist (`BASE_ENV` + `env_passthrough` + the harness `env`), without the spend key; `protected_paths` restored from a snapshot outside the workdir; audit diff; redacted logs; `rmtree_inside` for deletion; commands without `shell=True` and passed through `wrap()` (sandbox). `tests/smoke.py` has one case per defense. A new defense gets a new case.
 
 ## Usage semantics per harness
@@ -40,4 +43,6 @@ Checked against documentation and community sources in Nov 2026. The format chan
 
 ## Done when
 
-`python3 tests/smoke.py` ends with `PASS` and `python3 scripts/build_md.py` has regenerated `HARNESS_BENCH.md`. If you touched `sandbox/`, `wrap()` or the env file, rebuild the image and run `python3 tests/docker_e2e.py` until `PASS`.
+`make check` is green (run `make sync` once first; needs [uv](https://docs.astral.sh/uv/)). It runs: `ruff check`, `ruff format --check`, `mypy`, bandit (+ gitleaks if installed), actionlint, `make coverage` (smoke and unittest suite under coverage, with `fail_under = 100`, the measured total; add tests for new code instead of lowering it) and `make docs-check` (regenerates `HARNESS_BENCH.md` and fails if it changed). Without uv, `python3 tests/smoke.py` must end with `PASS` and `python3 -m unittest discover -s tests -p 'test_*.py'` must be OK. If you touched `sandbox/`, `wrap()` or the env file, rebuild the image and run `make docker-e2e` until `PASS`.
+
+Regenerate goldens with `HB_UPDATE_GOLDEN=1` only for an intended behavior change, and say so in the PR.

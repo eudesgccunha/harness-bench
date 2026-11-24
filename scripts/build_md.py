@@ -19,12 +19,18 @@ py, pyl, cfgl, cfg, pim, ocj, cdx, fz, th = map(
         "tasks/fizzbuzz/hidden_tests/test_hidden.py",
     ],
 )
-smoke, fagent, flite, dock, entry, de2e, dign = map(
+smoke, fagent, flite, tgold, tfix, tpars, twork, trun, tlite, dock, entry, de2e, dign = map(
     R,
     [
         "tests/smoke.py",
         "tests/fake_agent.py",
         "tests/fake_litellm.py",
+        "tests/test_golden.py",
+        "tests/fixtures.py",
+        "tests/test_parsers.py",
+        "tests/test_workspace.py",
+        "tests/test_run.py",
+        "tests/test_litellm.py",
         "sandbox/Dockerfile",
         "sandbox/entrypoint.sh",
         "tests/docker_e2e.py",
@@ -347,6 +353,38 @@ Run `python3 tests/smoke.py`. It uses fake agents and a fake LiteLLM to check th
 
 ```python
 {flite}```
+
+Golden tests (`python3 -m unittest discover -s tests -p 'test_*.py'`) freeze the `report` and `run` output against files in `tests/golden/`. `tests/test_golden.py`:
+
+```python
+{tgold}```
+
+`tests/fixtures.py` (shared by the smoke and golden tests):
+
+```python
+{tfix}```
+
+Unit tests call the engine in-process (`python3 -m unittest discover -s tests -p 'test_*.py'`), so `make coverage` sees every line.
+
+`tests/test_parsers.py`:
+
+```python
+{tpars}```
+
+`tests/test_workspace.py`:
+
+```python
+{twork}```
+
+`tests/test_run.py`:
+
+```python
+{trun}```
+
+`tests/test_litellm.py`:
+
+```python
+{tlite}```
 
 ## Sandbox
 

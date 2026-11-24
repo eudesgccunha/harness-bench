@@ -2,6 +2,20 @@
 
 Proposed improvements, based on good practices from [OpenBench](https://github.com/minghinmatthewlam/openbench) (O), [LiteLLM Lens CLI](https://docs.litellm.ai/docs/proxy/lens/cli) (L) and the [Hugging Face harness adapters study](https://huggingface.co/blog/harness-adapters-at-scale) (HF). Listed in suggested priority order. All of them keep the project on the Python standard library.
 
+Each item is scheduled in a phase of the [evolution plan](evolution-plan.md):
+
+| Item | Phase |
+|---|---|
+| M1 Wilson CI, M4 discrimination, M5 recommendation and chart, M10 efficiency, M11 paired comparison | 2 |
+| M2 `validate`, M12 task packs | 4 |
+| M3 `null` harness | 2 (negative control, next to M4; not built in Phase 0) |
+| M6 failure breakdown, M14 transcript hygiene | 1 |
+| M7 provenance | 1 (versions in the contract), 6 (image digest) |
+| M8 `doctor`, M15 egress restriction | 6 |
+| M9 partial credit | 3 (grader `score`) |
+| M13 trace export | 7 |
+| M16 skills axis | after 2 (needs M1, M3, M11) |
+
 ## M1. Wilson confidence interval in the report (O)
 
 Add a `wilson95` column to `summary.md` and the CSV. With few repetitions, it shows when two pairs cannot be told apart yet.

@@ -1,0 +1,8 @@
+[extend]
+useDefault = true
+
+# WARNING: a real secret committed under tests/ goes undetected. Fake keys there
+# must stay obviously fake (e.g. "sk-test-...").
+[allowlist]
+description = "Fake keys used by offline tests"
+paths = ['''^tests/''']

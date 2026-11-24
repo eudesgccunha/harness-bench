@@ -1,0 +1,104 @@
+# Project metadata exists only to drive uv for dev tooling. The runtime has no dependencies (ADR 0001).
+
+[project]
+name = "harness-bench"
+version = "0.0.0"
+requires-python = ">=3.12"
+# The runtime is standard library only (ADR 0001). Dev tools live in the dev group (ADR 0004).
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "ruff==0.17.6",
+    "mypy==2.4.1",
+    "bandit==1.9.4",
+    "pre-commit==4.7.0",
+    "actionlint-py==1.7.12.25",
+    "coverage==7.17.5",
+]
+
+[tool.uv]
+package = false
+# Same uv in CI (setup-uv `version`) and locally, so uv.lock resolves identically.
+required-version = "==0.12.13"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP"]
+# Disabled so Phase 0 changes no engine behavior (revisit when the engine is split):
+# B023: `step()` in cmd_run is a closure called inside the same loop iteration, never deferred.
+# UP036: the explicit `sys.version_info < (3, 12)` guard gives a clear error message on old Pythons.
+ignore = ["B023", "UP036"]
+
+[tool.ruff.lint.per-file-ignores]
+# E731: short lambda helper in the doc generator.
+"scripts/build_md.py" = ["E731", "E501"]
+# E501: existing long lines that `ruff format` cannot wrap (prose strings, docstrings).
+# Listed per file so every new file still gets E501.
+"harness_bench.py" = ["E501"]
+"tests/fake_agent.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["harness_bench.py", "harness_bench_litellm.py", "tests/fixtures.py", "tests/test_golden.py", "tests/test_parsers.py", "tests/test_workspace.py", "tests/test_run.py", "tests/test_litellm.py", "scripts/docs_check.py"]
+# Non-strict for the legacy engine. New modules are strict and listed below.
+
+[[tool.mypy.overrides]]
+module = ["fixtures", "test_golden", "docs_check"]
+# `strict = true` is not honored per module, so the strict flags are spelled out.
+disallow_any_generics = true
+disallow_subclassing_any = true
+disallow_untyped_calls = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+warn_return_any = true
+warn_unused_ignores = true
+no_implicit_reexport = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+# Same strict flags, except these tests call the untyped legacy engine (disallow_untyped_calls off).
+module = ["test_parsers", "test_workspace", "test_run", "test_litellm"]
+disallow_any_generics = true
+disallow_subclassing_any = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+warn_return_any = true
+warn_unused_ignores = true
+no_implicit_reexport = true
+strict_equality = true
+
+[tool.bandit]
+# B404: importing subprocess is the engine's job.
+# B603: subprocess calls use list argv without a shell.
+# B310: urllib only talks to the configured LiteLLM, https enforced by check_litellm_url.
+# B607: only `git` is flagged (harness_bench.py: git called by name). PATH is controlled by the operator, not the agent.
+# B602 (shell=True) is deliberately NOT skipped.
+skips = ["B404", "B603", "B310", "B607"]
+
+[tool.coverage.run]
+branch = true
+parallel = true
+# smoke and golden tests run the engine as subprocesses from copies in temp dirs: measure those too.
+patch = ["subprocess"]
+# Files are recorded relative to the cwd: the temp-dir copies run with cwd = temp dir, so
+# `harness_bench.py` there combines with the repo file of the same name.
+relative_files = true
+# `include` (not `source`) so the temp-dir copies match.
+include = ["*/harness_bench.py", "*/harness_bench_litellm.py", "*/tests/fixtures.py"]
+omit = ["*/tests/fake_*.py", "*/tests/test_*.py", "*/tests/smoke.py"]
+
+[tool.coverage.report]
+# Version guards run before any test could import the module on an old Python.
+exclude_also = ["if sys\\.version_info < \\(3, 12\\):"]
+precision = 2
+fail_under = 100
+show_missing = true
+skip_empty = true

@@ -1,0 +1,4 @@
+harness,model,cost_source,runs,solved,pass_rate,tokens_total,tokens_per_run,tokens_per_solved,cache_hit,cost_total,cost_per_run,cost_per_solved,cost_per_1m_tokens,avg_turns,avg_wall_s,parse_failures
+claude,sonnet,litellm,2,2,1.0,108860,54430.0,54430.0,0.9921276825191416,0.1291,0.06455,0.06455,1.1859268785596178,5.0,39.8,0
+opencode,glm,computed,2,0,0.0,52000,26000.0,inf,0.7843137254901961,0.0203,0.01015,inf,0.3903846153846154,8.0,56.5,0
+cursor,auto,n/a,2,1,0.5,0,0.0,0.0,0,,,,,0.0,23.75,2

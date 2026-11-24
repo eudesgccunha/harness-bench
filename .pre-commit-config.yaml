@@ -1,0 +1,24 @@
+# Tool versions come from uv.lock through `uv run` (ADR 0004); only gitleaks is an upstream hook.
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+        args: ["--config", ".gitleaks.toml"]
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: uv run --locked ruff check
+        language: system
+        types: [python]
+      - id: ruff-format
+        name: ruff format
+        entry: uv run --locked ruff format
+        language: system
+        types: [python]
+      - id: unittest
+        name: unittest
+        entry: python3 -m unittest discover -s tests -p 'test_*.py'
+        language: system
+        pass_filenames: false

@@ -13,3 +13,8 @@ tasks/*
 !tasks/fizzbuzz/
 
 __pycache__/
+
+# dev environment and coverage output
+.venv/
+htmlcov/
+.coverage*
