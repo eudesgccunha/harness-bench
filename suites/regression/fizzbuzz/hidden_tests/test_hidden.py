@@ -1,3 +1,4 @@
+# HIDDEN-TEST-MARKER: the contamination probe looks for this line outside the benchmark.
 import unittest
 from fizzbuzz import fizzbuzz
 

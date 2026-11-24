@@ -10,7 +10,11 @@ current name in the existing config and results format until Phase 1 migrates it
 | Trial | run, one `results.jsonl` row; contract model `TrialResult` (`trials.jsonl`) | One attempt of one target on one task, keyed by `(task, harness, model, rep)`. |
 | Rep | `rep` | Index of a repeated trial, from 1. |
 | Run | one `harness_bench.py run` call; contract model `RunInfo` (`run.json`) | All trials of one invocation, identified by `run_id`. |
-| Suite | `tasks` in the config | The list of tasks a run uses. |
+| Suite | a directory with `suite.json` (`hbench/suites.py`), listed in the config key `suites`; plain `tasks` in the config still work | A named, versioned list of tasks of one kind. Task ids become `<suite>/<task>`. `RunInfo.suite_version` records `name@version` of every suite used. |
+| Capability suite | `kind: "capability"` | Hard tasks with a low pass rate; they separate the targets. |
+| Regression suite | `kind: "regression"` | Tasks every healthy target must solve; the report flags a non-null target that fails one. |
+| Solution | task key `solution` (a directory) | Reference files copied over the repo by `suite validate --run`; the graders must fail without it and pass with it. |
+| Provenance | task key `provenance` (`source`, `license`, `url`) | Where a task comes from and its license. |
 | Task | task (`id`, `repo`, `ref`, `prompt`, `test`, `hidden_tests`, `protected_paths`) | One problem with a starting repo and a way to grade it. |
 | Grader | task key `graders` (default: `test` command + `hidden_tests`); contract model `GraderResult` | Decides pass or fail and gives a score from 0 to 1. Bundled types: `hidden_tests`, `command`, `diff_constraints`. Several graders combine through the task key `grade` (`all`, `any`, `weighted`). |
 | Runner | harness entry (`command` + `parser`); `HarnessRunner` protocol | Adapter that builds the agent argv and parses its output. It never starts a process: the engine does. |

@@ -33,7 +33,7 @@ def main() -> None:
     try:
         shutil.copy(ROOT / "harness_bench.py", tmp)
         shutil.copytree(ROOT / "hbench", tmp / "hbench", ignore=shutil.ignore_patterns("__pycache__"))
-        shutil.copytree(ROOT / "tasks" / "fizzbuzz", tmp / "tasks" / "fizzbuzz")
+        shutil.copytree(ROOT / "suites" / "regression" / "fizzbuzz", tmp / "tasks" / "fizzbuzz")
         env = dict(
             os.environ,
             FAKE_TAGS_FILE=str(shared / "tags.txt"),

@@ -41,6 +41,20 @@ class ValidateConfigTests(unittest.TestCase):
         cfg = base_config(tasks=[dict(fixtures.fizzbuzz_task(), id="a/b")])
         self.assert_rejected(cfg, "invalid task id")
 
+    def test_a_suite_task_id_is_the_suite_name_and_the_task_id(self) -> None:
+        cfg = base_config(tasks=[dict(fixtures.fizzbuzz_task(), id="demo/fizz", suite="demo")])
+        hb.validate_config(cfg)
+
+    def test_a_suite_task_id_with_a_bad_shape_is_rejected(self) -> None:
+        for task_id in ("demo", "demo/a/b", "demo/", "/fizz", ".x/fizz", "demo/.fizz", "demo/a b"):
+            with self.subTest(task_id=task_id):
+                cfg = base_config(tasks=[dict(fixtures.fizzbuzz_task(), id=task_id, suite="demo")])
+                self.assert_rejected(cfg, "invalid task id")
+
+    def test_ids_that_would_share_log_and_workdir_names_are_rejected(self) -> None:
+        tasks = [dict(fixtures.fizzbuzz_task(), id="a_b"), dict(fixtures.fizzbuzz_task(), id="a/b", suite="a")]
+        self.assert_rejected(base_config(tasks=tasks), "same file names")
+
     def test_task_id_with_leading_dot_is_rejected(self) -> None:
         cfg = base_config(tasks=[dict(fixtures.fizzbuzz_task(), id=".hidden")])
         self.assert_rejected(cfg, "invalid task id")
@@ -222,6 +236,20 @@ class ResolveWorkRootTests(unittest.TestCase):
         root = hb.resolve_work_root({"work_dir": str(outside / "w")}, base)
         self.assertEqual((root, root.is_dir()), (outside / "w", True))
 
+    def test_a_relative_work_dir_is_resolved_against_the_config_directory_not_the_cwd(self) -> None:
+        base = fixtures.tmpdir(self) / "config-dir"
+        base.mkdir()
+        root = hb.resolve_work_root({"work_dir": "../relative-work"}, base)
+        self.assertEqual(
+            (root, root.is_dir(), Path("relative-work").exists()), (base.parent / "relative-work", True, False)
+        )
+
+    def test_a_relative_work_dir_inside_the_config_directory_is_rejected(self) -> None:
+        base = fixtures.tmpdir(self)
+        with self.assertRaises(SystemExit) as cm:
+            hb.resolve_work_root({"work_dir": "work"}, base)
+        self.assertIn("inside the benchmark repo", str(cm.exception.code))
+
     def test_default_is_a_fresh_temp_dir(self) -> None:
         root = hb.resolve_work_root({}, fixtures.tmpdir(self))
         self.addCleanup(root.rmdir)
@@ -261,6 +289,39 @@ class PrepareWorkdirTests(unittest.TestCase):
         hb.prepare_workdir(task, base, base / "w1")
         hb.prepare_workdir(task, base, base / "w2")
         self.assertEqual((base / "w2" / "f.txt").read_text(), "new")
+
+    def test_a_config_task_may_clone_a_local_repo_and_a_suite_task_may_not(self) -> None:
+        """`GIT_ALLOW_PROTOCOL` is the second line of defense behind the suite loader: whatever repo a suite names,
+        git itself refuses `file`, `ssh` and the rest. The cache to workdir clone is ours, so it may use `file`."""
+        base = fixtures.tmpdir(self)
+        repo, _ = self.make_git_repo(base)
+        hb.prepare_workdir({"id": "t", "repo": str(repo)}, base, base / "w1")
+        suite_task = {"id": "demo/t", "suite": "demo", "repo": str(repo)}
+        with self.assertRaises(subprocess.CalledProcessError) as cm:
+            hb.prepare_workdir(suite_task, base, base / "w2")
+        self.assertIn("not allowed", cm.exception.stderr)
+
+    def test_the_allowed_protocols_follow_the_task_source(self) -> None:
+        base = fixtures.tmpdir(self)
+        calls: list[tuple[tuple[str, ...], str]] = []
+
+        def fake_git(*args: str, cwd: Path | None = None, protocols: str = "") -> None:
+            calls.append((args[:2], protocols))
+            Path(args[-1]).mkdir(parents=True)
+            (Path(args[-1]) / ".git").mkdir()
+
+        with mock.patch.object(hb, "git", fake_git):
+            hb.prepare_workdir({"id": "c", "repo": "https://example.com/x.git"}, base, base / "w1")
+            hb.prepare_workdir({"id": "s/c", "suite": "s", "repo": "https://example.com/x.git"}, base, base / "w2")
+        self.assertEqual(
+            calls,
+            [
+                (("clone", "--quiet"), "https:ssh:file"),
+                (("clone", "--quiet"), "file"),
+                (("clone", "--quiet"), "https"),
+                (("clone", "--quiet"), "file"),
+            ],
+        )
 
     def test_is_git_source_recognises_urls_and_ssh(self) -> None:
         self.assertEqual(

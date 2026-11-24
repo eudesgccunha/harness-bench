@@ -8,9 +8,8 @@ results*/
 work/
 .cache/
 
-# real tasks stay out of the repo (only the fizzbuzz example is tracked)
+# real tasks stay out of the repo (the example suites live in suites/)
 tasks/*
-!tasks/fizzbuzz/
 
 __pycache__/
 

@@ -48,7 +48,9 @@ Follow "Choosing tasks" in `HARNESS_BENCH.md`, plus the OpenBench discipline:
 - Use **real bugs that were already fixed**, with `ref` set to the commit before the fix. Use the tests from the fix commit as `hidden_tests`.
 - Write the `prompt` like an issue, with no hint of the solution.
 - List the tests and test configs in `protected_paths`.
-- **Check each task's polarity**: the hidden tests must **fail** on the untouched `ref` and **pass** with the fix applied. Today this is manual (see [roadmap](roadmap.md), M2).
+- **Check each task's polarity**: the hidden tests must **fail** on the untouched `ref` and **pass** with the fix applied. Put the tasks in a suite with a `solution` directory each and run `python3 -m hbench suite validate --run --config config.json` (see [Suites](../HARNESS_BENCH.md#suites)); it reports `ok`, `trivially passing` or `solution fails` per task, and follows the same sandbox rule as `run`.
+- **Keep two kinds of suite**: `capability` suites (hard, low pass rate) tell the pairs apart; `regression` suites (must always pass) tell you the setup works. The report adds `## By suite kind` and flags a failed regression task.
+- **Try the examples first**: `config.example.json` lists `suites/regression` and `suites/examples-capability` (synthetic, stdlib only, offline). `python3 -m hbench suite list --config config.json` shows them.
 - **Filter by difficulty**: after a pilot round, drop tasks that every pair solves or that no pair solves. They do not separate the pairs.
 - Start with **8 to 15 tasks**.
 

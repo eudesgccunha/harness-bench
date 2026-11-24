@@ -244,7 +244,7 @@ class WrapperMainTests(ServerTestCase):
         cfg["harnesses"]["claude"]["env"]["FAKE_TAGS_FILE"] = str(tags)
         cfg["litellm"]["base_url"] = "http://127.0.0.1:1"  # connection refused
         (self.base / "config.json").write_text(json.dumps(cfg))
-        shutil.copytree(fixtures.ROOT / "tasks" / "fizzbuzz", self.base / "tasks" / "fizzbuzz")
+        shutil.copytree(fixtures.FIZZBUZZ, self.base / "tasks" / "fizzbuzz")
         out = self.argv_run("--allow-unsandboxed")
         self.assertEqual(("reconcile failed" in out, "Run later" in out), (True, True))
 

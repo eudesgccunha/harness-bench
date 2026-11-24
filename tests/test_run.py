@@ -1,6 +1,7 @@
 """In-process tests for `cmd_run`, `aggregate` and `cmd_report` with the fake agents."""
 
 import argparse
+import json
 import shutil
 import unittest
 from pathlib import Path
@@ -9,6 +10,7 @@ from unittest import mock
 
 import fixtures
 import harness_bench as hb
+from hbench.core.ids import sha256_json
 
 
 def args(**overrides: Any) -> argparse.Namespace:
@@ -32,7 +34,7 @@ def rows_of(base: Path) -> list[dict[str, Any]]:
 class RunTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.base = fixtures.tmpdir(self)
-        shutil.copytree(fixtures.ROOT / "tasks" / "fizzbuzz", self.base / "tasks" / "fizzbuzz")
+        shutil.copytree(fixtures.FIZZBUZZ, self.base / "tasks" / "fizzbuzz")
         self.cfg = fixtures.fake_config({"FAKE_TAGS_FILE": str(self.base / "tags.txt")})
         self.cfg["matrix"] = [{"harness": "claude", "model": "fix"}, {"harness": "pi", "model": "p/nofix"}]
 
@@ -134,7 +136,7 @@ class CmdRunTests(RunTestCase):
         self.assertTrue(rows_of(self.base)[0]["passed"])
 
     def test_protected_file_is_snapshotted_and_restored_to_its_original_content(self) -> None:
-        original = (fixtures.ROOT / "tasks" / "fizzbuzz" / "repo" / "fizzbuzz.py").read_text()
+        original = (fixtures.FIZZBUZZ / "repo" / "fizzbuzz.py").read_text()
         work = fixtures.tmpdir(self) / "work"
         self.cfg["work_dir"] = str(work)
         self.cfg["tasks"][0]["protected_paths"] = ["fizzbuzz.py"]
@@ -279,6 +281,224 @@ class GraderRunTests(RunTestCase):
             fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
         self.assertIn("task fizzbuzz", str(cm.exception.code))
         self.assertFalse((self.base / "results" / "results.jsonl").exists())
+
+
+class SuiteRunTests(RunTestCase):
+    """Tasks that come from `suites` in the config."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        fixtures.write_fizzbuzz_suite(self.base, "fizz")
+        self.cfg["tasks"] = []
+        self.cfg["suites"] = ["suites/fizz"]
+        self.cfg["matrix"] = [{"harness": "claude", "model": "fix"}, {"harness": "pi", "model": "p/nofix"}]
+
+    def test_suite_tasks_run_with_prefixed_ids_and_the_hidden_tests_decide(self) -> None:
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        self.assertEqual(
+            [(r["task"], r["passed"]) for r in rows_of(self.base)], [("fizz/fizzbuzz", True), ("fizz/fizzbuzz", False)]
+        )
+
+    def test_config_tasks_and_suite_tasks_run_together(self) -> None:
+        self.cfg["tasks"] = [fixtures.fizzbuzz_task()]
+        fixtures.call_quiet(hb.cmd_run, args(only=["claude"]), self.cfg, self.base)
+        self.assertEqual([r["task"] for r in rows_of(self.base)], ["fizzbuzz", "fizz/fizzbuzz"])
+
+    def test_a_config_with_only_suites_needs_no_tasks_key(self) -> None:
+        del self.cfg["tasks"]
+        fixtures.call_quiet(hb.cmd_run, args(only=["claude"]), self.cfg, self.base)
+        self.assertEqual([r["task"] for r in rows_of(self.base)], ["fizz/fizzbuzz"])
+
+    def test_the_slash_in_the_id_never_reaches_a_log_or_workdir_name(self) -> None:
+        work = fixtures.tmpdir(self) / "work"
+        self.cfg["work_dir"] = str(work)
+        fixtures.call_quiet(hb.cmd_run, args(only=["claude"], keep=True), self.cfg, self.base)
+        logs = self.base / "results" / "logs"
+        self.assertEqual(
+            (sorted(p.name for p in work.iterdir()), {p.parent for p in logs.rglob("*") if p.is_file()}),
+            (["fizz_fizzbuzz__claude__fix__r1"], {logs}),
+        )
+        self.assertTrue(all(p.name.startswith("fizz_fizzbuzz__") for p in logs.iterdir()))
+
+    def test_run_info_lists_the_suites_with_their_versions_and_the_task_hash(self) -> None:
+        fixtures.write_fizzbuzz_suite(self.base, "other", "regression")
+        self.cfg["suites"] = ["suites/fizz", "suites/other"]
+        self.cfg["tasks"] = [fixtures.fizzbuzz_task()]
+        fixtures.call_quiet(hb.cmd_run, args(only=["claude"]), self.cfg, self.base)
+        (info,) = (self.base / "results").glob("*/run.json")
+        label, _, digest = json.loads(info.read_text())["suite_version"].partition("+")
+        self.assertEqual((label, len(digest)), ("fizz@1.0.0,other@1.0.0", 12))
+
+    def test_suite_content_does_not_change_the_recorded_hash_with_the_machine_path(self) -> None:
+        other = fixtures.tmpdir(self)
+        fixtures.write_fizzbuzz_suite(other, "fizz")
+        versions = []
+        for base in (self.base, other):
+            fixtures.call_quiet(hb.cmd_run, args(only=["claude"]), self.cfg, base)
+            (info,) = (base / "results").glob("*/run.json")
+            versions.append(json.loads(info.read_text())["suite_version"])
+        self.assertEqual(versions[0], versions[1])
+
+    def test_a_config_without_suites_keeps_the_plain_task_hash(self) -> None:
+        cfg = fixtures.fake_config({})
+        cfg["matrix"] = [{"harness": "claude", "model": "fix"}]
+        shutil.copytree(fixtures.FIZZBUZZ, self.base / "tasks" / "fizzbuzz", dirs_exist_ok=True)
+        fixtures.call_quiet(hb.cmd_run, args(), cfg, self.base)
+        (info,) = (self.base / "results").glob("*/run.json")
+        self.assertEqual(json.loads(info.read_text())["suite_version"], sha256_json(cfg["tasks"])[:12])
+
+    def test_dry_run_prints_the_commands_of_the_suite_tasks(self) -> None:
+        out = fixtures.call_quiet(hb.cmd_run, args(dry_run=True, allow_unsandboxed=False), self.cfg, self.base)
+        self.assertEqual(out.count("fake_agent.py"), 2)
+
+    def test_two_suites_with_the_same_name_are_a_config_error_naming_both(self) -> None:
+        fixtures.write_fizzbuzz_suite(self.base, "fizz", directory="copy")
+        self.cfg["suites"] = ["suites/fizz", "suites/copy"]
+        with self.assertRaises(SystemExit) as cm:
+            fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        message = str(cm.exception.code)
+        self.assertTrue(all(s in message for s in ("fizz/fizzbuzz", "suites/fizz", "suites/copy")), message)
+
+    def test_a_config_task_with_the_id_of_a_suite_task_is_a_config_error_naming_both(self) -> None:
+        self.cfg["tasks"] = [dict(fixtures.fizzbuzz_task(), id="fizz/fizzbuzz")]
+        with self.assertRaises(SystemExit) as cm:
+            fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        message = str(cm.exception.code)
+        self.assertTrue(all(s in message for s in ("fizz/fizzbuzz", "config tasks", "suites/fizz")), message)
+        self.assertFalse((self.base / "results" / "results.jsonl").exists())
+
+    def test_an_invalid_suite_exits_naming_the_suite_and_the_problem(self) -> None:
+        (self.base / "suites" / "fizz" / "suite.json").write_text("{}")
+        with self.assertRaises(SystemExit) as cm:
+            fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        self.assertTrue(all(s in str(cm.exception.code) for s in ("suites/fizz", "missing key")), cm.exception.code)
+
+    def test_suites_must_be_a_list_of_paths(self) -> None:
+        for bad in ("suites/fizz", [3], {"a": 1}):
+            with self.subTest(bad=bad), self.assertRaises(SystemExit) as cm:
+                fixtures.call_quiet(hb.cmd_run, args(), dict(self.cfg, suites=bad), self.base)
+            self.assertIn("suites must be a list", str(cm.exception.code))
+
+    def test_the_report_has_the_by_suite_kind_section_when_two_kinds_ran(self) -> None:
+        fixtures.write_fizzbuzz_suite(self.base, "guard", "regression")
+        self.cfg["suites"] = ["suites/fizz", "suites/guard"]
+        fixtures.call_quiet(hb.cmd_run, args(no_report=False), self.cfg, self.base)
+        summary = (self.base / "results" / "summary.md").read_text()
+        self.assertIn("| capability | 1/1 | 0/1 |", summary)
+        self.assertIn("**Warning:** regression tasks failed: pi/p/nofix (guard/fizzbuzz 0/1)", summary)
+
+    def test_report_alone_reads_the_kinds_from_the_config_suites(self) -> None:
+        fixtures.write_fizzbuzz_suite(self.base, "guard", "regression")
+        self.cfg["suites"] = ["suites/fizz", "suites/guard"]
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        fixtures.call_quiet(hb.cmd_report, args(), self.cfg, self.base)
+        self.assertIn("## By suite kind", (self.base / "results" / "summary.md").read_text())
+
+    def test_report_warns_and_skips_the_kind_section_when_the_suites_cannot_load(self) -> None:
+        fixtures.write_fizzbuzz_suite(self.base, "guard", "regression")
+        self.cfg["suites"] = ["suites/fizz", "suites/guard"]
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        (self.base / "suites" / "guard" / "suite.json").write_text("{}")
+        out = fixtures.call_quiet(hb.cmd_report, args(), self.cfg, self.base)
+        self.assertIn("warning: cannot read the suites", out)
+        self.assertIn("suites/guard", out)
+        self.assertNotIn("By suite kind", (self.base / "results" / "summary.md").read_text())
+
+    def test_a_single_suite_kind_leaves_the_report_unchanged(self) -> None:
+        fixtures.call_quiet(hb.cmd_run, args(no_report=False), self.cfg, self.base)
+        self.assertNotIn("By suite kind", (self.base / "results" / "summary.md").read_text())
+
+
+class RunTaskAttemptTests(unittest.TestCase):
+    """`run_task_attempt`: the trial `suite validate --run` runs, with a solution copied in place of an agent."""
+
+    def setUp(self) -> None:
+        self.root = fixtures.tmpdir(self)
+        self.base = self.root / "base"
+        self.work_root = self.root / "work"
+        self.git_root = self.root / "git"
+        for path in (self.base, self.work_root, self.git_root):
+            path.mkdir()
+        self.repo, self.solution = self.base / "repo", self.base / "solution"
+        for path in (self.repo, self.solution):
+            path.mkdir()
+        self.cfg = fixtures.fake_config({})
+
+    def attempt(self, task: dict[str, Any], solution: Path | None) -> bool:
+        with fixtures.quiet():
+            return hb.run_task_attempt(self.cfg, task, self.base, self.work_root, self.git_root, "trial", solution)
+
+    def test_a_solution_is_not_copied_through_a_symlink_the_repo_left_in_the_workdir(self) -> None:
+        (self.repo / "esc").symlink_to("../..", target_is_directory=True)  # from the workdir: the dir above `work`
+        (self.solution / "esc").mkdir()
+        (self.solution / "esc" / "PWNED").write_text("x")
+        task = {"id": "t", "repo": "repo", "test": "true"}
+        self.assertTrue(self.attempt(task, self.solution))
+        self.assertFalse((self.root / "PWNED").exists())
+        self.assertFalse((self.work_root.parent / "PWNED").exists())
+
+    def test_stale_bytecode_in_the_solution_does_not_reach_the_workdir(self) -> None:
+        (self.solution / "__pycache__").mkdir()
+        (self.solution / "__pycache__" / "x.pyc").write_text("stale")
+        (self.solution / "new.txt").write_text("n")
+        task = {"id": "t", "repo": "repo", "test": "test -e new.txt && ! test -e __pycache__"}
+        self.assertTrue(self.attempt(task, self.solution))
+
+    def test_protected_paths_are_restored_after_the_solution_is_copied(self) -> None:
+        (self.repo / "guard.txt").write_text("ok")
+        (self.solution / "guard.txt").write_text("tampered")
+        check = "import sys; sys.exit(0 if open('guard.txt').read() == 'ok' else 1)"
+        task = {"id": "t", "repo": "repo", "test": f'{fixtures.PY} -c "{check}"', "protected_paths": ["guard.txt"]}
+        self.assertEqual((self.attempt(task, None), self.attempt(task, self.solution)), (True, True))
+
+
+class SuiteVersionTests(unittest.TestCase):
+    def suite_task(self, suite_dir: str, **overrides: Any) -> dict[str, Any]:
+        task = {
+            "id": "s/t",
+            "suite": "s",
+            "suite_label": "s@1.0.0",
+            "suite_dir": suite_dir,
+            "repo": f"{suite_dir}/t/repo",
+            "hidden_tests": f"{suite_dir}/t/hidden_tests",
+            "solution": f"{suite_dir}/t/solution",
+            "prompt": "p",
+        }
+        task.update(overrides)
+        return task
+
+    def test_the_hash_does_not_depend_on_where_the_suite_is_checked_out(self) -> None:
+        self.assertEqual(
+            hb.suite_version_of([self.suite_task("/one/s")]), hb.suite_version_of([self.suite_task("/other/place/s")])
+        )
+
+    def test_the_hash_follows_which_directories_the_task_uses(self) -> None:
+        a = self.suite_task("/one/s")
+        for key in ("repo", "hidden_tests", "solution"):
+            with self.subTest(key=key):
+                b = self.suite_task("/one/s", **{key: f"/one/s/other/{key}"})
+                self.assertNotEqual(hb.suite_version_of([a]), hb.suite_version_of([b]))
+
+    def test_a_git_url_repo_stays_in_the_hash(self) -> None:
+        a = self.suite_task("/one/s", repo="https://example.com/x.git")
+        b = self.suite_task("/one/s", repo="https://example.com/y.git")
+        self.assertNotEqual(hb.suite_version_of([a]), hb.suite_version_of([b]))
+
+
+class ConfigTaskKeyTests(RunTestCase):
+    """The keys a suite adds to its tasks are the engine's, never a config task's (it would pose as a suite task)."""
+
+    def test_a_config_task_with_a_suite_key_is_rejected_naming_the_key(self) -> None:
+        for key in ("suite", "suite_kind", "suite_label", "suite_dir", "solution"):
+            with self.subTest(key=key), self.assertRaises(SystemExit) as cm:
+                self.cfg["tasks"] = [dict(fixtures.fizzbuzz_task(), **{key: "x"})]
+                fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+            self.assertTrue(all(s in str(cm.exception.code) for s in ("fizzbuzz", key, "suite")), cm.exception.code)
+
+    def test_the_check_runs_without_a_suites_key_too(self) -> None:
+        self.cfg["tasks"] = [dict(fixtures.fizzbuzz_task(), suite="x")]
+        with self.assertRaises(SystemExit):
+            hb.expand_suites(self.cfg, self.base)
 
 
 class AggregateTests(unittest.TestCase):

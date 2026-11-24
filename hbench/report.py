@@ -353,6 +353,58 @@ def _per_task_lines(table: Sequence[Mapping[str, Any]], trials: Sequence[TrialRe
     return lines
 
 
+def _suite_kind_of(task_id: str, suite_kinds: Mapping[str, str]) -> str | None:
+    """The kind of the suite a task id (`<suite>/<task>`) belongs to; none for a config task or an unknown suite."""
+    suite, slash, _ = task_id.partition("/")
+    return suite_kinds.get(suite) if slash else None
+
+
+def _failed_regressions(table: Sequence[Mapping[str, Any]], regression: Sequence[TrialResult]) -> list[str]:
+    """`pair (task solved/runs)` for every regression task a real (non-null) pair did not solve in every run."""
+    failed = []
+    for entry in table:
+        if entry["null_control"]:
+            continue
+        mine = [t for t in regression if (t.target.harness, t.target.model) == (entry["harness"], entry["model"])]
+        for task in sorted({t.task_id for t in mine}):
+            runs = [t for t in mine if t.task_id == task]
+            if not all(t.passed for t in runs):
+                failed.append(f"{_name(entry)} ({task} {sum(t.passed for t in runs)}/{len(runs)})")
+    return failed
+
+
+def _suite_kind_lines(
+    table: Sequence[Mapping[str, Any]], trials: Sequence[TrialResult], suite_kinds: Mapping[str, str]
+) -> list[str]:
+    """Solved/runs per pair for each suite kind, and a warning for every regression task a real pair failed.
+    Only when the trials come from more than one kind: a lone kind says nothing the main table does not."""
+    by_kind: dict[str, list[TrialResult]] = {}
+    for t in trials:
+        kind = _suite_kind_of(t.task_id, suite_kinds)
+        if kind is not None:
+            by_kind.setdefault(kind, []).append(t)
+    if len(by_kind) < 2:
+        return []
+    pairs = [(t["harness"], t["model"]) for t in table]
+    lines = [
+        "",
+        "## By suite kind",
+        "",
+        "| Kind | " + " | ".join(f"{h}<br>{m}" for h, m in pairs) + " |",
+        "|---|" + "---|" * len(pairs),
+    ]
+    for kind in sorted(by_kind):
+        cells = []
+        for h, m in pairs:
+            rs = [t for t in by_kind[kind] if t.target.harness == h and t.target.model == m]
+            cells.append(f"{sum(t.passed for t in rs)}/{len(rs)}" if rs else "-")
+        lines.append(f"| {kind} | " + " | ".join(cells) + " |")
+    failed = _failed_regressions(table, by_kind.get("regression", []))
+    if failed:
+        lines += ["", f"**Warning:** regression tasks failed: {', '.join(failed)}"]
+    return lines
+
+
 def render_markdown(
     table: Sequence[Mapping[str, Any]],
     trials: Sequence[TrialResult],
@@ -361,7 +413,9 @@ def render_markdown(
     *,
     recommend_within_pp: float = 5.0,
     target_ci_width: float = 0.2,
+    suite_kinds: Mapping[str, str] | None = None,
 ) -> str:
+    """The summary. `suite_kinds` maps a suite name to its kind and adds the `## By suite kind` section."""
     lines = [
         f"# Harness x model — {now.strftime('%Y-%m-%d %H:%M')}",
         "",
@@ -386,4 +440,5 @@ def render_markdown(
     lines += _paired_lines(table, trials)
     lines += _repetitions_lines(table, trials, target_ci_width)
     lines += _per_task_lines(table, trials)
+    lines += _suite_kind_lines(table, trials, suite_kinds or {})
     return "\n".join(lines) + "\n"

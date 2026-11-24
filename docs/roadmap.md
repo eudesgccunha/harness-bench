@@ -9,7 +9,8 @@ Each item is scheduled in a phase of the [evolution plan](evolution-plan.md):
 | M1 Wilson CI, M4 discrimination, M5 recommendation (text), M11 paired comparison | 2 (done, [ADR 0006](adr/0006-report-statistics.md)) |
 | M5 chart (`summary.html`) | 7 (sinks) |
 | M10 efficiency (tool calls) | 3 (done, [ADR 0007](adr/0007-runner-and-grader-protocols.md)) |
-| M2 `validate`, M12 task packs | 4 |
+| M2 `validate` | 4 (done, [ADR 0008](adr/0008-suites-as-data.md): `suite validate --run`) |
+| M12 task packs | 9 (the Exercism and Terminal-Bench importers need network access and a license review per pack; the suite `provenance` field is their hook) |
 | M3 `null` harness | 2 (done: negative control) |
 | M6 failure breakdown, M14 transcript hygiene | 1 |
 | M7 provenance | 1 (versions in the contract), 6 (image digest) |

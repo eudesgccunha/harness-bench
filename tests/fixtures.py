@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))  # lets tests import the engine in-process (coverage sees it directly)
 PY = sys.executable
 AGENT = str(ROOT / "tests" / "fake_agent.py")
+FIZZBUZZ = ROOT / "suites" / "regression" / "fizzbuzz"  # the sample task: `repo/` and `hidden_tests/`
 HARNESS_KINDS = ("claude", "opencode", "pi", "codex", "cursor")
 
 
@@ -45,6 +46,41 @@ def fizzbuzz_task() -> dict[str, Any]:
         "hidden_tests": "tasks/fizzbuzz/hidden_tests",
         "test": f"{PY} -m unittest -q test_hidden.py",
     }
+
+
+FIXED_FIZZBUZZ = (
+    "def fizzbuzz(n):\n    if n % 15 == 0:\n        return 'FizzBuzz'\n    if n % 3 == 0:\n        return 'Fizz'\n"
+    "    if n % 5 == 0:\n        return 'Buzz'\n    return str(n)\n"
+)
+
+
+def write_fizzbuzz_suite(base: Path, name: str = "fizz", kind: str = "capability", directory: str = "") -> Path:
+    """A one-task suite (`fizzbuzz`, with a reference solution) under `base/suites/<directory or name>`."""
+    suite_dir = base / "suites" / (directory or name)
+    shutil.copytree(FIZZBUZZ / "repo", suite_dir / "fizzbuzz" / "repo")
+    shutil.copytree(FIZZBUZZ / "hidden_tests", suite_dir / "fizzbuzz" / "hidden_tests")
+    (suite_dir / "fizzbuzz" / "solution").mkdir()
+    (suite_dir / "fizzbuzz" / "solution" / "fizzbuzz.py").write_text(FIXED_FIZZBUZZ)
+    task = {
+        "id": "fizzbuzz",
+        "repo": "fizzbuzz/repo",
+        "prompt": "fix it",
+        "hidden_tests": "fizzbuzz/hidden_tests",
+        "test": f"{PY} -m unittest -q test_hidden.py",
+        "solution": "fizzbuzz/solution",
+        "tags": ["bugfix"],
+        "provenance": {"source": "synthetic", "license": "MIT"},
+    }
+    document = {
+        "schema_version": "1.0.0",
+        "name": name,
+        "version": "1.0.0",
+        "kind": kind,
+        "description": "test suite",
+        "tasks": [task],
+    }
+    (suite_dir / "suite.json").write_text(json.dumps(document))
+    return suite_dir
 
 
 def matrix() -> list[dict[str, Any]]:

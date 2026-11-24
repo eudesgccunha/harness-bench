@@ -510,7 +510,7 @@ class HostileAgentOutputTests(RunTestCase):
 class ReconcileContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self.base = fixtures.tmpdir(self)
-        shutil.copytree(fixtures.ROOT / "tasks" / "fizzbuzz", self.base / "tasks" / "fizzbuzz")
+        shutil.copytree(fixtures.FIZZBUZZ, self.base / "tasks" / "fizzbuzz")
         self.server = ScriptedServer()
         self.addCleanup(self.server.close)
         patcher = mock.patch.dict(os.environ, {"HB_TEST_KEY": "k-test"})

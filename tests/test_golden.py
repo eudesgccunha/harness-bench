@@ -72,7 +72,7 @@ class GoldenReport(GoldenCase):
 class GoldenRun(GoldenCase):
     def test_results_match_golden(self) -> None:
         tmp = make_tmp(self)
-        shutil.copytree(ROOT / "tasks" / "fizzbuzz", tmp / "tasks" / "fizzbuzz")
+        shutil.copytree(fixtures.FIZZBUZZ, tmp / "tasks" / "fizzbuzz")
         cfg = fixtures.fake_config({"FAKE_TAGS_FILE": str(tmp / "tags.txt")})
         (tmp / "config.json").write_text(json.dumps(cfg))
         p = run_cli(tmp, "harness_bench.py", "run", "--allow-unsandboxed")

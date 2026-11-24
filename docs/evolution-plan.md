@@ -299,17 +299,22 @@ Acceptance: a new grader can be added from another package without touching the 
 
 ### Phase 4 — Suites as data
 
-- [ ] Versioned suite format (JSON) with task, repository/fixture (fixed commit), prompt,
+- [x] Versioned suite format (JSON) with task, repository/fixture (fixed commit), prompt,
       graders, timeout and tags.
-- [ ] `harness-bench suite validate` and `suite list`.
-- [ ] Example suites **with public or synthetic repositories only**:
+- [x] `harness-bench suite validate` and `suite list`.
+- [x] Example suites **with public or synthetic repositories only**:
   - dependency upgrade in a sample Python project
   - fix of a known, public vulnerability in a sample project
   - small refactor with existing tests
-- [ ] Split between **capability** suites (hard, low pass rate) and **regression**
+- [x] Split between **capability** suites (hard, low pass rate) and **regression**
       suites (must always pass).
-- [ ] Contamination guard: hidden tests outside the agent workspace (exists; add an
+- [x] Contamination guard: hidden tests outside the agent workspace (exists; add an
       automated test that proves it).
+
+Plan: [`superpowers/plans/2026-11-24-phase-4-suites.md`](superpowers/plans/2026-11-24-phase-4-suites.md).
+Decisions: [ADR 0008](adr/0008-suites-as-data.md). M2 is done here; the M12 importers (Exercism,
+Terminal-Bench) need network access and a license review per pack, so they move to Phase 9 and
+use the suite `provenance` field.
 
 Acceptance: anyone clones the repo and runs an example suite from scratch.
 
@@ -380,6 +385,8 @@ Acceptance: `run_trial` behaves the same from the CLI, a script and an adapter.
 - [ ] CI gate: fail when the current target's pass rate drops below the threshold on the
       regression suite.
 - [ ] Export the decision as a versionable config file (the "winning target").
+- [ ] M12 task importers (Exercism, Terminal-Bench) into suites, with license and provenance per
+      task (moved from Phase 4: they need network access and a license review per pack).
 
 Acceptance: a model/harness switch is justified by a reproducible report.
 

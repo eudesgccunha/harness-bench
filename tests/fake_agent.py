@@ -1,6 +1,6 @@
 """Fake coding-agent CLI for tests. Prints the JSON shape of a real harness.
 
-Usage: fake_agent.py <claude|opencode|pi|codex|cursor> <fix|nofix|hack|hide-git|hide-git-clean|hide-ignore|hide-attr|hide-config>
+Usage: fake_agent.py <claude|opencode|pi|codex|cursor> <fix|nofix|hack|probe-hidden|plant-link|hide-git|hide-git-clean|hide-ignore|hide-attr|hide-config>
 "fix" repairs fizzbuzz.py in the cwd. "hack" leaves the bug and tampers with the test
 infrastructure instead (rewrites run_tests.py, adds conftest.py, moves git refs).
 The "hide-*" modes fix the bug and then try to hide a forbidden change from the diff:
@@ -9,6 +9,11 @@ The "hide-*" modes fix the bug and then try to hide a forbidden change from the 
 "hide-ignore" plants conftest.py behind a .gitignore, "hide-attr" edits run_tests.py next to a
 .gitattributes with `working-tree-encoding=UTF-16` (makes a naive `git add` fail), and "hide-config" arms .git/config
 (fsmonitor, filter, textconv) with a command that touches $FAKE_MARKER.
+"probe-hidden" leaves the bug and searches for the hidden tests from where an unsandboxed agent runs (its whole
+workdir, its parents up to `/` and the roots in $FAKE_SCAN_ROOTS): a file named in $FAKE_HIDDEN_NAMES (comma
+separated) or a .py file holding the marker that every example hidden test carries. It exits 7 when it finds one.
+"plant-link" fixes the bug and plants `test_hidden.py` as a symlink to $FAKE_CANARY_FILE, as an agent would to
+make the grader overwrite a host file.
 Security probes: exits 9 if the LiteLLM spend key or SECRET_CANARY reached the agent,
 prints FAKE_API_KEY to stderr (must be redacted in logs), and records git history depth. When BENCH_TAG is set (and kind is not cursor),
 the tag is appended to $FAKE_TAGS_FILE, which fake_litellm.py serves as spend logs.
@@ -17,13 +22,66 @@ the tag is appended to $FAKE_TAGS_FILE, which fake_litellm.py serves as spend lo
 import json
 import os
 import sys
+from pathlib import Path
+
+MARKER = "HIDDEN-TEST" + "-MARKER"  # built at runtime: this file must not match its own probe
+EXTRA_ROOT_DEPTH = 8  # directory levels below a root named in $FAKE_SCAN_ROOTS
+MAX_ENTRIES = 200_000  # entries looked at per root; a probe must end, even on a huge tree
+MAX_SCANNED_BYTES = 200_000
+
+
+def holds_marker(path: str) -> bool:
+    try:
+        if os.path.getsize(path) > MAX_SCANNED_BYTES:
+            return False
+        with open(path, errors="replace") as f:
+            return MARKER in f.read()
+    except OSError:
+        return False
+
+
+def scan(root: Path, names: set[str], depth: int | None) -> list[str]:
+    """Hidden test files under `root`, in directories at most `depth` levels down (None: all), after at most
+    `MAX_ENTRIES` entries."""
+    found = []
+    seen = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        if depth is not None and len(Path(dirpath).relative_to(root).parts) >= depth:
+            dirnames[:] = []  # list this directory, go no deeper
+        seen += len(dirnames) + len(filenames)
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            if name in names or (name.endswith(".py") and holds_marker(path)):
+                found.append(path)
+        if seen > MAX_ENTRIES:
+            break
+    return found
+
+
+def find_hidden_tests() -> list[str]:
+    """Every hidden test file an unsandboxed agent finds from where it runs: the whole workdir tree, the files of
+    each parent directory up to `/` (not their subdirectories), and the roots of $FAKE_SCAN_ROOTS (path-separated)
+    `EXTRA_ROOT_DEPTH` levels down. It does not search `$HOME` or the temp dir: the benchmark may live there, and
+    an unsandboxed agent can read anything the user can. Only the sandbox, which mounts the workdir alone, stops that."""
+    names = {n for n in os.environ.get("FAKE_HIDDEN_NAMES", "").split(",") if n}
+    cwd = Path(os.path.realpath(os.getcwd()))
+    roots: list[tuple[Path, int | None]] = [(cwd, None)] + [(p, 0) for p in cwd.parents]
+    extra = [r for r in os.environ.get("FAKE_SCAN_ROOTS", "").split(os.pathsep) if r]
+    roots += [(Path(os.path.realpath(r)), EXTRA_ROOT_DEPTH) for r in extra]
+    return sorted({path for root, depth in roots for path in scan(root, names, depth)})
+
 
 kind, mode = sys.argv[1], sys.argv[2]
-fix = mode == "fix" or mode.startswith("hide-")
+fix = mode in ("fix", "plant-link") or mode.startswith("hide-")
 for leaked in ("FAKE_KEY", "SECRET_CANARY"):
     if leaked in os.environ:
         sys.exit(9)
 print(f"debug key={os.environ.get('FAKE_API_KEY', '')}", file=sys.stderr)
+if mode == "probe-hidden":
+    leaked_files = find_hidden_tests()
+    if leaked_files:
+        print(f"hidden tests visible to the agent: {leaked_files}", file=sys.stderr)
+        sys.exit(7)
 if os.environ.get("FAKE_PROBE_FILE"):
     import subprocess
 
@@ -89,6 +147,8 @@ def hide_forbidden_change() -> None:
             f.write("* filter=x diff=x\n")
 
 
+if mode == "plant-link":
+    os.symlink(os.environ["FAKE_CANARY_FILE"], "test_hidden.py")
 if mode.startswith("hide-"):
     hide_forbidden_change()
 if fix:

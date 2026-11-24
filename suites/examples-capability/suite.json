@@ -1,0 +1,71 @@
+{
+  "schema_version": "1.0.0",
+  "name": "examples-capability",
+  "version": "1.0.0",
+  "kind": "capability",
+  "description": "Three small synthetic tasks written for this repository (MIT): a dependency API migration, a path traversal fix and an extract-function refactor. Stdlib only, offline.",
+  "tasks": [
+    {
+      "id": "dependency-upgrade",
+      "repo": "dependency-upgrade/repo",
+      "prompt": "The vendored library under vendor/tinytable was upgraded to 2.0 and inventory.py no longer works with it. Read vendor/tinytable/CHANGELOG.md and migrate inventory.py to the new API without changing the text it produces. Do not edit anything under vendor/. Do not ask questions.",
+      "hidden_tests": "dependency-upgrade/hidden_tests",
+      "test": "python3 -m unittest -q test_hidden_upgrade.py",
+      "solution": "dependency-upgrade/solution",
+      "protected_paths": [
+        "vendor"
+      ],
+      "tags": [
+        "python",
+        "migration",
+        "dependency"
+      ],
+      "provenance": {
+        "source": "synthetic",
+        "license": "MIT",
+        "url": null
+      }
+    },
+    {
+      "id": "path-traversal-fix",
+      "repo": "path-traversal-fix/repo",
+      "prompt": "archive_tools/extract.py unpacks uploaded zip archives, but a crafted archive can make it write files outside the destination directory (CWE-22, \"zip slip\"). Fix extract_all so that, when any member would be written outside dest, it raises UnsafeArchiveError before writing anything, and archives with safe members still extract as before. Do not ask questions.",
+      "hidden_tests": "path-traversal-fix/hidden_tests",
+      "test": "python3 -m unittest -q test_hidden_traversal.py",
+      "solution": "path-traversal-fix/solution",
+      "protected_paths": [
+        "tests"
+      ],
+      "tags": [
+        "python",
+        "security",
+        "cwe-22"
+      ],
+      "provenance": {
+        "source": "synthetic",
+        "license": "MIT",
+        "url": null
+      }
+    },
+    {
+      "id": "extract-function",
+      "repo": "extract-function/repo",
+      "prompt": "render_invoice in invoice.py mixes the invoice layout with the discount rules. Extract the discount calculation into a module-level function discount_amount(subtotal: Decimal, code: str | None) -> Decimal that returns the amount to take off, and make render_invoice call it. The output of render_invoice must not change; the tests in tests/ must keep passing. Do not ask questions.",
+      "hidden_tests": "extract-function/hidden_tests",
+      "test": "python3 -m unittest -q test_hidden_extract.py tests.test_invoice",
+      "solution": "extract-function/solution",
+      "protected_paths": [
+        "tests"
+      ],
+      "tags": [
+        "python",
+        "refactor"
+      ],
+      "provenance": {
+        "source": "synthetic",
+        "license": "MIT",
+        "url": null
+      }
+    }
+  ]
+}

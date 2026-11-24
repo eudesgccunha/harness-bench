@@ -221,15 +221,11 @@
       "cache_write": 0
     }
   },
+  "suites": [
+    "suites/regression",
+    "suites/examples-capability"
+  ],
   "tasks": [
-    {
-      "id": "fizzbuzz",
-      "repo": "tasks/fizzbuzz/repo",
-      "prompt": "The function fizzbuzz in fizzbuzz.py has bugs. Fix it so fizzbuzz(n) returns 'Fizz' for multiples of 3, 'Buzz' for multiples of 5, 'FizzBuzz' for multiples of both, and str(n) otherwise. Do not ask questions.",
-      "hidden_tests": "tasks/fizzbuzz/hidden_tests",
-      "test": "python3 -m unittest -q test_hidden.py",
-      "protected_paths": []
-    },
     {
       "id": "example-real-repo",
       "repo": "git@github.com:YOUR-ORG/YOUR-REPO.git",

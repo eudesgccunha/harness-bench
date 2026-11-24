@@ -45,6 +45,8 @@ from hbench.runners import PARSERS as PARSERS, empty_usage as empty_usage, json_
 from hbench.runners import num as num, runner_for  # noqa: E402
 from hbench.graders.base import RunStep  # noqa: E402
 from hbench.runners.base import ParseUsage, build_argv  # noqa: E402
+from hbench.safe_copy import safe_copy_into  # noqa: E402
+from hbench.suites import SUITE_ONLY_KEYS, SUITE_PATH_KEYS, Suite, SuiteError, load_suite, suite_tasks  # noqa: E402
 
 VERSION = "0.0.0"
 
@@ -89,6 +91,8 @@ def computed_cost(u: Mapping[str, Any], price: Mapping[str, Any] | None) -> floa
 BASE_ENV = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ", "TMPDIR")
 SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]")
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+# Stale bytecode in a task source must not reach the workdir (a diff of the agent's work would show it).
+PYCACHE = shutil.ignore_patterns("__pycache__")
 
 
 def safe(s: object) -> str:
@@ -137,12 +141,69 @@ def report_options(cfg: Mapping[str, Any]) -> tuple[float, float]:
     return pp, width
 
 
+def load_config_suites(cfg: Mapping[str, Any], base: Path) -> list[Suite]:
+    """The suites listed in the config's `suites` key (directories relative to the config).
+    Raises `SuiteError` naming the entry and the problem."""
+    entries = cfg.get("suites", [])
+    if not isinstance(entries, list) or not all(isinstance(e, str) for e in entries):
+        raise SuiteError("suites must be a list of suite directories")
+    loaded = []
+    for entry in entries:
+        try:
+            loaded.append(load_suite(base / entry))
+        except SuiteError as e:
+            raise SuiteError(f"suite {entry}: {e}") from e
+    return loaded
+
+
+def check_config_tasks(cfg: Mapping[str, Any]) -> None:
+    """Exits when a config task carries a key only a suite task has: the engine reads `suite` to tell suite tasks
+    (someone else's data, with a narrower git policy) from the user's own, so a config task must not set it."""
+    for task in cfg.get("tasks", []):
+        reserved = sorted(SUITE_ONLY_KEYS & task.keys())
+        if reserved:
+            sys.exit(f"task {task.get('id')!r}: key(s) {', '.join(reserved)} are reserved for suite tasks; remove them")
+
+
+def expand_suites(cfg: Mapping[str, Any], base: Path) -> Mapping[str, Any]:
+    """`cfg` with the tasks of its suites appended to `tasks`. A config without `suites` is returned as it is.
+    A task id used twice (two suites of one name, or a config task with the id of a suite task) exits naming both."""
+    check_config_tasks(cfg)
+    try:
+        suites = load_config_suites(cfg, base)
+    except SuiteError as e:
+        sys.exit(str(e))
+    if not suites:
+        return cfg
+    tasks = list(cfg.get("tasks", []))
+    origin = {task["id"]: "config tasks" for task in tasks}
+    for suite in suites:
+        for task in suite_tasks(suite):
+            if task["id"] in origin:
+                sys.exit(f"duplicate task id {task['id']!r}: defined in {origin[task['id']]} and in suite {suite.path}")
+            origin[task["id"]] = f"suite {suite.path}"
+            tasks.append(task)
+    return {**cfg, "tasks": tasks}
+
+
+def valid_task_id(task: Mapping[str, Any]) -> bool:
+    """A config task id is one safe name. A suite task id is `<suite>/<task>`, each part a safe name."""
+    task_id = str(task["id"])
+    parts = task_id.split("/") if "suite" in task else [task_id]
+    if "suite" in task and (len(parts) != 2 or not all(parts)):
+        return False
+    return not any(SAFE_NAME.search(part) or part.startswith(".") for part in parts)
+
+
 def validate_config(cfg: Mapping[str, Any]) -> None:
     check_cost_source(cfg.get("cost_source", "auto"))
     report_options(cfg)
+    file_names: dict[str, str] = {}
     for task in cfg["tasks"]:
-        if SAFE_NAME.search(task["id"]) or task["id"].startswith("."):
+        if not valid_task_id(task):
             sys.exit(f"invalid task id {task['id']!r}: use only letters, digits, _ . - (no leading dot)")
+        if file_names.setdefault(safe(task["id"]), task["id"]) != task["id"]:
+            sys.exit(f"task ids {file_names[safe(task['id'])]!r} and {task['id']!r} would share the same file names")
         for field in ("repo", "ref"):
             if str(task.get(field, "")).startswith("-"):
                 sys.exit(f"task {task['id']}: {field} must not start with '-'")
@@ -174,6 +235,21 @@ def validate_config(cfg: Mapping[str, Any]) -> None:
     )
     if leaked:
         sys.exit(f"LiteLLM spend key {sorted(leaked)} must not be passed to agents")
+
+
+def is_sandboxed(cfg: Mapping[str, Any]) -> bool:
+    return bool((cfg.get("sandbox") or {}).get("prefix"))
+
+
+def require_sandbox(cfg: Mapping[str, Any], allow_unsandboxed: bool) -> None:
+    """Exit unless commands run in the configured sandbox or the user accepted the risk. Every command that
+    executes agent or task code (`run`, `suite validate --run`) starts with this check."""
+    if not is_sandboxed(cfg) and not allow_unsandboxed:
+        sys.exit(
+            "No sandbox configured. Agents run without approval prompts and the test\n"
+            "command executes agent-written code as your user. Set sandbox.prefix in the\n"
+            "config (see HARNESS_BENCH.md) or pass --allow-unsandboxed inside a disposable VM."
+        )
 
 
 def rmtree_inside(path: Path | str, root: Path | str) -> None:
@@ -227,8 +303,20 @@ def git_bin() -> str:
     return shutil.which("git") or sys.exit("git not found on PATH")
 
 
-def git(*args: str, cwd: Path | None = None) -> None:
-    subprocess.run([git_bin(), *args], cwd=cwd, check=True, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+# `GIT_ALLOW_PROTOCOL` of the clone of a task repo (defense in depth, behind the suite loader). A config task is the
+# user's own and may use any transport; a suite task is someone else's data and may only use `https`, so a suite can
+# never clone a private local repo (`file`) or use the user's SSH keys (`ssh`).
+CONFIG_GIT_PROTOCOLS = "https:ssh:file"
+SUITE_GIT_PROTOCOLS = "https"
+LOCAL_GIT_PROTOCOLS = "file"  # the clone from our own cache into the workdir
+
+
+def git(*args: str, cwd: Path | None = None, protocols: str = CONFIG_GIT_PROTOCOLS) -> None:
+    """Run git with only the transports in `protocols` allowed (`GIT_ALLOW_PROTOCOL`, so `ext::` is off too)."""
+    env = {**os.environ, "GIT_ALLOW_PROTOCOL": protocols}
+    subprocess.run(
+        [git_bin(), *args], cwd=cwd, env=env, check=True, stdin=subprocess.DEVNULL, capture_output=True, text=True
+    )
 
 
 def is_git_source(src: str) -> bool:
@@ -247,13 +335,14 @@ def prepare_workdir(task: Mapping[str, Any], base: Path, workdir: Path) -> None:
         cache = base / ".cache" / safe(task["id"])
         if not cache.exists():
             cache.parent.mkdir(parents=True, exist_ok=True)
-            git("clone", "--quiet", "--", src, str(cache))
-        git("clone", "--quiet", "--local", "--", str(cache), str(workdir))
+            allowed = SUITE_GIT_PROTOCOLS if "suite" in task else CONFIG_GIT_PROTOCOLS
+            git("clone", "--quiet", "--", src, str(cache), protocols=allowed)
+        git("clone", "--quiet", "--local", "--", str(cache), str(workdir), protocols=LOCAL_GIT_PROTOCOLS)
         if task.get("ref"):
             git("-C", str(workdir), "checkout", "--quiet", "--detach", task["ref"])
         shutil.rmtree(workdir / ".git")
     else:
-        shutil.copytree(src, workdir, symlinks=True)
+        shutil.copytree(src, workdir, symlinks=True, ignore=PYCACHE)
 
 
 # Options of every git call on the agent's workdir, so nothing the agent leaves there can steer or hide the diff:
@@ -527,7 +616,7 @@ def resolve_work_root(cfg: Mapping[str, Any], base: Path) -> Path:
     """Work directories live outside the benchmark repo, so the agent's cwd does not
     sit next to hidden tests, config and results."""
     if cfg.get("work_dir"):
-        root = Path(expand_env(cfg["work_dir"])).expanduser().resolve()
+        root = (base / Path(expand_env(cfg["work_dir"])).expanduser()).resolve()  # relative: to the config dir
         if root.is_relative_to(base.resolve()):
             sys.exit(f"work_dir {root} is inside the benchmark repo; use a path outside it")
         root.mkdir(parents=True, exist_ok=True)
@@ -557,6 +646,29 @@ def run_step(
     return rc, to, out, err
 
 
+def step_runner(
+    cfg: Mapping[str, Any],
+    logs_dir: Path,
+    tag: str,
+    workdir: Path,
+    env_file: Path,
+    secrets: Iterable[str],
+    env: Mapping[str, str],
+) -> Callable[[str], RunStep]:
+    """`run_for(prefix)` for `grade_trial`: a `RunStep` that goes through `run_step` (sandbox wrapper, env allowlist,
+    redacted log named `<tag>.<prefix><log name>.log` in `logs_dir`)."""
+    secret_list = list(secrets)
+
+    def run_for(prefix: str) -> RunStep:
+        def run(command: str, timeout: int, log_name: str) -> tuple[int, bool, str, str]:
+            log = logs_dir / f"{tag}.{prefix}{safe(log_name)}.log"
+            return run_step(cfg, command, env, timeout, log, workdir, env_file, secret_list)
+
+        return run
+
+    return run_for
+
+
 def grade_trial(
     plan: GradePlan,
     task: Mapping[str, Any],
@@ -582,8 +694,99 @@ def grade_trial(
     return passed, results
 
 
+def stable_task(task: Mapping[str, Any]) -> dict[str, Any]:
+    """`task` as it enters the hash of a run. A suite task's directories are relative to its suite directory, so the
+    hash does not depend on the checkout path. A git URL stays as it is."""
+    if "suite" not in task:
+        return dict(task)
+    root = Path(task["suite_dir"])
+    stable = {k: v for k, v in task.items() if k != "suite_dir"}
+    for key in SUITE_PATH_KEYS:
+        if key in stable and Path(stable[key]).is_relative_to(root):
+            stable[key] = Path(stable[key]).relative_to(root).as_posix()
+    return stable
+
+
+def suite_version_of(tasks: Sequence[Mapping[str, Any]]) -> str:
+    """What `RunInfo.suite_version` records: the hash of the tasks, led by `name@version,...` when suites ran."""
+    labels = list(dict.fromkeys(t["suite_label"] for t in tasks if "suite" in t))
+    digest = sha256_json([stable_task(t) for t in tasks])[:12]
+    return f"{','.join(labels)}+{digest}" if labels else digest
+
+
+@dataclass(frozen=True)
+class TaskCheck:
+    """Behavioral check of a suite task: the graders must fail on the untouched repo and pass with the solution."""
+
+    task_id: str
+    untouched_passed: bool
+    solution_passed: bool
+
+    @property
+    def ok(self) -> bool:
+        return not self.untouched_passed and self.solution_passed
+
+    @property
+    def status(self) -> str:
+        problems = [
+            *(["trivially passing"] if self.untouched_passed else []),
+            *([] if self.solution_passed else ["solution fails"]),
+        ]
+        return ", ".join(problems) or "ok"
+
+
+def run_task_attempt(
+    cfg: Mapping[str, Any],
+    task: Mapping[str, Any],
+    base: Path,
+    work_root: Path,
+    git_root: Path,
+    tag: str,
+    solution: Path | None,
+) -> bool:
+    """One trial of `task` the way `run` does it (workdir, setup, baseline, protected paths, graders), with the files
+    of `solution` copied over the repo in place of an agent. Whether the graders passed."""
+    logs_dir = work_root / "logs"
+    logs_dir.mkdir(exist_ok=True)
+    workdir = work_root / tag
+    rmtree_inside(workdir, work_root)  # a leftover of a crashed validation
+    prepare_workdir(task, base, workdir)
+    env = base_env(cfg)
+    secrets = [os.environ.get(v, "") for v in spend_key_vars(cfg)]
+    run_for = step_runner(cfg, logs_dir, tag, workdir, work_root / f".{tag}.env", secrets, env)
+    if task.get("setup"):
+        run_for("")(task["setup"], task.get("setup_timeout", 900), "setup")
+    git_dir = git_root / f"{tag}.git"
+    baseline = make_baseline(workdir, git_dir)
+    snap = Path(tempfile.mkdtemp(prefix=f".{tag}.protected-", dir=work_root))
+    snapshot_protected(task, workdir, snap)
+    if solution is not None:
+        safe_copy_into(solution, workdir, ignore=PYCACHE)  # never through a link the repo left in the workdir
+    changes = collect_changes(baseline)
+    rmtree_inside(git_dir, git_root)
+    restore_protected(task, workdir, snap)
+    rmtree_inside(snap, work_root)
+    passed, _ = grade_trial(grade_plan(task), task, base, workdir, changes, run_for)
+    rmtree_inside(workdir, work_root)
+    return passed
+
+
+def validate_task_behavior(cfg: Mapping[str, Any], task: Mapping[str, Any], base: Path, work_root: Path) -> TaskCheck:
+    """The M2 check of a suite task (needs its `solution` key): the graders on the untouched repo and with the
+    solution. It runs repo and test code only through the engine path of `run`: `prepare_workdir`, `run_step` (so
+    `wrap()`, the env allowlist and log redaction) and `rmtree_inside`. The caller has applied `require_sandbox`."""
+    slug = safe(task["id"])
+    with tempfile.TemporaryDirectory(prefix="harness-bench-git-") as git_root:
+        untouched = run_task_attempt(cfg, task, base, work_root, Path(git_root), f"validate-{slug}-untouched", None)
+        solved = run_task_attempt(
+            cfg, task, base, work_root, Path(git_root), f"validate-{slug}-solution", Path(task["solution"])
+        )
+    return TaskCheck(task_id=task["id"], untouched_passed=untouched, solution_passed=solved)
+
+
 def make_run_info(cfg: Mapping[str, Any], only: Sequence[str] | None, sandboxed: bool) -> RunInfo:
-    """Metadata of this `run`. The config hash covers `${VAR}` references, never expanded values."""
+    """Metadata of this `run`. The config hash covers `${VAR}` references, never expanded values, and the
+    config as written: the tasks that came from suites are not part of it."""
     targets = tuple(
         Target(
             harness=pair["harness"],
@@ -599,8 +802,8 @@ def make_run_info(cfg: Mapping[str, Any], only: Sequence[str] | None, sandboxed:
         started_at=datetime.now(UTC),
         finished_at=None,
         harness_bench_version=VERSION,
-        config_sha256=sha256_json(cfg),
-        suite_version=sha256_json(cfg["tasks"])[:12],
+        config_sha256=sha256_json({**cfg, "tasks": [t for t in cfg["tasks"] if "suite" not in t]}),
+        suite_version=suite_version_of(cfg["tasks"]),
         python=platform.python_version(),
         platform=platform.platform(),
         sandboxed=sandboxed,
@@ -616,14 +819,11 @@ def cmd_run(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path) -> Non
 
 
 def _run_matrix(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path, git_root: Path) -> None:
+    cfg = expand_suites(cfg, base)
     validate_config(cfg)
-    sandboxed = bool((cfg.get("sandbox") or {}).get("prefix"))
-    if not sandboxed and not args.dry_run and not args.allow_unsandboxed:
-        sys.exit(
-            "No sandbox configured. Agents run without approval prompts and the test\n"
-            "command executes agent-written code as your user. Set sandbox.prefix in the\n"
-            "config (see HARNESS_BENCH.md) or pass --allow-unsandboxed inside a disposable VM."
-        )
+    sandboxed = is_sandboxed(cfg)
+    if not args.dry_run:
+        require_sandbox(cfg, args.allow_unsandboxed)
     out_dir = base / cfg.get("output_dir", "results")
     out_dir.mkdir(parents=True, exist_ok=True)
     logs_dir = out_dir / "logs"
@@ -717,19 +917,7 @@ def _run_matrix(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path, gi
                 restore_protected(task, workdir, snap)
                 rmtree_inside(snap, work_root)
 
-                def run_for(
-                    prefix: str,
-                    tag: str = tag,
-                    workdir: Path = workdir,
-                    env_file: Path = env_file,
-                    secrets: list[str] = secrets,
-                    cmd_env: dict[str, str] = cmd_env,
-                ) -> RunStep:
-                    def run(command: str, timeout: int, log_name: str) -> tuple[int, bool, str, str]:
-                        log = logs_dir / f"{tag}.{prefix}{safe(log_name)}.log"
-                        return run_step(cfg, command, cmd_env, timeout, log, workdir, env_file, secrets)
-
-                    return run
+                run_for = step_runner(cfg, logs_dir, tag, workdir, env_file, secrets, cmd_env)
 
                 passed, grader_results = grade_trial(plans[task["id"]], task, base, workdir, changes, run_for)
                 test_to = any(r.timed_out for r in grader_results)
@@ -923,8 +1111,19 @@ def cmd_report(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path) -> 
             return
     table = report.aggregate(trials, cost_source, null_harnesses=null_harnesses, target_ci_width=target_width)
     report.write_csv(table, out_dir / "summary.csv")
+    try:
+        suite_kinds = {suite.name: suite.kind for suite in load_config_suites(cfg, base)}
+    except SuiteError as e:
+        print(f"warning: cannot read the suites ({e}); the 'By suite kind' section is skipped")
+        suite_kinds = {}
     md = report.render_markdown(
-        table, trials, cost_source, datetime.now(), recommend_within_pp=within_pp, target_ci_width=target_width
+        table,
+        trials,
+        cost_source,
+        datetime.now(),
+        recommend_within_pp=within_pp,
+        target_ci_width=target_width,
+        suite_kinds=suite_kinds,
     )
     (out_dir / "summary.md").write_text(md)
     print("\n" + md)

@@ -54,7 +54,7 @@ If a run shows cost `n/a`, its tag did not reach LiteLLM. See the "LiteLLM: what
 harness-bench/
 ├── harness_bench.py
 ├── harness_bench_litellm.py     # LiteLLM-only variant (no Cursor)
-├── hbench/                      # data contract, report and single CLI (ADR 0005)
+├── hbench/                      # data contract, report, suites and single CLI (ADR 0005, 0008)
 ├── README.md / AGENTS.md
 ├── scripts/build_md.py          # generates this HARNESS_BENCH.md
 ├── sandbox/Dockerfile           # sandbox image with the CLIs
@@ -66,10 +66,10 @@ harness-bench/
 ├── pi-models.example.json       # goes to ~/.pi/agent/models.json
 ├── opencode.example.json        # goes to ~/.config/opencode/opencode.json (or the project's opencode.json)
 ├── codex-config.example.toml    # snippet for ~/.codex/config.toml
-└── tasks/
-    └── fizzbuzz/
-        ├── repo/fizzbuzz.py
-        └── hidden_tests/test_hidden.py   # copied in only AFTER the agent runs
+└── suites/                      # versioned suites of tasks (ADR 0008)
+    ├── regression/              # kind "regression": tasks every healthy pair solves
+    │   └── fizzbuzz/            # repo/, hidden_tests/ (copied in only AFTER the agent runs), solution/
+    └── examples-capability/     # kind "capability": dependency-upgrade, path-traversal-fix, extract-function
 ```
 
 ## Step by step
@@ -131,6 +131,7 @@ Besides the cost and token columns, the main table of `summary.md` shows how sur
 | Negative control | Pairs whose harness uses `parser: null`. Any pass prints a warning: the tests are too lenient. Null pairs are left out of the recommendation, ties, frontier and discrimination, and sort last. |
 | Discrimination | Tasks every non-null run solved (saturated) and tasks no run solved. They do not separate the pairs. `report --drop-saturated` removes the saturated ones before aggregating (also accepted by `run` and `reconcile`, which print the report). |
 | Paired comparison | Exact two-sided McNemar test between the best-ranked pair and every other pair, pairing runs by task and rep. `b` counts runs only the best pair solved, `c` runs only the other pair solved. |
+| By suite kind | Only when the trials come from more than one suite kind (`capability`, `regression`): solved/runs per pair for each kind, and a warning for every regression task a non-null pair did not solve. |
 | Repetitions | Reps per task needed for a pass-rate interval at most `target_ci_width` wide (config, default 0.20), at the observed pass rate; `more than N` when 10,000 total runs are not enough. |
 
 Both config keys are optional: `recommend_within_pp` is a number from 0 to 100, `target_ci_width` a number above 0 and up to 1.
@@ -273,7 +274,7 @@ The agents run **without asking for approval**, and the `test` command executes 
 
 What the script does on every run:
 
-1. **Workdir outside the benchmark repository**: a new temporary directory, or an absolute `work_dir` outside the repository (the script rejects a path inside it). So the agent does not work next to hidden tests, config and results.
+1. **Workdir outside the benchmark repository**: a new temporary directory, or a `work_dir` outside the repository (a relative path is relative to the config directory; the script rejects a path inside the repository). So the agent does not work next to hidden tests, config and results.
 2. **No git history**: the task repository is copied without `.git`. A clone at the commit before the fix would still contain the fix commit, and the remote would point back to the benchmark. The single `baseline` commit lives in a private temporary git directory outside the workdir and `work_dir` (deleted after the trial). Every git call on the workdir ignores its `.git`, `.gitignore`, `.gitattributes`, replace refs and git config, and every diff starts from a fresh index, so the agent cannot hide a change or run a command on the host through git. If the agent leaves a `.git` anywhere in the workdir, or `git add` fails (for example on an unreadable file), its changes count as unknown and `diff_constraints` fails; a binary file counts as more than any `max_changed_lines`. This works on any git version (an `info/attributes` file in the baseline git directory does the work; git 2.40 or newer adds `--attr-source` as a second layer). The guarantee holds for sandboxed runs: an unsandboxed agent runs as your user and could find and edit the temporary git directory.
 3. **Minimal environment**: the agent gets only `PATH`, `HOME`, `USER`, locale, `TERM`, `TMPDIR`, the variables in `env_passthrough` and those in the harness `env` block. `setup` and `test` get the same, without the harness `env`. The LiteLLM spend-read key (`litellm.api_key`) **never** reaches the agent: the script rejects a config that tries to pass it through.
 4. **Protected files**: before the agent runs, each path in `protected_paths` is copied outside the workdir. Before the test, that content is restored and anything the agent created there is deleted. Use it for the test runner and configs (`tests/`, `package.json`, `pytest.ini`, `conftest.py`, `vitest.config.ts`). Without it, an agent can "solve" the task by making the test always pass.
@@ -281,6 +282,8 @@ What the script does on every run:
 6. **Logs without secrets**: values of the harness `env` variables and the spend key are replaced with `***REDACTED***`.
 7. **Config validation**: task ids and harness names accept only letters, digits, `_`, `.` and `-`. `repo` and `ref` cannot start with `-`. `protected_paths` must be relative and without `..`. The script deletes only directories inside the work root.
 8. **LiteLLM**: `base_url` must use `https` (http only for localhost), and redirects are not followed, so the key does not go to another host.
+9. **Copies never follow a link the agent planted**: the hidden tests (before grading) and the `solution` of `suite validate --run` are copied with `hbench/safe_copy.py`, which replaces any symlink (or hard-linked file) on the destination path with a regular file instead of writing through it. Otherwise an agent that plants `test_hidden.py -> ~/.bashrc` would make the grader overwrite a host file.
+10. **Git transports**: `git clone` of a task repo runs with `GIT_ALLOW_PROTOCOL`: `https:ssh:file` for the tasks of your config, `https` only for suite tasks, so a suite can never clone a private local repo or use your SSH keys. The clone from the local cache into the workdir allows `file` alone.
 
 What the script does **not** solve on its own: without a sandbox, the agent runs as your user and can read any of your files (including `~/.ssh`) and tamper with results. That is why `run` requires `sandbox.prefix` or `--allow-unsandboxed`.
 
@@ -329,6 +332,8 @@ The `prefix` in the example configs mounts only the workdir, at the same path, a
 Integrating it would need a dedicated backend: create the sandbox, upload the workdir, run, download the result and destroy it. It is worth it when you need to restrict the agents' egress.
 
 ## Choosing tasks
+
+A task lives in a suite (see [Suites](#suites)): add it to a `suite.json` with its `solution`, bump the suite `version`, and run `suite validate --run` before using it. The list below applies to every task.
 
 - Use real bugs that were already fixed, with `ref` = the commit before the fix.
 - Write the prompt like an issue, with no hint of the solution.
@@ -419,6 +424,8 @@ from hbench.runners import PARSERS as PARSERS, empty_usage as empty_usage, json_
 from hbench.runners import num as num, runner_for  # noqa: E402
 from hbench.graders.base import RunStep  # noqa: E402
 from hbench.runners.base import ParseUsage, build_argv  # noqa: E402
+from hbench.safe_copy import safe_copy_into  # noqa: E402
+from hbench.suites import SUITE_ONLY_KEYS, SUITE_PATH_KEYS, Suite, SuiteError, load_suite, suite_tasks  # noqa: E402
 
 VERSION = "0.0.0"
 
@@ -463,6 +470,8 @@ def computed_cost(u: Mapping[str, Any], price: Mapping[str, Any] | None) -> floa
 BASE_ENV = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ", "TMPDIR")
 SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]")
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+# Stale bytecode in a task source must not reach the workdir (a diff of the agent's work would show it).
+PYCACHE = shutil.ignore_patterns("__pycache__")
 
 
 def safe(s: object) -> str:
@@ -511,12 +520,69 @@ def report_options(cfg: Mapping[str, Any]) -> tuple[float, float]:
     return pp, width
 
 
+def load_config_suites(cfg: Mapping[str, Any], base: Path) -> list[Suite]:
+    """The suites listed in the config's `suites` key (directories relative to the config).
+    Raises `SuiteError` naming the entry and the problem."""
+    entries = cfg.get("suites", [])
+    if not isinstance(entries, list) or not all(isinstance(e, str) for e in entries):
+        raise SuiteError("suites must be a list of suite directories")
+    loaded = []
+    for entry in entries:
+        try:
+            loaded.append(load_suite(base / entry))
+        except SuiteError as e:
+            raise SuiteError(f"suite {entry}: {e}") from e
+    return loaded
+
+
+def check_config_tasks(cfg: Mapping[str, Any]) -> None:
+    """Exits when a config task carries a key only a suite task has: the engine reads `suite` to tell suite tasks
+    (someone else's data, with a narrower git policy) from the user's own, so a config task must not set it."""
+    for task in cfg.get("tasks", []):
+        reserved = sorted(SUITE_ONLY_KEYS & task.keys())
+        if reserved:
+            sys.exit(f"task {task.get('id')!r}: key(s) {', '.join(reserved)} are reserved for suite tasks; remove them")
+
+
+def expand_suites(cfg: Mapping[str, Any], base: Path) -> Mapping[str, Any]:
+    """`cfg` with the tasks of its suites appended to `tasks`. A config without `suites` is returned as it is.
+    A task id used twice (two suites of one name, or a config task with the id of a suite task) exits naming both."""
+    check_config_tasks(cfg)
+    try:
+        suites = load_config_suites(cfg, base)
+    except SuiteError as e:
+        sys.exit(str(e))
+    if not suites:
+        return cfg
+    tasks = list(cfg.get("tasks", []))
+    origin = {task["id"]: "config tasks" for task in tasks}
+    for suite in suites:
+        for task in suite_tasks(suite):
+            if task["id"] in origin:
+                sys.exit(f"duplicate task id {task['id']!r}: defined in {origin[task['id']]} and in suite {suite.path}")
+            origin[task["id"]] = f"suite {suite.path}"
+            tasks.append(task)
+    return {**cfg, "tasks": tasks}
+
+
+def valid_task_id(task: Mapping[str, Any]) -> bool:
+    """A config task id is one safe name. A suite task id is `<suite>/<task>`, each part a safe name."""
+    task_id = str(task["id"])
+    parts = task_id.split("/") if "suite" in task else [task_id]
+    if "suite" in task and (len(parts) != 2 or not all(parts)):
+        return False
+    return not any(SAFE_NAME.search(part) or part.startswith(".") for part in parts)
+
+
 def validate_config(cfg: Mapping[str, Any]) -> None:
     check_cost_source(cfg.get("cost_source", "auto"))
     report_options(cfg)
+    file_names: dict[str, str] = {}
     for task in cfg["tasks"]:
-        if SAFE_NAME.search(task["id"]) or task["id"].startswith("."):
+        if not valid_task_id(task):
             sys.exit(f"invalid task id {task['id']!r}: use only letters, digits, _ . - (no leading dot)")
+        if file_names.setdefault(safe(task["id"]), task["id"]) != task["id"]:
+            sys.exit(f"task ids {file_names[safe(task['id'])]!r} and {task['id']!r} would share the same file names")
         for field in ("repo", "ref"):
             if str(task.get(field, "")).startswith("-"):
                 sys.exit(f"task {task['id']}: {field} must not start with '-'")
@@ -548,6 +614,21 @@ def validate_config(cfg: Mapping[str, Any]) -> None:
     )
     if leaked:
         sys.exit(f"LiteLLM spend key {sorted(leaked)} must not be passed to agents")
+
+
+def is_sandboxed(cfg: Mapping[str, Any]) -> bool:
+    return bool((cfg.get("sandbox") or {}).get("prefix"))
+
+
+def require_sandbox(cfg: Mapping[str, Any], allow_unsandboxed: bool) -> None:
+    """Exit unless commands run in the configured sandbox or the user accepted the risk. Every command that
+    executes agent or task code (`run`, `suite validate --run`) starts with this check."""
+    if not is_sandboxed(cfg) and not allow_unsandboxed:
+        sys.exit(
+            "No sandbox configured. Agents run without approval prompts and the test\n"
+            "command executes agent-written code as your user. Set sandbox.prefix in the\n"
+            "config (see HARNESS_BENCH.md) or pass --allow-unsandboxed inside a disposable VM."
+        )
 
 
 def rmtree_inside(path: Path | str, root: Path | str) -> None:
@@ -601,8 +682,20 @@ def git_bin() -> str:
     return shutil.which("git") or sys.exit("git not found on PATH")
 
 
-def git(*args: str, cwd: Path | None = None) -> None:
-    subprocess.run([git_bin(), *args], cwd=cwd, check=True, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+# `GIT_ALLOW_PROTOCOL` of the clone of a task repo (defense in depth, behind the suite loader). A config task is the
+# user's own and may use any transport; a suite task is someone else's data and may only use `https`, so a suite can
+# never clone a private local repo (`file`) or use the user's SSH keys (`ssh`).
+CONFIG_GIT_PROTOCOLS = "https:ssh:file"
+SUITE_GIT_PROTOCOLS = "https"
+LOCAL_GIT_PROTOCOLS = "file"  # the clone from our own cache into the workdir
+
+
+def git(*args: str, cwd: Path | None = None, protocols: str = CONFIG_GIT_PROTOCOLS) -> None:
+    """Run git with only the transports in `protocols` allowed (`GIT_ALLOW_PROTOCOL`, so `ext::` is off too)."""
+    env = {**os.environ, "GIT_ALLOW_PROTOCOL": protocols}
+    subprocess.run(
+        [git_bin(), *args], cwd=cwd, env=env, check=True, stdin=subprocess.DEVNULL, capture_output=True, text=True
+    )
 
 
 def is_git_source(src: str) -> bool:
@@ -621,13 +714,14 @@ def prepare_workdir(task: Mapping[str, Any], base: Path, workdir: Path) -> None:
         cache = base / ".cache" / safe(task["id"])
         if not cache.exists():
             cache.parent.mkdir(parents=True, exist_ok=True)
-            git("clone", "--quiet", "--", src, str(cache))
-        git("clone", "--quiet", "--local", "--", str(cache), str(workdir))
+            allowed = SUITE_GIT_PROTOCOLS if "suite" in task else CONFIG_GIT_PROTOCOLS
+            git("clone", "--quiet", "--", src, str(cache), protocols=allowed)
+        git("clone", "--quiet", "--local", "--", str(cache), str(workdir), protocols=LOCAL_GIT_PROTOCOLS)
         if task.get("ref"):
             git("-C", str(workdir), "checkout", "--quiet", "--detach", task["ref"])
         shutil.rmtree(workdir / ".git")
     else:
-        shutil.copytree(src, workdir, symlinks=True)
+        shutil.copytree(src, workdir, symlinks=True, ignore=PYCACHE)
 
 
 # Options of every git call on the agent's workdir, so nothing the agent leaves there can steer or hide the diff:
@@ -901,7 +995,7 @@ def resolve_work_root(cfg: Mapping[str, Any], base: Path) -> Path:
     """Work directories live outside the benchmark repo, so the agent's cwd does not
     sit next to hidden tests, config and results."""
     if cfg.get("work_dir"):
-        root = Path(expand_env(cfg["work_dir"])).expanduser().resolve()
+        root = (base / Path(expand_env(cfg["work_dir"])).expanduser()).resolve()  # relative: to the config dir
         if root.is_relative_to(base.resolve()):
             sys.exit(f"work_dir {root} is inside the benchmark repo; use a path outside it")
         root.mkdir(parents=True, exist_ok=True)
@@ -931,6 +1025,29 @@ def run_step(
     return rc, to, out, err
 
 
+def step_runner(
+    cfg: Mapping[str, Any],
+    logs_dir: Path,
+    tag: str,
+    workdir: Path,
+    env_file: Path,
+    secrets: Iterable[str],
+    env: Mapping[str, str],
+) -> Callable[[str], RunStep]:
+    """`run_for(prefix)` for `grade_trial`: a `RunStep` that goes through `run_step` (sandbox wrapper, env allowlist,
+    redacted log named `<tag>.<prefix><log name>.log` in `logs_dir`)."""
+    secret_list = list(secrets)
+
+    def run_for(prefix: str) -> RunStep:
+        def run(command: str, timeout: int, log_name: str) -> tuple[int, bool, str, str]:
+            log = logs_dir / f"{tag}.{prefix}{safe(log_name)}.log"
+            return run_step(cfg, command, env, timeout, log, workdir, env_file, secret_list)
+
+        return run
+
+    return run_for
+
+
 def grade_trial(
     plan: GradePlan,
     task: Mapping[str, Any],
@@ -956,8 +1073,99 @@ def grade_trial(
     return passed, results
 
 
+def stable_task(task: Mapping[str, Any]) -> dict[str, Any]:
+    """`task` as it enters the hash of a run. A suite task's directories are relative to its suite directory, so the
+    hash does not depend on the checkout path. A git URL stays as it is."""
+    if "suite" not in task:
+        return dict(task)
+    root = Path(task["suite_dir"])
+    stable = {k: v for k, v in task.items() if k != "suite_dir"}
+    for key in SUITE_PATH_KEYS:
+        if key in stable and Path(stable[key]).is_relative_to(root):
+            stable[key] = Path(stable[key]).relative_to(root).as_posix()
+    return stable
+
+
+def suite_version_of(tasks: Sequence[Mapping[str, Any]]) -> str:
+    """What `RunInfo.suite_version` records: the hash of the tasks, led by `name@version,...` when suites ran."""
+    labels = list(dict.fromkeys(t["suite_label"] for t in tasks if "suite" in t))
+    digest = sha256_json([stable_task(t) for t in tasks])[:12]
+    return f"{','.join(labels)}+{digest}" if labels else digest
+
+
+@dataclass(frozen=True)
+class TaskCheck:
+    """Behavioral check of a suite task: the graders must fail on the untouched repo and pass with the solution."""
+
+    task_id: str
+    untouched_passed: bool
+    solution_passed: bool
+
+    @property
+    def ok(self) -> bool:
+        return not self.untouched_passed and self.solution_passed
+
+    @property
+    def status(self) -> str:
+        problems = [
+            *(["trivially passing"] if self.untouched_passed else []),
+            *([] if self.solution_passed else ["solution fails"]),
+        ]
+        return ", ".join(problems) or "ok"
+
+
+def run_task_attempt(
+    cfg: Mapping[str, Any],
+    task: Mapping[str, Any],
+    base: Path,
+    work_root: Path,
+    git_root: Path,
+    tag: str,
+    solution: Path | None,
+) -> bool:
+    """One trial of `task` the way `run` does it (workdir, setup, baseline, protected paths, graders), with the files
+    of `solution` copied over the repo in place of an agent. Whether the graders passed."""
+    logs_dir = work_root / "logs"
+    logs_dir.mkdir(exist_ok=True)
+    workdir = work_root / tag
+    rmtree_inside(workdir, work_root)  # a leftover of a crashed validation
+    prepare_workdir(task, base, workdir)
+    env = base_env(cfg)
+    secrets = [os.environ.get(v, "") for v in spend_key_vars(cfg)]
+    run_for = step_runner(cfg, logs_dir, tag, workdir, work_root / f".{tag}.env", secrets, env)
+    if task.get("setup"):
+        run_for("")(task["setup"], task.get("setup_timeout", 900), "setup")
+    git_dir = git_root / f"{tag}.git"
+    baseline = make_baseline(workdir, git_dir)
+    snap = Path(tempfile.mkdtemp(prefix=f".{tag}.protected-", dir=work_root))
+    snapshot_protected(task, workdir, snap)
+    if solution is not None:
+        safe_copy_into(solution, workdir, ignore=PYCACHE)  # never through a link the repo left in the workdir
+    changes = collect_changes(baseline)
+    rmtree_inside(git_dir, git_root)
+    restore_protected(task, workdir, snap)
+    rmtree_inside(snap, work_root)
+    passed, _ = grade_trial(grade_plan(task), task, base, workdir, changes, run_for)
+    rmtree_inside(workdir, work_root)
+    return passed
+
+
+def validate_task_behavior(cfg: Mapping[str, Any], task: Mapping[str, Any], base: Path, work_root: Path) -> TaskCheck:
+    """The M2 check of a suite task (needs its `solution` key): the graders on the untouched repo and with the
+    solution. It runs repo and test code only through the engine path of `run`: `prepare_workdir`, `run_step` (so
+    `wrap()`, the env allowlist and log redaction) and `rmtree_inside`. The caller has applied `require_sandbox`."""
+    slug = safe(task["id"])
+    with tempfile.TemporaryDirectory(prefix="harness-bench-git-") as git_root:
+        untouched = run_task_attempt(cfg, task, base, work_root, Path(git_root), f"validate-{slug}-untouched", None)
+        solved = run_task_attempt(
+            cfg, task, base, work_root, Path(git_root), f"validate-{slug}-solution", Path(task["solution"])
+        )
+    return TaskCheck(task_id=task["id"], untouched_passed=untouched, solution_passed=solved)
+
+
 def make_run_info(cfg: Mapping[str, Any], only: Sequence[str] | None, sandboxed: bool) -> RunInfo:
-    """Metadata of this `run`. The config hash covers `${VAR}` references, never expanded values."""
+    """Metadata of this `run`. The config hash covers `${VAR}` references, never expanded values, and the
+    config as written: the tasks that came from suites are not part of it."""
     targets = tuple(
         Target(
             harness=pair["harness"],
@@ -973,8 +1181,8 @@ def make_run_info(cfg: Mapping[str, Any], only: Sequence[str] | None, sandboxed:
         started_at=datetime.now(UTC),
         finished_at=None,
         harness_bench_version=VERSION,
-        config_sha256=sha256_json(cfg),
-        suite_version=sha256_json(cfg["tasks"])[:12],
+        config_sha256=sha256_json({**cfg, "tasks": [t for t in cfg["tasks"] if "suite" not in t]}),
+        suite_version=suite_version_of(cfg["tasks"]),
         python=platform.python_version(),
         platform=platform.platform(),
         sandboxed=sandboxed,
@@ -990,14 +1198,11 @@ def cmd_run(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path) -> Non
 
 
 def _run_matrix(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path, git_root: Path) -> None:
+    cfg = expand_suites(cfg, base)
     validate_config(cfg)
-    sandboxed = bool((cfg.get("sandbox") or {}).get("prefix"))
-    if not sandboxed and not args.dry_run and not args.allow_unsandboxed:
-        sys.exit(
-            "No sandbox configured. Agents run without approval prompts and the test\n"
-            "command executes agent-written code as your user. Set sandbox.prefix in the\n"
-            "config (see HARNESS_BENCH.md) or pass --allow-unsandboxed inside a disposable VM."
-        )
+    sandboxed = is_sandboxed(cfg)
+    if not args.dry_run:
+        require_sandbox(cfg, args.allow_unsandboxed)
     out_dir = base / cfg.get("output_dir", "results")
     out_dir.mkdir(parents=True, exist_ok=True)
     logs_dir = out_dir / "logs"
@@ -1091,19 +1296,7 @@ def _run_matrix(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path, gi
                 restore_protected(task, workdir, snap)
                 rmtree_inside(snap, work_root)
 
-                def run_for(
-                    prefix: str,
-                    tag: str = tag,
-                    workdir: Path = workdir,
-                    env_file: Path = env_file,
-                    secrets: list[str] = secrets,
-                    cmd_env: dict[str, str] = cmd_env,
-                ) -> RunStep:
-                    def run(command: str, timeout: int, log_name: str) -> tuple[int, bool, str, str]:
-                        log = logs_dir / f"{tag}.{prefix}{safe(log_name)}.log"
-                        return run_step(cfg, command, cmd_env, timeout, log, workdir, env_file, secrets)
-
-                    return run
+                run_for = step_runner(cfg, logs_dir, tag, workdir, env_file, secrets, cmd_env)
 
                 passed, grader_results = grade_trial(plans[task["id"]], task, base, workdir, changes, run_for)
                 test_to = any(r.timed_out for r in grader_results)
@@ -1297,8 +1490,19 @@ def cmd_report(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path) -> 
             return
     table = report.aggregate(trials, cost_source, null_harnesses=null_harnesses, target_ci_width=target_width)
     report.write_csv(table, out_dir / "summary.csv")
+    try:
+        suite_kinds = {suite.name: suite.kind for suite in load_config_suites(cfg, base)}
+    except SuiteError as e:
+        print(f"warning: cannot read the suites ({e}); the 'By suite kind' section is skipped")
+        suite_kinds = {}
     md = report.render_markdown(
-        table, trials, cost_source, datetime.now(), recommend_within_pp=within_pp, target_ci_width=target_width
+        table,
+        trials,
+        cost_source,
+        datetime.now(),
+        recommend_within_pp=within_pp,
+        target_ci_width=target_width,
+        suite_kinds=suite_kinds,
     )
     (out_dir / "summary.md").write_text(md)
     print("\n" + md)
@@ -2869,13 +3073,13 @@ def command_result(
 ```python
 """The default grader: copy the hidden tests into the workdir, then run the task's test command."""
 
-import shutil
 from collections.abc import Mapping
 from typing import Any
 
 from hbench.core.models import GraderResult
 from hbench.graders._command import DEFAULT_TIMEOUT, check_score_flag, command_result
 from hbench.graders.base import GradeContext
+from hbench.safe_copy import safe_copy_into
 
 
 class HiddenTestsGrader:
@@ -2891,7 +3095,7 @@ class HiddenTestsGrader:
     def grade(self, ctx: GradeContext) -> GraderResult:
         hidden = ctx.task.get("hidden_tests")
         if hidden:
-            shutil.copytree((ctx.base / hidden).resolve(), ctx.workdir, dirs_exist_ok=True)
+            safe_copy_into((ctx.base / hidden).resolve(), ctx.workdir)  # never through a link the agent planted
         rc, timed_out, stdout, _ = ctx.run(ctx.task["test"], ctx.task.get("test_timeout", DEFAULT_TIMEOUT), "test")
         return command_result(self.name, self.version, rc, timed_out, stdout, self._use_score)
 ```
@@ -3778,6 +3982,58 @@ def _per_task_lines(table: Sequence[Mapping[str, Any]], trials: Sequence[TrialRe
     return lines
 
 
+def _suite_kind_of(task_id: str, suite_kinds: Mapping[str, str]) -> str | None:
+    """The kind of the suite a task id (`<suite>/<task>`) belongs to; none for a config task or an unknown suite."""
+    suite, slash, _ = task_id.partition("/")
+    return suite_kinds.get(suite) if slash else None
+
+
+def _failed_regressions(table: Sequence[Mapping[str, Any]], regression: Sequence[TrialResult]) -> list[str]:
+    """`pair (task solved/runs)` for every regression task a real (non-null) pair did not solve in every run."""
+    failed = []
+    for entry in table:
+        if entry["null_control"]:
+            continue
+        mine = [t for t in regression if (t.target.harness, t.target.model) == (entry["harness"], entry["model"])]
+        for task in sorted({t.task_id for t in mine}):
+            runs = [t for t in mine if t.task_id == task]
+            if not all(t.passed for t in runs):
+                failed.append(f"{_name(entry)} ({task} {sum(t.passed for t in runs)}/{len(runs)})")
+    return failed
+
+
+def _suite_kind_lines(
+    table: Sequence[Mapping[str, Any]], trials: Sequence[TrialResult], suite_kinds: Mapping[str, str]
+) -> list[str]:
+    """Solved/runs per pair for each suite kind, and a warning for every regression task a real pair failed.
+    Only when the trials come from more than one kind: a lone kind says nothing the main table does not."""
+    by_kind: dict[str, list[TrialResult]] = {}
+    for t in trials:
+        kind = _suite_kind_of(t.task_id, suite_kinds)
+        if kind is not None:
+            by_kind.setdefault(kind, []).append(t)
+    if len(by_kind) < 2:
+        return []
+    pairs = [(t["harness"], t["model"]) for t in table]
+    lines = [
+        "",
+        "## By suite kind",
+        "",
+        "| Kind | " + " | ".join(f"{h}<br>{m}" for h, m in pairs) + " |",
+        "|---|" + "---|" * len(pairs),
+    ]
+    for kind in sorted(by_kind):
+        cells = []
+        for h, m in pairs:
+            rs = [t for t in by_kind[kind] if t.target.harness == h and t.target.model == m]
+            cells.append(f"{sum(t.passed for t in rs)}/{len(rs)}" if rs else "-")
+        lines.append(f"| {kind} | " + " | ".join(cells) + " |")
+    failed = _failed_regressions(table, by_kind.get("regression", []))
+    if failed:
+        lines += ["", f"**Warning:** regression tasks failed: {', '.join(failed)}"]
+    return lines
+
+
 def render_markdown(
     table: Sequence[Mapping[str, Any]],
     trials: Sequence[TrialResult],
@@ -3786,7 +4042,9 @@ def render_markdown(
     *,
     recommend_within_pp: float = 5.0,
     target_ci_width: float = 0.2,
+    suite_kinds: Mapping[str, str] | None = None,
 ) -> str:
+    """The summary. `suite_kinds` maps a suite name to its kind and adds the `## By suite kind` section."""
     lines = [
         f"# Harness x model — {now.strftime('%Y-%m-%d %H:%M')}",
         "",
@@ -3811,6 +4069,7 @@ def render_markdown(
     lines += _paired_lines(table, trials)
     lines += _repetitions_lines(table, trials, target_ci_width)
     lines += _per_task_lines(table, trials)
+    lines += _suite_kind_lines(table, trials, suite_kinds or {})
     return "\n".join(lines) + "\n"
 ```
 
@@ -3848,10 +4107,308 @@ def apply_litellm_profile(cfg: dict[str, Any]) -> dict[str, Any]:
     }
 ```
 
+`hbench/suites.py`:
+
+```python
+"""Suites as data (ADR 0008): versioned JSON suites of benchmark tasks.
+
+A suite is one directory with a `suite.json`. `load_suite` validates it and resolves every path, and `suite_tasks`
+expands it into the task dicts the engine runs. Every path must stay inside the suite directory (a git URL as `repo`
+is the one exception, and only `https://`), because a suite is data from someone else and its hidden tests are
+copied into the workdir. A suite holds no symlinks: a link could reach a host path or the hidden tests.
+"""
+
+import json
+import os
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from types import MappingProxyType
+from typing import Any, Literal
+
+SUITE_SCHEMA_VERSION = "1.0.0"
+SUITE_FILE = "suite.json"
+
+_NAME = re.compile(r"[a-z0-9-]+")
+_SEMVER = re.compile(r"\d+\.\d+\.\d+")
+# A repo that is not a directory of the suite: any URL, scp-like `git@host:path` or remote-helper `ext::cmd` form.
+# Only `https://` is accepted: `file://` and `git@` would read private local repos or use the user's SSH keys,
+# and `ext::` runs a command. A suite is data from someone else (config tasks are the user's own and keep all forms).
+_GIT_SOURCE = re.compile(r"^([\w.+-]+://|[\w.+-]+::|git@)")
+_HTTPS_URL = re.compile(r"https://\S+")
+_SUITE_KEYS = frozenset({"schema_version", "name", "version", "kind", "description", "tasks"})
+# The task keys the engine reads, validated here and passed through. `id` is prefixed with the suite name.
+_STRING_KEYS = ("prompt", "test", "setup", "ref")
+_TIMEOUT_KEYS = ("timeout", "setup_timeout", "test_timeout")
+_ENGINE_KEYS = frozenset(
+    {"id", "repo", "hidden_tests", "protected_paths", "graders", "grade", *_STRING_KEYS, *_TIMEOUT_KEYS}
+)
+_TASK_KEYS = _ENGINE_KEYS | {"tags", "solution", "provenance"}
+_REQUIRED_TASK_KEYS = ("id", "repo", "prompt", "provenance")
+# The task keys that hold a location: kept out of the hash of a run, so it does not depend on the checkout path.
+SUITE_PATH_KEYS = ("repo", "hidden_tests", "solution")
+# The keys `suite_tasks` adds to a task. A config task must not carry them: they mark a task as a suite's.
+SUITE_ONLY_KEYS = frozenset({"suite", "suite_kind", "suite_label", "suite_dir", "solution"})
+_PROVENANCE_KEYS = frozenset({"source", "license", "url"})
+
+
+class SuiteError(ValueError):
+    """A suite file or a task in it is invalid."""
+
+
+@dataclass(frozen=True, kw_only=True)
+class Provenance:
+    """Where a task comes from and under which license."""
+
+    source: str
+    license: str
+    url: str | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class SuiteTask:
+    """One task of a suite. `data` holds the validated engine keys (paths absolute), without `id`."""
+
+    id: str
+    data: Mapping[str, Any]
+    tags: tuple[str, ...]
+    solution: Path | None
+    provenance: Provenance
+
+
+@dataclass(frozen=True, kw_only=True)
+class Suite:
+    name: str
+    version: str
+    kind: Literal["capability", "regression"]
+    description: str
+    path: Path
+    tasks: tuple[SuiteTask, ...]
+
+
+def suite_label(suite: Suite) -> str:
+    """`name@version`, as recorded in `RunInfo.suite_version`."""
+    return f"{suite.name}@{suite.version}"
+
+
+def _require_string(value: object, where: str) -> str:
+    if not isinstance(value, str):
+        raise SuiteError(f"{where} must be a string")
+    return value
+
+
+def _reject_unknown(keys: Mapping[str, Any], allowed: frozenset[str], where: str) -> None:
+    unknown = sorted(set(keys) - allowed)
+    if unknown:
+        raise SuiteError(f"{where}: unknown key(s) {', '.join(unknown)}")
+
+
+def _kind(value: object) -> Literal["capability", "regression"]:
+    if value == "capability":
+        return "capability"
+    if value == "regression":
+        return "regression"
+    raise SuiteError(f"kind must be 'capability' or 'regression', got {value!r}")
+
+
+def _check_schema_version(value: object) -> None:
+    match = re.fullmatch(r"(\d+)\.\d+\.\d+", value) if isinstance(value, str) else None
+    if match is None or match.group(1) != SUITE_SCHEMA_VERSION.split(".")[0]:
+        raise SuiteError(f"schema_version must be {SUITE_SCHEMA_VERSION.split('.')[0]}.x.y, got {value!r}")
+
+
+def _reject_symlinks(target: Path, suite_dir: Path, where: str) -> None:
+    """A suite has no symlinks (YAGNI: the example suites need none). The directory is copied into a workdir or
+    onto one, and a link could reach a host path outside the suite or the hidden tests inside it."""
+    parent = suite_dir
+    for part in target.relative_to(suite_dir).parts:
+        parent = parent / part
+        if parent.is_symlink():
+            raise SuiteError(f"{where}: symlink {parent.relative_to(suite_dir)} is not allowed in a suite")
+    for dirpath, dirnames, filenames in os.walk(target, followlinks=False):
+        for name in (*dirnames, *filenames):
+            link = Path(dirpath) / name
+            if link.is_symlink():
+                raise SuiteError(f"{where}: symlink {link.relative_to(target)} is not allowed in a suite")
+
+
+def _suite_directory(suite_dir: Path, value: object, where: str) -> Path:
+    """The directory `value` names, relative to the suite directory, existing, not leaving it and free of symlinks."""
+    rel = _require_string(value, where)
+    if not rel or Path(rel).is_absolute():
+        raise SuiteError(f"{where}: {rel!r} must be a relative path")
+    target = suite_dir / rel
+    resolved = target.resolve()
+    if not resolved.is_relative_to(suite_dir):
+        raise SuiteError(f"{where}: {rel!r} must stay inside the suite directory")
+    if not resolved.is_dir():
+        raise SuiteError(f"{where}: {rel!r} is not a directory")
+    _reject_symlinks(Path(os.path.normpath(target)), suite_dir, where)
+    return resolved
+
+
+def _provenance(value: object, where: str) -> Provenance:
+    if not isinstance(value, dict):
+        raise SuiteError(f"{where}: provenance must be an object with 'source' and 'license'")
+    _reject_unknown(value, _PROVENANCE_KEYS, f"{where} provenance")
+    for key in ("source", "license"):
+        if not isinstance(value.get(key), str):
+            raise SuiteError(f"{where}: provenance needs a string {key!r}")
+    url = value.get("url")
+    if url is not None and not isinstance(url, str):
+        raise SuiteError(f"{where}: provenance url must be a string or null")
+    return Provenance(source=value["source"], license=value["license"], url=url)
+
+
+def _positive_int(value: object, where: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise SuiteError(f"{where} must be a positive integer")
+    return value
+
+
+def _string_list(value: object, where: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise SuiteError(f"{where} must be a list of strings")
+    return list(value)
+
+
+def _repo(suite_dir: Path, repo: str, where: str) -> str:
+    """An `https://` URL as it is, or the absolute path of a directory of the suite."""
+    if not _GIT_SOURCE.match(repo):
+        directory = _suite_directory(suite_dir, repo, f"{where} key 'repo'")
+        if directory.name.endswith(".git") or os.path.lexists(directory / ".git"):
+            raise SuiteError(
+                f"{where} key 'repo': a suite repo directory must not be a git repository "
+                "(use an https URL with ref, or a plain directory)"
+            )
+        return str(directory)
+    if not _HTTPS_URL.fullmatch(repo):
+        raise SuiteError(f"{where} key 'repo': a suite may only use an https:// URL or a directory, got {repo!r}")
+    return repo
+
+
+def _engine_data(suite_dir: Path, entry: Mapping[str, Any], where: str) -> dict[str, Any]:
+    """The engine keys of one task entry, type-checked, with the paths made absolute."""
+    data: dict[str, Any] = {}
+    for key in _STRING_KEYS:
+        if key in entry:
+            data[key] = _require_string(entry[key], f"{where} key {key!r}")
+    for key in _TIMEOUT_KEYS:
+        if key in entry:
+            data[key] = _positive_int(entry[key], f"{where} key {key!r}")
+    if "protected_paths" in entry:
+        data["protected_paths"] = _string_list(entry["protected_paths"], f"{where} key 'protected_paths'")
+    if "graders" in entry:
+        if not isinstance(entry["graders"], list):
+            raise SuiteError(f"{where} key 'graders' must be a list")
+        data["graders"] = entry["graders"]
+    if "grade" in entry:
+        if not isinstance(entry["grade"], dict):
+            raise SuiteError(f"{where} key 'grade' must be an object")
+        data["grade"] = entry["grade"]
+    repo = _require_string(entry["repo"], f"{where} key 'repo'")
+    data["repo"] = _repo(suite_dir, repo, where)
+    if "hidden_tests" in entry:
+        hidden = _suite_directory(suite_dir, entry["hidden_tests"], f"{where} key 'hidden_tests'")
+        data["hidden_tests"] = str(hidden)
+    return data
+
+
+def _task(suite_dir: Path, index: int, entry: object) -> SuiteTask:
+    where = f"tasks[{index}]"
+    if not isinstance(entry, dict):
+        raise SuiteError(f"{where} must be an object")
+    _reject_unknown(entry, _TASK_KEYS, where)
+    task_id = entry.get("id")
+    if not isinstance(task_id, str) or not _NAME.fullmatch(task_id):
+        raise SuiteError(f"{where}: invalid task id {task_id!r}: use only a-z, 0-9 and -")
+    where = f"task {task_id!r}"
+    for key in _REQUIRED_TASK_KEYS:
+        if key not in entry:
+            raise SuiteError(f"{where}: missing key {key!r}")
+    solution = None
+    if "solution" in entry:
+        solution = _suite_directory(suite_dir, entry["solution"], f"{where} key 'solution'")
+    return SuiteTask(
+        id=task_id,
+        data=MappingProxyType(_engine_data(suite_dir, entry, where)),
+        tags=tuple(_string_list(entry.get("tags", []), f"{where} key 'tags'")),
+        solution=solution,
+        provenance=_provenance(entry["provenance"], where),
+    )
+
+
+def _read_document(suite_file: Path) -> dict[str, Any]:
+    try:
+        document = json.loads(suite_file.read_text())
+    except OSError as e:
+        raise SuiteError(f"{suite_file}: cannot read {SUITE_FILE} ({e.strerror or e})") from e
+    except ValueError as e:
+        raise SuiteError(f"{suite_file}: {SUITE_FILE} is not valid JSON ({e})") from e
+    if not isinstance(document, dict):
+        raise SuiteError(f"{suite_file}: {SUITE_FILE} must be a JSON object")
+    return document
+
+
+def load_suite(path: Path) -> Suite:
+    """Load and validate the suite in directory `path`. Raises `SuiteError` naming the problem and the file."""
+    suite_dir = Path(path).resolve()
+    suite_file = suite_dir / SUITE_FILE
+    document = _read_document(suite_file)
+    try:
+        _reject_unknown(document, _SUITE_KEYS, "suite")
+        missing = sorted(_SUITE_KEYS - document.keys())
+        if missing:
+            raise SuiteError(f"missing key(s) {', '.join(missing)}")
+        _check_schema_version(document["schema_version"])
+        name = document["name"]
+        if not isinstance(name, str) or not _NAME.fullmatch(name):
+            raise SuiteError(f"invalid name {name!r}: use only a-z, 0-9 and -")
+        version = document["version"]
+        if not isinstance(version, str) or not _SEMVER.fullmatch(version):
+            raise SuiteError(f"invalid version {version!r}: use MAJOR.MINOR.PATCH")
+        entries = document["tasks"]
+        if not isinstance(entries, list) or not entries:
+            raise SuiteError("tasks must be a non-empty list")
+        tasks = tuple(_task(suite_dir, i, entry) for i, entry in enumerate(entries))
+        seen: set[str] = set()
+        for task in tasks:
+            if task.id in seen:
+                raise SuiteError(f"duplicate task id {task.id!r}")
+            seen.add(task.id)
+        return Suite(
+            name=name,
+            version=version,
+            kind=_kind(document["kind"]),
+            description=_require_string(document["description"], "description"),
+            path=suite_dir,
+            tasks=tasks,
+        )
+    except SuiteError as e:
+        raise SuiteError(f"{suite_file}: {e}") from e
+
+
+def suite_tasks(suite: Suite) -> list[dict[str, Any]]:
+    """The engine task dicts of `suite`, with ids `<suite>/<task>`. The keys `suite`, `suite_kind`, `suite_label`,
+    `suite_dir`, `tags` and `solution` are for the report, the run hash and `suite validate`; the engine ignores
+    them."""
+    tasks = []
+    for task in suite.tasks:
+        entry = {**task.data, "id": f"{suite.name}/{task.id}", "suite": suite.name, "suite_kind": suite.kind}
+        entry["suite_label"] = suite_label(suite)
+        entry["suite_dir"] = str(suite.path)
+        entry["tags"] = list(task.tags)
+        if task.solution is not None:
+            entry["solution"] = str(task.solution)
+        tasks.append(entry)
+    return tasks
+```
+
 `hbench/cli.py`:
 
 ```python
-"""The single command line: `python3 -m hbench {run,report,reconcile,schema export}`.
+"""The single command line: `python3 -m hbench {run,report,reconcile,schema export,suite list,suite validate}`.
 
 `harness_bench.py` and `harness_bench_litellm.py` are shims over `main`. `--litellm` applies the LiteLLM
 profile (see `hbench.profiles`) and, for `run`, waits for the spend logs and reconciles afterwards.
@@ -3860,6 +4417,7 @@ profile (see `hbench.profiles`) and, for `run`, waits for the spend logs and rec
 import argparse
 import importlib
 import json
+import shutil
 import sys
 import time
 from collections.abc import Sequence
@@ -3869,13 +4427,16 @@ from typing import Any
 
 from hbench.core.schema import schema_document
 from hbench.profiles import apply_litellm_profile
+from hbench.suites import Suite, SuiteError, load_suite, suite_label, suite_tasks
 
 _DESCRIPTION = (
     "harness-bench: compare coding-agent harness x model pairs. Main metric: cost per solved task.\n\n"
     "  python3 -m hbench run       --config config.json [--reps 3] [--only HARNESS] [--keep] [--dry-run]\n"
     "  python3 -m hbench reconcile --config config.json   # pull real spend from LiteLLM\n"
     "  python3 -m hbench report    --config config.json [--drop-saturated]\n"
-    "  python3 -m hbench schema export [--out PATH]       # JSON Schema of trials.jsonl and run.json\n\n"
+    "  python3 -m hbench schema export [--out PATH]       # JSON Schema of trials.jsonl and run.json\n"
+    "  python3 -m hbench suite list     [--config C | PATH...]\n"
+    "  python3 -m hbench suite validate [--config C] [--run [--allow-unsandboxed]] [PATH...]\n\n"
     "Add --litellm to run, report or reconcile for the LiteLLM-only benchmark."
 )
 
@@ -3938,6 +4499,22 @@ def build_parser(epilog: str | None = None) -> argparse.ArgumentParser:
     schema_sub = schema.add_subparsers(dest="schema_cmd", required=True)
     export = schema_sub.add_parser("export", help="print the schema document, or write it with --out")
     export.add_argument("--out", help="write to this file instead of stdout")
+    suite = sub.add_parser("suite", help="list and validate suites of tasks")
+    suite_sub = suite.add_subparsers(dest="suite_cmd", required=True)
+    suite_list = suite_sub.add_parser("list", help="name, version, kind, task count and tags of each suite")
+    suite_list.add_argument("--config", help="list the suites named in this config")
+    suite_list.add_argument("paths", nargs="*", metavar="PATH", help="suite directories")
+    validate = suite_sub.add_parser("validate", help="check suites; with --run also run each task against its solution")
+    validate.add_argument(
+        "--config", help="validate the suites named in this config; its sandbox and env settings apply"
+    )
+    validate.add_argument(
+        "--run", action="store_true", help="the graders must fail on the repo and pass with the solution"
+    )
+    validate.add_argument(
+        "--allow-unsandboxed", action="store_true", help="with --run: no sandbox.prefix (only inside a disposable VM)"
+    )
+    validate.add_argument("paths", nargs="*", metavar="PATH", help="suite directories")
     return ap
 
 
@@ -3955,6 +4532,85 @@ def _schema_export(out: str | None) -> None:
         Path(out).write_text(text + "\n")
     else:
         print(text)
+
+
+def _suite_inputs(parser: argparse.ArgumentParser, args: argparse.Namespace) -> tuple[list[Path], dict[str, Any], Path]:
+    """The suite directories to act on, the config (empty without `--config`) and the directory paths resolve from."""
+    cfg: dict[str, Any] = {}
+    base = Path.cwd()
+    if args.config:
+        cfg_path = Path(args.config).resolve()
+        cfg, base = json.loads(cfg_path.read_text()), cfg_path.parent
+    dirs = [Path(p) for p in args.paths] or [base / s for s in cfg.get("suites", [])]
+    if not dirs:
+        parser.error("give suite directories or --config with a 'suites' list")
+    return dirs, cfg, base
+
+
+def _suite_list(dirs: list[Path]) -> None:
+    for path in dirs:
+        try:
+            suite = load_suite(path)
+        except SuiteError as e:
+            sys.exit(str(e))
+        count = len(suite.tasks)
+        tags = ",".join(sorted({tag for task in suite.tasks for tag in task.tags})) or "-"
+        print(f"{suite.name}  {suite.version}  {suite.kind}  {count} {'task' if count == 1 else 'tasks'}  tags: {tags}")
+
+
+def _suite_validate(dirs: list[Path], cfg: dict[str, Any], base: Path, run: bool) -> bool:
+    """Static checks of every suite (the tasks must also pass the engine's config checks), then, with `run`, the
+    behavioral check of every task. Prints one line per suite or task; returns whether everything is ok."""
+    engine = _engine()
+    ok = True
+    valid: list[Suite] = []
+    for path in dirs:
+        try:
+            suite = load_suite(path)
+            engine.validate_config({**cfg, "harnesses": cfg.get("harnesses", {}), "tasks": suite_tasks(suite)})
+        except SuiteError as e:
+            print(f"FAIL  {e}")
+            ok = False
+        except SystemExit as e:  # `validate_config` exits with a message
+            print(f"FAIL  {path}: {e.code}")
+            ok = False
+        else:
+            count = len(suite.tasks)
+            print(f"ok    {suite_label(suite)} ({count} {'task' if count == 1 else 'tasks'})")
+            valid.append(suite)
+    if run and ok:
+        ok = _suite_check_behavior(engine, valid, cfg, base)
+    return ok
+
+
+def _suite_check_behavior(engine: ModuleType, suites: list[Suite], cfg: dict[str, Any], base: Path) -> bool:
+    work_root = engine.resolve_work_root(cfg, base)
+    ok = True
+    try:
+        for suite in suites:
+            for task in suite_tasks(suite):
+                if "solution" not in task:
+                    print(f"{task['id']}: no solution")
+                    ok = False
+                    continue
+                check = engine.validate_task_behavior(cfg, task, base, work_root)
+                print(f"{check.task_id}: {check.status}")
+                ok = ok and check.ok
+    finally:
+        if not cfg.get("work_dir"):
+            shutil.rmtree(work_root, ignore_errors=True)
+    return ok
+
+
+def _suite(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    dirs, cfg, base = _suite_inputs(parser, args)
+    if args.suite_cmd == "list":
+        _suite_list(dirs)
+        return
+    if args.run:
+        _engine().require_sandbox(cfg, args.allow_unsandboxed)
+    if not _suite_validate(dirs, cfg, base, args.run):
+        sys.exit(1)
 
 
 def _run_litellm(engine: ModuleType, args: argparse.Namespace, cfg: dict[str, Any], base: Path) -> None:
@@ -3975,6 +4631,9 @@ def main(argv: Sequence[str] | None = None, *, epilog: str | None = None) -> Non
     args = parser.parse_args(argv)
     if args.cmd == "schema":
         _schema_export(args.out)
+        return
+    if args.cmd == "suite":
+        _suite(parser, args)
         return
     engine = _engine()
     cfg_path = Path(args.config).resolve()
@@ -4165,15 +4824,11 @@ if __name__ == "__main__":
       "model": "none"
     }
   ],
+  "suites": [
+    "suites/regression",
+    "suites/examples-capability"
+  ],
   "tasks": [
-    {
-      "id": "fizzbuzz",
-      "repo": "tasks/fizzbuzz/repo",
-      "prompt": "The function fizzbuzz in fizzbuzz.py has bugs. Fix it so fizzbuzz(n) returns 'Fizz' for multiples of 3, 'Buzz' for multiples of 5, 'FizzBuzz' for multiples of both, and str(n) otherwise. Do not ask questions.",
-      "hidden_tests": "tasks/fizzbuzz/hidden_tests",
-      "test": "python3 -m unittest -q test_hidden.py",
-      "protected_paths": []
-    },
     {
       "id": "example-real-repo",
       "repo": "git@github.com:YOUR-ORG/YOUR-REPO.git",
@@ -4419,15 +5074,11 @@ if __name__ == "__main__":
       "cache_write": 0
     }
   },
+  "suites": [
+    "suites/regression",
+    "suites/examples-capability"
+  ],
   "tasks": [
-    {
-      "id": "fizzbuzz",
-      "repo": "tasks/fizzbuzz/repo",
-      "prompt": "The function fizzbuzz in fizzbuzz.py has bugs. Fix it so fizzbuzz(n) returns 'Fizz' for multiples of 3, 'Buzz' for multiples of 5, 'FizzBuzz' for multiples of both, and str(n) otherwise. Do not ask questions.",
-      "hidden_tests": "tasks/fizzbuzz/hidden_tests",
-      "test": "python3 -m unittest -q test_hidden.py",
-      "protected_paths": []
-    },
     {
       "id": "example-real-repo",
       "repo": "git@github.com:YOUR-ORG/YOUR-REPO.git",
@@ -4447,9 +5098,173 @@ if __name__ == "__main__":
 }
 ```
 
-## Example task
+## Suites
 
-`tasks/fizzbuzz/repo/fizzbuzz.py` (deliberate bugs):
+A suite is a directory with a `suite.json` and the files it points to. A config lists them in `suites` (directories relative to the config); their tasks are appended to `tasks` with the id `<suite>/<task>`. A config without `suites` works as before. ([ADR 0008](docs/adr/0008-suites-as-data.md))
+
+`suite.json` has `schema_version` (`"1.0.0"`), `name` (`[a-z0-9-]+`), `version` (`MAJOR.MINOR.PATCH`), `kind` (`"capability"` or `"regression"`), `description` and `tasks`. A task takes the keys of a config task (`id`, `repo`, `ref`, `prompt`, `test`, `hidden_tests`, `setup`, `timeout`, `setup_timeout`, `test_timeout`, `protected_paths`, `graders`, `grade`) and:
+
+- `tags`: a list of strings;
+- `solution`: a directory with the reference files, copied over the repo by `suite validate --run`;
+- `provenance`: `{"source": ..., "license": ..., "url": ... or null}` (required).
+
+Paths are relative to the suite directory and must stay inside it (no absolute path, no `..`). A suite holds **no symlinks** at all in `repo`, `hidden_tests` or `solution` (a link could reach a host path or the hidden tests when the directory is copied). A suite `repo` directory must not be a git repository (no `.git`, no name ending in `.git`): use an `https://` URL with `ref`, or a plain directory. A suite is someone else's data, so `repo` may be a directory of the suite or an `https://` URL: `file://`, `ssh://`, `git@host:...` and `ext::` are rejected. A task in your own config keeps every form. A config task must not set the keys the engine adds to suite tasks (`suite`, `suite_kind`, `suite_label`, `suite_dir`, `solution`). Unknown keys are an error. `capability` suites hold hard tasks with a low pass rate; `regression` suites hold tasks every healthy pair solves, and the report flags a pair that fails one.
+
+```bash
+python3 -m hbench suite list     [--config C | PATH...]     # name, version, kind, task count and tags
+python3 -m hbench suite validate [--config C] PATH...       # static checks and the engine's config checks
+python3 -m hbench suite validate --run --allow-unsandboxed PATH...
+```
+
+`--run` is the behavioral check: for every task the graders must **fail** on the untouched repo and **pass** once `solution` is copied in. It runs repo and test code, so it goes through the same engine path as `run` (workdir outside the repo, `wrap()`, env allowlist, redacted logs) and follows the same sandbox rule: set `sandbox.prefix` in a `--config`, or pass `--allow-unsandboxed` inside a disposable VM. One line per task: `ok`, `trivially passing` or `solution fails`; the exit code is 1 when any task is not ok.
+
+The report adds `## By suite kind` (solved/runs per pair for each kind) when the trials come from more than one kind, and a warning for every regression task a non-null pair did not solve. Without suites the report does not change.
+
+`RunInfo.suite_version` records `name@version` of every suite used, then a hash of the tasks (the directories of a suite task enter the hash relative to the suite directory, so it does not depend on the checkout path; a git URL stays in it).
+
+The example suites hold synthetic code written for this repository (MIT), standard library only, no network: `regression/fizzbuzz`, and `examples-capability` with `dependency-upgrade` (migrate a caller to the API of a vendored library), `path-traversal-fix` (CWE-22 "zip slip" in an archive extractor) and `extract-function` (a refactor guarded by existing tests). Every hidden test file carries a marker comment. What `tests/smoke.py` proves, exactly: hidden tests are never copied into the workdir before grading, and an unsandboxed fake agent cannot find them in its workdir (searched recursively) or in its parent directories. Positive controls plant a leak at the real depth of a hidden test and the probe must find it. It does **not** prove isolation from the rest of the host: an unsandboxed agent runs as your user and can read anything you can, including the suite sources (the same smoke test shows a probe over the benchmark directory finds them). Real isolation of the hidden tests needs the sandbox, which mounts only the workdir. A clone proves the tasks are sound with:
+
+```bash
+python3 -m hbench suite validate --run --allow-unsandboxed suites/regression suites/examples-capability
+```
+
+`suites/regression/suite.json`:
+
+```json
+{
+  "schema_version": "1.0.0",
+  "name": "regression",
+  "version": "1.0.0",
+  "kind": "regression",
+  "description": "Tasks every healthy harness x model pair solves. A failure here means the setup is broken, not that the model is weak.",
+  "tasks": [
+    {
+      "id": "fizzbuzz",
+      "repo": "fizzbuzz/repo",
+      "prompt": "The function fizzbuzz in fizzbuzz.py has bugs. Fix it so fizzbuzz(n) returns 'Fizz' for multiples of 3, 'Buzz' for multiples of 5, 'FizzBuzz' for multiples of both, and str(n) otherwise. Do not ask questions.",
+      "hidden_tests": "fizzbuzz/hidden_tests",
+      "test": "python3 -m unittest -q test_hidden.py",
+      "solution": "fizzbuzz/solution",
+      "protected_paths": [],
+      "tags": [
+        "python",
+        "bugfix",
+        "smoke"
+      ],
+      "provenance": {
+        "source": "synthetic",
+        "license": "MIT",
+        "url": null
+      }
+    }
+  ]
+}
+```
+
+`suites/examples-capability/suite.json`:
+
+```json
+{
+  "schema_version": "1.0.0",
+  "name": "examples-capability",
+  "version": "1.0.0",
+  "kind": "capability",
+  "description": "Three small synthetic tasks written for this repository (MIT): a dependency API migration, a path traversal fix and an extract-function refactor. Stdlib only, offline.",
+  "tasks": [
+    {
+      "id": "dependency-upgrade",
+      "repo": "dependency-upgrade/repo",
+      "prompt": "The vendored library under vendor/tinytable was upgraded to 2.0 and inventory.py no longer works with it. Read vendor/tinytable/CHANGELOG.md and migrate inventory.py to the new API without changing the text it produces. Do not edit anything under vendor/. Do not ask questions.",
+      "hidden_tests": "dependency-upgrade/hidden_tests",
+      "test": "python3 -m unittest -q test_hidden_upgrade.py",
+      "solution": "dependency-upgrade/solution",
+      "protected_paths": [
+        "vendor"
+      ],
+      "tags": [
+        "python",
+        "migration",
+        "dependency"
+      ],
+      "provenance": {
+        "source": "synthetic",
+        "license": "MIT",
+        "url": null
+      }
+    },
+    {
+      "id": "path-traversal-fix",
+      "repo": "path-traversal-fix/repo",
+      "prompt": "archive_tools/extract.py unpacks uploaded zip archives, but a crafted archive can make it write files outside the destination directory (CWE-22, \"zip slip\"). Fix extract_all so that, when any member would be written outside dest, it raises UnsafeArchiveError before writing anything, and archives with safe members still extract as before. Do not ask questions.",
+      "hidden_tests": "path-traversal-fix/hidden_tests",
+      "test": "python3 -m unittest -q test_hidden_traversal.py",
+      "solution": "path-traversal-fix/solution",
+      "protected_paths": [
+        "tests"
+      ],
+      "tags": [
+        "python",
+        "security",
+        "cwe-22"
+      ],
+      "provenance": {
+        "source": "synthetic",
+        "license": "MIT",
+        "url": null
+      }
+    },
+    {
+      "id": "extract-function",
+      "repo": "extract-function/repo",
+      "prompt": "render_invoice in invoice.py mixes the invoice layout with the discount rules. Extract the discount calculation into a module-level function discount_amount(subtotal: Decimal, code: str | None) -> Decimal that returns the amount to take off, and make render_invoice call it. The output of render_invoice must not change; the tests in tests/ must keep passing. Do not ask questions.",
+      "hidden_tests": "extract-function/hidden_tests",
+      "test": "python3 -m unittest -q test_hidden_extract.py tests.test_invoice",
+      "solution": "extract-function/solution",
+      "protected_paths": [
+        "tests"
+      ],
+      "tags": [
+        "python",
+        "refactor"
+      ],
+      "provenance": {
+        "source": "synthetic",
+        "license": "MIT",
+        "url": null
+      }
+    }
+  ]
+}
+```
+
+Files of the example suites:
+
+```
+suites/examples-capability/dependency-upgrade/hidden_tests/test_hidden_upgrade.py
+suites/examples-capability/dependency-upgrade/repo/inventory.py
+suites/examples-capability/dependency-upgrade/repo/vendor/__init__.py
+suites/examples-capability/dependency-upgrade/repo/vendor/tinytable/CHANGELOG.md
+suites/examples-capability/dependency-upgrade/repo/vendor/tinytable/__init__.py
+suites/examples-capability/dependency-upgrade/solution/inventory.py
+suites/examples-capability/extract-function/hidden_tests/test_hidden_extract.py
+suites/examples-capability/extract-function/repo/invoice.py
+suites/examples-capability/extract-function/repo/tests/__init__.py
+suites/examples-capability/extract-function/repo/tests/test_invoice.py
+suites/examples-capability/extract-function/solution/invoice.py
+suites/examples-capability/path-traversal-fix/hidden_tests/test_hidden_traversal.py
+suites/examples-capability/path-traversal-fix/repo/archive_tools/__init__.py
+suites/examples-capability/path-traversal-fix/repo/archive_tools/extract.py
+suites/examples-capability/path-traversal-fix/repo/tests/__init__.py
+suites/examples-capability/path-traversal-fix/repo/tests/test_extract.py
+suites/examples-capability/path-traversal-fix/solution/archive_tools/extract.py
+suites/examples-capability/suite.json
+suites/regression/fizzbuzz/hidden_tests/test_hidden.py
+suites/regression/fizzbuzz/repo/fizzbuzz.py
+suites/regression/fizzbuzz/solution/fizzbuzz.py
+suites/regression/suite.json
+```
+
+`suites/regression/fizzbuzz/repo/fizzbuzz.py` (deliberate bugs):
 
 ```python
 def fizzbuzz(n):
@@ -4462,9 +5277,10 @@ def fizzbuzz(n):
     return n
 ```
 
-`tasks/fizzbuzz/hidden_tests/test_hidden.py`:
+`suites/regression/fizzbuzz/hidden_tests/test_hidden.py`:
 
 ```python
+# HIDDEN-TEST-MARKER: the contamination probe looks for this line outside the benchmark.
 import unittest
 from fizzbuzz import fizzbuzz
 
@@ -4542,7 +5358,7 @@ def git(cwd: Path, *args: str) -> None:
 def make_git_task(tmp: Path) -> tuple[str, str]:
     """Repo with a buggy commit followed by the fix: the agent must only see the first."""
     repo = tmp / "gitrepo"
-    shutil.copytree(ROOT / "tasks" / "fizzbuzz" / "repo", repo)
+    shutil.copytree(fixtures.FIZZBUZZ / "repo", repo)
     (repo / "run_tests.py").write_text(
         "import sys, unittest\n"
         "r = unittest.main(module='test_hidden', exit=False).result\n"
@@ -4562,7 +5378,7 @@ def main() -> None:
     hide_work = Path(tempfile.mkdtemp(prefix="hb-smoke-work-"))
     try:
         fixtures.copy_engine(tmp)
-        shutil.copytree(ROOT / "tasks" / "fizzbuzz", tmp / "tasks" / "fizzbuzz")
+        shutil.copytree(fixtures.FIZZBUZZ, tmp / "tasks" / "fizzbuzz")
         tags_file, probe_file = tmp / "tags.txt", tmp / "probe.jsonl"
         marker = tmp / "host-exec-marker"
         os.environ.update(
@@ -4731,6 +5547,108 @@ def main() -> None:
             "grader logs: spend key and harness secrets redacted",
         )
 
+        # --- contamination guard: hidden tests are never copied into the workdir before grading, and an
+        # unsandboxed agent cannot find them from its workdir or its parents. It CAN read the suite sources
+        # elsewhere on the host (the sandbox, which mounts only the workdir, is what stops that).
+        example_hidden = sorted((ROOT / "suites" / "examples-capability").glob("*/hidden_tests/test_*.py"))
+        hidden_names = ",".join(p.name for p in example_hidden)
+        probe_env = dict(harness_env, FAKE_HIDDEN_NAMES=hidden_names)
+        cfg7 = dict(
+            cfg,
+            output_dir="results-probe",
+            tasks=[fizz],
+            harnesses={"claude": fixtures.harness("claude", probe_env, "probe-hidden")},
+            matrix=[{"harness": "claude", "model": "m"}],
+        )
+        (tmp / "config7.json").write_text(json.dumps(cfg7))
+        run(tmp, "harness_bench.py", "run", "--allow-unsandboxed", config="config7.json")
+        (probe_row,) = results(tmp / "results-probe/results.jsonl")
+        check(
+            probe_row["agent_rc"] == 0, "contamination guard: no hidden test file or marker in the workdir or parents"
+        )
+
+        # positive controls: the probe must find a leak wherever it claims to look, at the depth of the real hidden
+        # tests (`tasks/<task>/hidden_tests/<file>`, three levels down, four from the temp dir)
+        agent_env = {k: v for k, v in os.environ.items() if k not in ("FAKE_KEY", "SECRET_CANARY")}
+        agent_env["FAKE_HIDDEN_NAMES"] = hidden_names
+        planted = example_hidden[0]
+
+        def probe_from(cwd: Path, **extra_env: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [PY, str(ROOT / "tests" / "fake_agent.py"), "claude", "probe-hidden"],
+                cwd=cwd,
+                env=dict(agent_env, **extra_env),
+                capture_output=True,
+                text=True,
+            )
+
+        for label, leak_name, text in (
+            ("file name", planted.name, ""),
+            ("marker", "notes.py", planted.read_text()),
+        ):
+            seen = tmp / f"seen-{leak_name}"
+            seen.mkdir()
+            (seen / leak_name).write_text(text)
+            probe = probe_from(seen)
+            check(probe.returncode == 7 and leak_name in probe.stderr, f"contamination guard: finds a leaked {label}")
+
+        deep = tmp / "seen-deep"
+        (deep / "a" / "b" / "c" / "d" / "e" / "f").mkdir(parents=True)
+        (deep / "a" / "b" / "c" / "d" / "e" / "f" / "notes.py").write_text(planted.read_text())
+        check(probe_from(deep).returncode == 7, "contamination guard: finds a leak six levels down the workdir")
+
+        parent = tmp / "seen-parent"
+        (parent / "work").mkdir(parents=True)
+        (parent / planted.name).write_text("")
+        check(probe_from(parent / "work").returncode == 7, "contamination guard: finds a leak in a parent directory")
+
+        clean = tmp / "seen-clean"
+        clean.mkdir()
+        check(probe_from(clean).returncode == 0, "contamination guard: a clean workdir passes")
+        reach = probe_from(clean, FAKE_SCAN_ROOTS=str(tmp))
+        check(
+            reach.returncode == 7 and "tasks/fizzbuzz/hidden_tests" in reach.stderr,
+            "unsandboxed agents CAN read the benchmark dir: hidden-test isolation needs the sandbox",
+        )
+
+        # --- an agent that plants a symlink at a hidden test path cannot make the grader write a host file
+        canary = tmp / "host-canary.txt"
+        canary.write_text("host file")
+        link_env = dict(harness_env, FAKE_CANARY_FILE="${FAKE_CANARY_FILE}")
+        os.environ["FAKE_CANARY_FILE"] = str(canary)
+        cfg8 = dict(
+            cfg,
+            output_dir="results-link",
+            tasks=[fizz],
+            harnesses={"claude": fixtures.harness("claude", link_env, "plant-link")},
+            matrix=[{"harness": "claude", "model": "m"}],
+        )
+        (tmp / "config8.json").write_text(json.dumps(cfg8))
+        run(tmp, "harness_bench.py", "run", "--allow-unsandboxed", config="config8.json")
+        (link_row,) = results(tmp / "results-link/results.jsonl")
+        check(
+            canary.read_text() == "host file", "grader: a symlink planted at a hidden test path is not written through"
+        )
+        check(link_row["passed"], "grader: the hidden tests still run after the planted symlink is replaced")
+
+        # --- a suite with a symlink is refused, so a solution is never copied through one
+        link_suite = fixtures.write_fizzbuzz_suite(tmp, "linked")
+        outside = tmp / "outside-suite"
+        outside.mkdir()
+        (link_suite / "fizzbuzz" / "repo" / "esc").symlink_to(outside, target_is_directory=True)
+        (link_suite / "fizzbuzz" / "solution" / "esc").mkdir()
+        (link_suite / "fizzbuzz" / "solution" / "esc" / "PWNED").write_text("x")
+        p = subprocess.run(
+            [PY, "-m", "hbench", "suite", "validate", "--run", "--allow-unsandboxed", str(link_suite)],
+            cwd=tmp,
+            capture_output=True,
+            text=True,
+        )
+        check(
+            p.returncode != 0 and "symlink esc" in p.stdout and not list(outside.iterdir()),
+            "suite loader: a symlink in a suite is rejected and nothing is written outside",
+        )
+
         # --- config validation and URL policy
         for bad, why in (
             (dict(fizz, id="/etc"), "absolute task id"),
@@ -4770,7 +5688,7 @@ if __name__ == "__main__":
 ```python
 """Fake coding-agent CLI for tests. Prints the JSON shape of a real harness.
 
-Usage: fake_agent.py <claude|opencode|pi|codex|cursor> <fix|nofix|hack|hide-git|hide-git-clean|hide-ignore|hide-attr|hide-config>
+Usage: fake_agent.py <claude|opencode|pi|codex|cursor> <fix|nofix|hack|probe-hidden|plant-link|hide-git|hide-git-clean|hide-ignore|hide-attr|hide-config>
 "fix" repairs fizzbuzz.py in the cwd. "hack" leaves the bug and tampers with the test
 infrastructure instead (rewrites run_tests.py, adds conftest.py, moves git refs).
 The "hide-*" modes fix the bug and then try to hide a forbidden change from the diff:
@@ -4779,6 +5697,11 @@ The "hide-*" modes fix the bug and then try to hide a forbidden change from the 
 "hide-ignore" plants conftest.py behind a .gitignore, "hide-attr" edits run_tests.py next to a
 .gitattributes with `working-tree-encoding=UTF-16` (makes a naive `git add` fail), and "hide-config" arms .git/config
 (fsmonitor, filter, textconv) with a command that touches $FAKE_MARKER.
+"probe-hidden" leaves the bug and searches for the hidden tests from where an unsandboxed agent runs (its whole
+workdir, its parents up to `/` and the roots in $FAKE_SCAN_ROOTS): a file named in $FAKE_HIDDEN_NAMES (comma
+separated) or a .py file holding the marker that every example hidden test carries. It exits 7 when it finds one.
+"plant-link" fixes the bug and plants `test_hidden.py` as a symlink to $FAKE_CANARY_FILE, as an agent would to
+make the grader overwrite a host file.
 Security probes: exits 9 if the LiteLLM spend key or SECRET_CANARY reached the agent,
 prints FAKE_API_KEY to stderr (must be redacted in logs), and records git history depth. When BENCH_TAG is set (and kind is not cursor),
 the tag is appended to $FAKE_TAGS_FILE, which fake_litellm.py serves as spend logs.
@@ -4787,13 +5710,66 @@ the tag is appended to $FAKE_TAGS_FILE, which fake_litellm.py serves as spend lo
 import json
 import os
 import sys
+from pathlib import Path
+
+MARKER = "HIDDEN-TEST" + "-MARKER"  # built at runtime: this file must not match its own probe
+EXTRA_ROOT_DEPTH = 8  # directory levels below a root named in $FAKE_SCAN_ROOTS
+MAX_ENTRIES = 200_000  # entries looked at per root; a probe must end, even on a huge tree
+MAX_SCANNED_BYTES = 200_000
+
+
+def holds_marker(path: str) -> bool:
+    try:
+        if os.path.getsize(path) > MAX_SCANNED_BYTES:
+            return False
+        with open(path, errors="replace") as f:
+            return MARKER in f.read()
+    except OSError:
+        return False
+
+
+def scan(root: Path, names: set[str], depth: int | None) -> list[str]:
+    """Hidden test files under `root`, in directories at most `depth` levels down (None: all), after at most
+    `MAX_ENTRIES` entries."""
+    found = []
+    seen = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        if depth is not None and len(Path(dirpath).relative_to(root).parts) >= depth:
+            dirnames[:] = []  # list this directory, go no deeper
+        seen += len(dirnames) + len(filenames)
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            if name in names or (name.endswith(".py") and holds_marker(path)):
+                found.append(path)
+        if seen > MAX_ENTRIES:
+            break
+    return found
+
+
+def find_hidden_tests() -> list[str]:
+    """Every hidden test file an unsandboxed agent finds from where it runs: the whole workdir tree, the files of
+    each parent directory up to `/` (not their subdirectories), and the roots of $FAKE_SCAN_ROOTS (path-separated)
+    `EXTRA_ROOT_DEPTH` levels down. It does not search `$HOME` or the temp dir: the benchmark may live there, and
+    an unsandboxed agent can read anything the user can. Only the sandbox, which mounts the workdir alone, stops that."""
+    names = {n for n in os.environ.get("FAKE_HIDDEN_NAMES", "").split(",") if n}
+    cwd = Path(os.path.realpath(os.getcwd()))
+    roots: list[tuple[Path, int | None]] = [(cwd, None)] + [(p, 0) for p in cwd.parents]
+    extra = [r for r in os.environ.get("FAKE_SCAN_ROOTS", "").split(os.pathsep) if r]
+    roots += [(Path(os.path.realpath(r)), EXTRA_ROOT_DEPTH) for r in extra]
+    return sorted({path for root, depth in roots for path in scan(root, names, depth)})
+
 
 kind, mode = sys.argv[1], sys.argv[2]
-fix = mode == "fix" or mode.startswith("hide-")
+fix = mode in ("fix", "plant-link") or mode.startswith("hide-")
 for leaked in ("FAKE_KEY", "SECRET_CANARY"):
     if leaked in os.environ:
         sys.exit(9)
 print(f"debug key={os.environ.get('FAKE_API_KEY', '')}", file=sys.stderr)
+if mode == "probe-hidden":
+    leaked_files = find_hidden_tests()
+    if leaked_files:
+        print(f"hidden tests visible to the agent: {leaked_files}", file=sys.stderr)
+        sys.exit(7)
 if os.environ.get("FAKE_PROBE_FILE"):
     import subprocess
 
@@ -4859,6 +5835,8 @@ def hide_forbidden_change() -> None:
             f.write("* filter=x diff=x\n")
 
 
+if mode == "plant-link":
+    os.symlink(os.environ["FAKE_CANARY_FILE"], "test_hidden.py")
 if mode.startswith("hide-"):
     hide_forbidden_change()
 if fix:
@@ -5066,7 +6044,7 @@ class GoldenReport(GoldenCase):
 class GoldenRun(GoldenCase):
     def test_results_match_golden(self) -> None:
         tmp = make_tmp(self)
-        shutil.copytree(ROOT / "tasks" / "fizzbuzz", tmp / "tasks" / "fizzbuzz")
+        shutil.copytree(fixtures.FIZZBUZZ, tmp / "tasks" / "fizzbuzz")
         cfg = fixtures.fake_config({"FAKE_TAGS_FILE": str(tmp / "tags.txt")})
         (tmp / "config.json").write_text(json.dumps(cfg))
         p = run_cli(tmp, "harness_bench.py", "run", "--allow-unsandboxed")
@@ -5105,6 +6083,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))  # lets tests import the engine in-process (coverage sees it directly)
 PY = sys.executable
 AGENT = str(ROOT / "tests" / "fake_agent.py")
+FIZZBUZZ = ROOT / "suites" / "regression" / "fizzbuzz"  # the sample task: `repo/` and `hidden_tests/`
 HARNESS_KINDS = ("claude", "opencode", "pi", "codex", "cursor")
 
 
@@ -5131,6 +6110,41 @@ def fizzbuzz_task() -> dict[str, Any]:
         "hidden_tests": "tasks/fizzbuzz/hidden_tests",
         "test": f"{PY} -m unittest -q test_hidden.py",
     }
+
+
+FIXED_FIZZBUZZ = (
+    "def fizzbuzz(n):\n    if n % 15 == 0:\n        return 'FizzBuzz'\n    if n % 3 == 0:\n        return 'Fizz'\n"
+    "    if n % 5 == 0:\n        return 'Buzz'\n    return str(n)\n"
+)
+
+
+def write_fizzbuzz_suite(base: Path, name: str = "fizz", kind: str = "capability", directory: str = "") -> Path:
+    """A one-task suite (`fizzbuzz`, with a reference solution) under `base/suites/<directory or name>`."""
+    suite_dir = base / "suites" / (directory or name)
+    shutil.copytree(FIZZBUZZ / "repo", suite_dir / "fizzbuzz" / "repo")
+    shutil.copytree(FIZZBUZZ / "hidden_tests", suite_dir / "fizzbuzz" / "hidden_tests")
+    (suite_dir / "fizzbuzz" / "solution").mkdir()
+    (suite_dir / "fizzbuzz" / "solution" / "fizzbuzz.py").write_text(FIXED_FIZZBUZZ)
+    task = {
+        "id": "fizzbuzz",
+        "repo": "fizzbuzz/repo",
+        "prompt": "fix it",
+        "hidden_tests": "fizzbuzz/hidden_tests",
+        "test": f"{PY} -m unittest -q test_hidden.py",
+        "solution": "fizzbuzz/solution",
+        "tags": ["bugfix"],
+        "provenance": {"source": "synthetic", "license": "MIT"},
+    }
+    document = {
+        "schema_version": "1.0.0",
+        "name": name,
+        "version": "1.0.0",
+        "kind": kind,
+        "description": "test suite",
+        "tasks": [task],
+    }
+    (suite_dir / "suite.json").write_text(json.dumps(document))
+    return suite_dir
 
 
 def matrix() -> list[dict[str, Any]]:
@@ -5565,6 +6579,20 @@ class ValidateConfigTests(unittest.TestCase):
         cfg = base_config(tasks=[dict(fixtures.fizzbuzz_task(), id="a/b")])
         self.assert_rejected(cfg, "invalid task id")
 
+    def test_a_suite_task_id_is_the_suite_name_and_the_task_id(self) -> None:
+        cfg = base_config(tasks=[dict(fixtures.fizzbuzz_task(), id="demo/fizz", suite="demo")])
+        hb.validate_config(cfg)
+
+    def test_a_suite_task_id_with_a_bad_shape_is_rejected(self) -> None:
+        for task_id in ("demo", "demo/a/b", "demo/", "/fizz", ".x/fizz", "demo/.fizz", "demo/a b"):
+            with self.subTest(task_id=task_id):
+                cfg = base_config(tasks=[dict(fixtures.fizzbuzz_task(), id=task_id, suite="demo")])
+                self.assert_rejected(cfg, "invalid task id")
+
+    def test_ids_that_would_share_log_and_workdir_names_are_rejected(self) -> None:
+        tasks = [dict(fixtures.fizzbuzz_task(), id="a_b"), dict(fixtures.fizzbuzz_task(), id="a/b", suite="a")]
+        self.assert_rejected(base_config(tasks=tasks), "same file names")
+
     def test_task_id_with_leading_dot_is_rejected(self) -> None:
         cfg = base_config(tasks=[dict(fixtures.fizzbuzz_task(), id=".hidden")])
         self.assert_rejected(cfg, "invalid task id")
@@ -5746,6 +6774,20 @@ class ResolveWorkRootTests(unittest.TestCase):
         root = hb.resolve_work_root({"work_dir": str(outside / "w")}, base)
         self.assertEqual((root, root.is_dir()), (outside / "w", True))
 
+    def test_a_relative_work_dir_is_resolved_against_the_config_directory_not_the_cwd(self) -> None:
+        base = fixtures.tmpdir(self) / "config-dir"
+        base.mkdir()
+        root = hb.resolve_work_root({"work_dir": "../relative-work"}, base)
+        self.assertEqual(
+            (root, root.is_dir(), Path("relative-work").exists()), (base.parent / "relative-work", True, False)
+        )
+
+    def test_a_relative_work_dir_inside_the_config_directory_is_rejected(self) -> None:
+        base = fixtures.tmpdir(self)
+        with self.assertRaises(SystemExit) as cm:
+            hb.resolve_work_root({"work_dir": "work"}, base)
+        self.assertIn("inside the benchmark repo", str(cm.exception.code))
+
     def test_default_is_a_fresh_temp_dir(self) -> None:
         root = hb.resolve_work_root({}, fixtures.tmpdir(self))
         self.addCleanup(root.rmdir)
@@ -5785,6 +6827,39 @@ class PrepareWorkdirTests(unittest.TestCase):
         hb.prepare_workdir(task, base, base / "w1")
         hb.prepare_workdir(task, base, base / "w2")
         self.assertEqual((base / "w2" / "f.txt").read_text(), "new")
+
+    def test_a_config_task_may_clone_a_local_repo_and_a_suite_task_may_not(self) -> None:
+        """`GIT_ALLOW_PROTOCOL` is the second line of defense behind the suite loader: whatever repo a suite names,
+        git itself refuses `file`, `ssh` and the rest. The cache to workdir clone is ours, so it may use `file`."""
+        base = fixtures.tmpdir(self)
+        repo, _ = self.make_git_repo(base)
+        hb.prepare_workdir({"id": "t", "repo": str(repo)}, base, base / "w1")
+        suite_task = {"id": "demo/t", "suite": "demo", "repo": str(repo)}
+        with self.assertRaises(subprocess.CalledProcessError) as cm:
+            hb.prepare_workdir(suite_task, base, base / "w2")
+        self.assertIn("not allowed", cm.exception.stderr)
+
+    def test_the_allowed_protocols_follow_the_task_source(self) -> None:
+        base = fixtures.tmpdir(self)
+        calls: list[tuple[tuple[str, ...], str]] = []
+
+        def fake_git(*args: str, cwd: Path | None = None, protocols: str = "") -> None:
+            calls.append((args[:2], protocols))
+            Path(args[-1]).mkdir(parents=True)
+            (Path(args[-1]) / ".git").mkdir()
+
+        with mock.patch.object(hb, "git", fake_git):
+            hb.prepare_workdir({"id": "c", "repo": "https://example.com/x.git"}, base, base / "w1")
+            hb.prepare_workdir({"id": "s/c", "suite": "s", "repo": "https://example.com/x.git"}, base, base / "w2")
+        self.assertEqual(
+            calls,
+            [
+                (("clone", "--quiet"), "https:ssh:file"),
+                (("clone", "--quiet"), "file"),
+                (("clone", "--quiet"), "https"),
+                (("clone", "--quiet"), "file"),
+            ],
+        )
 
     def test_is_git_source_recognises_urls_and_ssh(self) -> None:
         self.assertEqual(
@@ -6318,6 +7393,7 @@ if __name__ == "__main__":
 """In-process tests for `cmd_run`, `aggregate` and `cmd_report` with the fake agents."""
 
 import argparse
+import json
 import shutil
 import unittest
 from pathlib import Path
@@ -6326,6 +7402,7 @@ from unittest import mock
 
 import fixtures
 import harness_bench as hb
+from hbench.core.ids import sha256_json
 
 
 def args(**overrides: Any) -> argparse.Namespace:
@@ -6349,7 +7426,7 @@ def rows_of(base: Path) -> list[dict[str, Any]]:
 class RunTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.base = fixtures.tmpdir(self)
-        shutil.copytree(fixtures.ROOT / "tasks" / "fizzbuzz", self.base / "tasks" / "fizzbuzz")
+        shutil.copytree(fixtures.FIZZBUZZ, self.base / "tasks" / "fizzbuzz")
         self.cfg = fixtures.fake_config({"FAKE_TAGS_FILE": str(self.base / "tags.txt")})
         self.cfg["matrix"] = [{"harness": "claude", "model": "fix"}, {"harness": "pi", "model": "p/nofix"}]
 
@@ -6451,7 +7528,7 @@ class CmdRunTests(RunTestCase):
         self.assertTrue(rows_of(self.base)[0]["passed"])
 
     def test_protected_file_is_snapshotted_and_restored_to_its_original_content(self) -> None:
-        original = (fixtures.ROOT / "tasks" / "fizzbuzz" / "repo" / "fizzbuzz.py").read_text()
+        original = (fixtures.FIZZBUZZ / "repo" / "fizzbuzz.py").read_text()
         work = fixtures.tmpdir(self) / "work"
         self.cfg["work_dir"] = str(work)
         self.cfg["tasks"][0]["protected_paths"] = ["fizzbuzz.py"]
@@ -6596,6 +7673,224 @@ class GraderRunTests(RunTestCase):
             fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
         self.assertIn("task fizzbuzz", str(cm.exception.code))
         self.assertFalse((self.base / "results" / "results.jsonl").exists())
+
+
+class SuiteRunTests(RunTestCase):
+    """Tasks that come from `suites` in the config."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        fixtures.write_fizzbuzz_suite(self.base, "fizz")
+        self.cfg["tasks"] = []
+        self.cfg["suites"] = ["suites/fizz"]
+        self.cfg["matrix"] = [{"harness": "claude", "model": "fix"}, {"harness": "pi", "model": "p/nofix"}]
+
+    def test_suite_tasks_run_with_prefixed_ids_and_the_hidden_tests_decide(self) -> None:
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        self.assertEqual(
+            [(r["task"], r["passed"]) for r in rows_of(self.base)], [("fizz/fizzbuzz", True), ("fizz/fizzbuzz", False)]
+        )
+
+    def test_config_tasks_and_suite_tasks_run_together(self) -> None:
+        self.cfg["tasks"] = [fixtures.fizzbuzz_task()]
+        fixtures.call_quiet(hb.cmd_run, args(only=["claude"]), self.cfg, self.base)
+        self.assertEqual([r["task"] for r in rows_of(self.base)], ["fizzbuzz", "fizz/fizzbuzz"])
+
+    def test_a_config_with_only_suites_needs_no_tasks_key(self) -> None:
+        del self.cfg["tasks"]
+        fixtures.call_quiet(hb.cmd_run, args(only=["claude"]), self.cfg, self.base)
+        self.assertEqual([r["task"] for r in rows_of(self.base)], ["fizz/fizzbuzz"])
+
+    def test_the_slash_in_the_id_never_reaches_a_log_or_workdir_name(self) -> None:
+        work = fixtures.tmpdir(self) / "work"
+        self.cfg["work_dir"] = str(work)
+        fixtures.call_quiet(hb.cmd_run, args(only=["claude"], keep=True), self.cfg, self.base)
+        logs = self.base / "results" / "logs"
+        self.assertEqual(
+            (sorted(p.name for p in work.iterdir()), {p.parent for p in logs.rglob("*") if p.is_file()}),
+            (["fizz_fizzbuzz__claude__fix__r1"], {logs}),
+        )
+        self.assertTrue(all(p.name.startswith("fizz_fizzbuzz__") for p in logs.iterdir()))
+
+    def test_run_info_lists_the_suites_with_their_versions_and_the_task_hash(self) -> None:
+        fixtures.write_fizzbuzz_suite(self.base, "other", "regression")
+        self.cfg["suites"] = ["suites/fizz", "suites/other"]
+        self.cfg["tasks"] = [fixtures.fizzbuzz_task()]
+        fixtures.call_quiet(hb.cmd_run, args(only=["claude"]), self.cfg, self.base)
+        (info,) = (self.base / "results").glob("*/run.json")
+        label, _, digest = json.loads(info.read_text())["suite_version"].partition("+")
+        self.assertEqual((label, len(digest)), ("fizz@1.0.0,other@1.0.0", 12))
+
+    def test_suite_content_does_not_change_the_recorded_hash_with_the_machine_path(self) -> None:
+        other = fixtures.tmpdir(self)
+        fixtures.write_fizzbuzz_suite(other, "fizz")
+        versions = []
+        for base in (self.base, other):
+            fixtures.call_quiet(hb.cmd_run, args(only=["claude"]), self.cfg, base)
+            (info,) = (base / "results").glob("*/run.json")
+            versions.append(json.loads(info.read_text())["suite_version"])
+        self.assertEqual(versions[0], versions[1])
+
+    def test_a_config_without_suites_keeps_the_plain_task_hash(self) -> None:
+        cfg = fixtures.fake_config({})
+        cfg["matrix"] = [{"harness": "claude", "model": "fix"}]
+        shutil.copytree(fixtures.FIZZBUZZ, self.base / "tasks" / "fizzbuzz", dirs_exist_ok=True)
+        fixtures.call_quiet(hb.cmd_run, args(), cfg, self.base)
+        (info,) = (self.base / "results").glob("*/run.json")
+        self.assertEqual(json.loads(info.read_text())["suite_version"], sha256_json(cfg["tasks"])[:12])
+
+    def test_dry_run_prints_the_commands_of_the_suite_tasks(self) -> None:
+        out = fixtures.call_quiet(hb.cmd_run, args(dry_run=True, allow_unsandboxed=False), self.cfg, self.base)
+        self.assertEqual(out.count("fake_agent.py"), 2)
+
+    def test_two_suites_with_the_same_name_are_a_config_error_naming_both(self) -> None:
+        fixtures.write_fizzbuzz_suite(self.base, "fizz", directory="copy")
+        self.cfg["suites"] = ["suites/fizz", "suites/copy"]
+        with self.assertRaises(SystemExit) as cm:
+            fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        message = str(cm.exception.code)
+        self.assertTrue(all(s in message for s in ("fizz/fizzbuzz", "suites/fizz", "suites/copy")), message)
+
+    def test_a_config_task_with_the_id_of_a_suite_task_is_a_config_error_naming_both(self) -> None:
+        self.cfg["tasks"] = [dict(fixtures.fizzbuzz_task(), id="fizz/fizzbuzz")]
+        with self.assertRaises(SystemExit) as cm:
+            fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        message = str(cm.exception.code)
+        self.assertTrue(all(s in message for s in ("fizz/fizzbuzz", "config tasks", "suites/fizz")), message)
+        self.assertFalse((self.base / "results" / "results.jsonl").exists())
+
+    def test_an_invalid_suite_exits_naming_the_suite_and_the_problem(self) -> None:
+        (self.base / "suites" / "fizz" / "suite.json").write_text("{}")
+        with self.assertRaises(SystemExit) as cm:
+            fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        self.assertTrue(all(s in str(cm.exception.code) for s in ("suites/fizz", "missing key")), cm.exception.code)
+
+    def test_suites_must_be_a_list_of_paths(self) -> None:
+        for bad in ("suites/fizz", [3], {"a": 1}):
+            with self.subTest(bad=bad), self.assertRaises(SystemExit) as cm:
+                fixtures.call_quiet(hb.cmd_run, args(), dict(self.cfg, suites=bad), self.base)
+            self.assertIn("suites must be a list", str(cm.exception.code))
+
+    def test_the_report_has_the_by_suite_kind_section_when_two_kinds_ran(self) -> None:
+        fixtures.write_fizzbuzz_suite(self.base, "guard", "regression")
+        self.cfg["suites"] = ["suites/fizz", "suites/guard"]
+        fixtures.call_quiet(hb.cmd_run, args(no_report=False), self.cfg, self.base)
+        summary = (self.base / "results" / "summary.md").read_text()
+        self.assertIn("| capability | 1/1 | 0/1 |", summary)
+        self.assertIn("**Warning:** regression tasks failed: pi/p/nofix (guard/fizzbuzz 0/1)", summary)
+
+    def test_report_alone_reads_the_kinds_from_the_config_suites(self) -> None:
+        fixtures.write_fizzbuzz_suite(self.base, "guard", "regression")
+        self.cfg["suites"] = ["suites/fizz", "suites/guard"]
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        fixtures.call_quiet(hb.cmd_report, args(), self.cfg, self.base)
+        self.assertIn("## By suite kind", (self.base / "results" / "summary.md").read_text())
+
+    def test_report_warns_and_skips_the_kind_section_when_the_suites_cannot_load(self) -> None:
+        fixtures.write_fizzbuzz_suite(self.base, "guard", "regression")
+        self.cfg["suites"] = ["suites/fizz", "suites/guard"]
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        (self.base / "suites" / "guard" / "suite.json").write_text("{}")
+        out = fixtures.call_quiet(hb.cmd_report, args(), self.cfg, self.base)
+        self.assertIn("warning: cannot read the suites", out)
+        self.assertIn("suites/guard", out)
+        self.assertNotIn("By suite kind", (self.base / "results" / "summary.md").read_text())
+
+    def test_a_single_suite_kind_leaves_the_report_unchanged(self) -> None:
+        fixtures.call_quiet(hb.cmd_run, args(no_report=False), self.cfg, self.base)
+        self.assertNotIn("By suite kind", (self.base / "results" / "summary.md").read_text())
+
+
+class RunTaskAttemptTests(unittest.TestCase):
+    """`run_task_attempt`: the trial `suite validate --run` runs, with a solution copied in place of an agent."""
+
+    def setUp(self) -> None:
+        self.root = fixtures.tmpdir(self)
+        self.base = self.root / "base"
+        self.work_root = self.root / "work"
+        self.git_root = self.root / "git"
+        for path in (self.base, self.work_root, self.git_root):
+            path.mkdir()
+        self.repo, self.solution = self.base / "repo", self.base / "solution"
+        for path in (self.repo, self.solution):
+            path.mkdir()
+        self.cfg = fixtures.fake_config({})
+
+    def attempt(self, task: dict[str, Any], solution: Path | None) -> bool:
+        with fixtures.quiet():
+            return hb.run_task_attempt(self.cfg, task, self.base, self.work_root, self.git_root, "trial", solution)
+
+    def test_a_solution_is_not_copied_through_a_symlink_the_repo_left_in_the_workdir(self) -> None:
+        (self.repo / "esc").symlink_to("../..", target_is_directory=True)  # from the workdir: the dir above `work`
+        (self.solution / "esc").mkdir()
+        (self.solution / "esc" / "PWNED").write_text("x")
+        task = {"id": "t", "repo": "repo", "test": "true"}
+        self.assertTrue(self.attempt(task, self.solution))
+        self.assertFalse((self.root / "PWNED").exists())
+        self.assertFalse((self.work_root.parent / "PWNED").exists())
+
+    def test_stale_bytecode_in_the_solution_does_not_reach_the_workdir(self) -> None:
+        (self.solution / "__pycache__").mkdir()
+        (self.solution / "__pycache__" / "x.pyc").write_text("stale")
+        (self.solution / "new.txt").write_text("n")
+        task = {"id": "t", "repo": "repo", "test": "test -e new.txt && ! test -e __pycache__"}
+        self.assertTrue(self.attempt(task, self.solution))
+
+    def test_protected_paths_are_restored_after_the_solution_is_copied(self) -> None:
+        (self.repo / "guard.txt").write_text("ok")
+        (self.solution / "guard.txt").write_text("tampered")
+        check = "import sys; sys.exit(0 if open('guard.txt').read() == 'ok' else 1)"
+        task = {"id": "t", "repo": "repo", "test": f'{fixtures.PY} -c "{check}"', "protected_paths": ["guard.txt"]}
+        self.assertEqual((self.attempt(task, None), self.attempt(task, self.solution)), (True, True))
+
+
+class SuiteVersionTests(unittest.TestCase):
+    def suite_task(self, suite_dir: str, **overrides: Any) -> dict[str, Any]:
+        task = {
+            "id": "s/t",
+            "suite": "s",
+            "suite_label": "s@1.0.0",
+            "suite_dir": suite_dir,
+            "repo": f"{suite_dir}/t/repo",
+            "hidden_tests": f"{suite_dir}/t/hidden_tests",
+            "solution": f"{suite_dir}/t/solution",
+            "prompt": "p",
+        }
+        task.update(overrides)
+        return task
+
+    def test_the_hash_does_not_depend_on_where_the_suite_is_checked_out(self) -> None:
+        self.assertEqual(
+            hb.suite_version_of([self.suite_task("/one/s")]), hb.suite_version_of([self.suite_task("/other/place/s")])
+        )
+
+    def test_the_hash_follows_which_directories_the_task_uses(self) -> None:
+        a = self.suite_task("/one/s")
+        for key in ("repo", "hidden_tests", "solution"):
+            with self.subTest(key=key):
+                b = self.suite_task("/one/s", **{key: f"/one/s/other/{key}"})
+                self.assertNotEqual(hb.suite_version_of([a]), hb.suite_version_of([b]))
+
+    def test_a_git_url_repo_stays_in_the_hash(self) -> None:
+        a = self.suite_task("/one/s", repo="https://example.com/x.git")
+        b = self.suite_task("/one/s", repo="https://example.com/y.git")
+        self.assertNotEqual(hb.suite_version_of([a]), hb.suite_version_of([b]))
+
+
+class ConfigTaskKeyTests(RunTestCase):
+    """The keys a suite adds to its tasks are the engine's, never a config task's (it would pose as a suite task)."""
+
+    def test_a_config_task_with_a_suite_key_is_rejected_naming_the_key(self) -> None:
+        for key in ("suite", "suite_kind", "suite_label", "suite_dir", "solution"):
+            with self.subTest(key=key), self.assertRaises(SystemExit) as cm:
+                self.cfg["tasks"] = [dict(fixtures.fizzbuzz_task(), **{key: "x"})]
+                fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+            self.assertTrue(all(s in str(cm.exception.code) for s in ("fizzbuzz", key, "suite")), cm.exception.code)
+
+    def test_the_check_runs_without_a_suites_key_too(self) -> None:
+        self.cfg["tasks"] = [dict(fixtures.fizzbuzz_task(), suite="x")]
+        with self.assertRaises(SystemExit):
+            hb.expand_suites(self.cfg, self.base)
 
 
 class AggregateTests(unittest.TestCase):
@@ -6918,7 +8213,7 @@ class WrapperMainTests(ServerTestCase):
         cfg["harnesses"]["claude"]["env"]["FAKE_TAGS_FILE"] = str(tags)
         cfg["litellm"]["base_url"] = "http://127.0.0.1:1"  # connection refused
         (self.base / "config.json").write_text(json.dumps(cfg))
-        shutil.copytree(fixtures.ROOT / "tasks" / "fizzbuzz", self.base / "tasks" / "fizzbuzz")
+        shutil.copytree(fixtures.FIZZBUZZ, self.base / "tasks" / "fizzbuzz")
         out = self.argv_run("--allow-unsandboxed")
         self.assertEqual(("reconcile failed" in out, "Run later" in out), (True, True))
 
@@ -7972,7 +9267,7 @@ class HostileAgentOutputTests(RunTestCase):
 class ReconcileContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self.base = fixtures.tmpdir(self)
-        shutil.copytree(fixtures.ROOT / "tasks" / "fizzbuzz", self.base / "tasks" / "fizzbuzz")
+        shutil.copytree(fixtures.FIZZBUZZ, self.base / "tasks" / "fizzbuzz")
         self.server = ScriptedServer()
         self.addCleanup(self.server.close)
         patcher = mock.patch.dict(os.environ, {"HB_TEST_KEY": "k-test"})
@@ -8507,6 +9802,58 @@ class ToolCallStatisticsTests(unittest.TestCase):
         self.assertEqual([fmt_tool_calls(v) for v in (None, math.inf, 0.0, 2.55)], ["n/a", "inf", "0.0", "2.5"])
 
 
+KINDS = {"cap": "capability", "reg": "regression"}
+
+
+class SuiteKindTests(unittest.TestCase):
+    """`## By suite kind`: only when the trials come from more than one suite kind."""
+
+    def mixed(self, regression: list[bool], capability: list[bool] | None = None) -> list[Any]:
+        return [
+            *pair_trials("h", "m", capability or [True, False], task="cap/a"),
+            *pair_trials("h", "m", regression, task="reg/b"),
+            *pair_trials("g", "m", [True, True], task="reg/b"),
+            *pair_trials("g", "m", [True, True], task="cap/a"),
+        ]
+
+    def test_solved_over_runs_per_pair_and_kind(self) -> None:
+        md = render(self.mixed([True, True]), suite_kinds=KINDS)
+        self.assertIn("## By suite kind", md)
+        self.assertIn("| capability | 2/2 | 1/2 |", md)
+        self.assertIn("| regression | 2/2 | 2/2 |", md)
+
+    def test_a_failed_regression_task_is_flagged_for_its_pair(self) -> None:
+        md = render(self.mixed([True, False]), suite_kinds=KINDS)
+        self.assertIn("**Warning:** regression tasks failed: h/m (reg/b 1/2)", md)
+
+    def test_no_warning_when_every_regression_task_passed(self) -> None:
+        self.assertNotIn("Warning:** regression", render(self.mixed([True, True]), suite_kinds=KINDS))
+
+    def test_a_null_control_failing_a_regression_task_is_not_flagged(self) -> None:
+        trials = [*self.mixed([True, True]), *pair_trials("n", "none", [False], task="reg/b")]
+        md = render(trials, null=("n",), suite_kinds=KINDS)
+        self.assertNotIn("Warning:** regression", md)
+
+    def test_a_pair_missing_from_a_kind_shows_a_dash(self) -> None:
+        trials = [*pair_trials("h", "m", [True], task="cap/a"), *pair_trials("g", "m", [True], task="reg/b")]
+        self.assertIn("| capability | 1/1 | - |", render(trials, suite_kinds=KINDS))
+
+    def test_one_kind_only_adds_no_section(self) -> None:
+        trials = pair_trials("h", "m", [True], task="reg/b")
+        self.assertNotIn("By suite kind", render(trials, suite_kinds=KINDS))
+
+    def test_tasks_of_unknown_suites_and_config_tasks_are_left_out(self) -> None:
+        trials = [*pair_trials("h", "m", [True], task="plain"), *pair_trials("h", "m", [True], task="zzz/x")]
+        self.assertNotIn("By suite kind", render(trials, suite_kinds=KINDS))
+
+    def test_a_config_task_named_like_a_suite_does_not_count_as_that_suite(self) -> None:
+        trials = [*pair_trials("h", "m", [True], task="cap/a"), *pair_trials("h", "m", [True], task="reg")]
+        self.assertNotIn("By suite kind", render(trials, suite_kinds=KINDS))
+
+    def test_without_suite_kinds_the_report_has_no_section(self) -> None:
+        self.assertNotIn("By suite kind", render(self.mixed([True, True])))
+
+
 class WriteCsvTests(unittest.TestCase):
     def test_writes_header_and_one_line_per_pair(self) -> None:
         path: Path = fixtures.tmpdir(self) / "s.csv"
@@ -8661,7 +10008,7 @@ class CliDispatchTests(unittest.TestCase):
         self.server = ScriptedServer()
         self.addCleanup(self.server.close)
         self.base = fixtures.tmpdir(self)
-        shutil.copytree(ROOT / "tasks" / "fizzbuzz", self.base / "tasks" / "fizzbuzz")
+        shutil.copytree(fixtures.FIZZBUZZ, self.base / "tasks" / "fizzbuzz")
         self.cfg = fixtures.fake_config({})
         self.cfg["litellm"] = {"base_url": self.server.url, "api_key": "k-test"}
         self.cfg_path = self.base / "config.json"
@@ -8716,6 +10063,162 @@ class CliDispatchTests(unittest.TestCase):
         self.cli("run", "--allow-unsandboxed", "--only", "claude")
         shutil.copytree(self.base / "results", self.base / "results-litellm")
         self.assertIn("Cost source: `litellm`", self.cli("report", "--litellm"))
+
+
+class SuiteCommandTests(unittest.TestCase):
+    """`suite list` and `suite validate [--run]` over a one-task suite built on the fizzbuzz sample."""
+
+    def setUp(self) -> None:
+        self.base = fixtures.tmpdir(self)
+        self.suite = fixtures.write_fizzbuzz_suite(self.base, "fizz")
+        self.cfg: dict[str, Any] = {"harnesses": {}, "suites": ["suites/fizz"]}
+        self.cfg_path = self.base / "config.json"
+
+    def write_config(self) -> str:
+        self.cfg_path.write_text(json.dumps(self.cfg))
+        return str(self.cfg_path)
+
+    def call(self, *argv: str, code: int | None = 0) -> str:
+        """Output of `cli.main(argv)`; the exit code is checked (None means it must not exit)."""
+        err = io.StringIO()
+        with fixtures.quiet() as out, contextlib.redirect_stderr(err):
+            if code is None:
+                cli.main(list(argv))
+            else:
+                with self.assertRaises(SystemExit) as cm:
+                    cli.main(list(argv))
+                exit_code = cm.exception.code
+                if not isinstance(exit_code, int):  # `sys.exit("message")`: status 1 and the message on stderr
+                    err.write(str(exit_code))
+                self.assertEqual(exit_code if isinstance(exit_code, int) else 1, code, err.getvalue())
+        return out.getvalue() + err.getvalue()
+
+    def test_list_prints_name_version_kind_task_count_and_tags(self) -> None:
+        out = self.call("suite", "list", str(self.suite), code=None)
+        self.assertEqual(out.strip(), "fizz  1.0.0  capability  1 task  tags: bugfix")
+
+    def test_list_reads_the_suites_of_a_config(self) -> None:
+        out = self.call("suite", "list", "--config", self.write_config(), code=None)
+        self.assertIn("fizz  1.0.0  capability", out)
+
+    def test_list_pluralizes_tasks_and_shows_a_dash_without_tags(self) -> None:
+        document = json.loads((self.suite / "suite.json").read_text())
+        document["tasks"][0].pop("tags")
+        document["tasks"].append(dict(document["tasks"][0], id="second"))
+        (self.suite / "suite.json").write_text(json.dumps(document))
+        self.assertIn("2 tasks  tags: -", self.call("suite", "list", str(self.suite), code=None))
+
+    def test_list_without_paths_or_config_is_a_usage_error(self) -> None:
+        self.assertIn("give suite directories or --config", self.call("suite", "list", code=2))
+
+    def test_list_of_a_bad_suite_exits_with_the_problem(self) -> None:
+        (self.suite / "suite.json").write_text("{}")
+        self.assertIn("missing key", self.call("suite", "list", str(self.suite), code=1))
+
+    def test_validate_static_reports_ok_per_suite(self) -> None:
+        out = self.call("suite", "validate", str(self.suite), code=None)
+        self.assertEqual(out.strip(), "ok    fizz@1.0.0 (1 task)")
+
+    def test_validate_static_fails_with_the_message_and_still_checks_the_other_suites(self) -> None:
+        bad = self.base / "suites" / "bad"
+        bad.mkdir()
+        (bad / "suite.json").write_text("{}")
+        out = self.call("suite", "validate", str(bad), str(self.suite), code=1)
+        self.assertIn("FAIL  ", out)
+        self.assertIn("missing key", out)
+        self.assertIn("ok    fizz@1.0.0", out)
+
+    def test_validate_static_checks_the_tasks_the_way_run_does(self) -> None:
+        document = json.loads((self.suite / "suite.json").read_text())
+        document["tasks"][0]["graders"] = [{"type": "command"}]
+        (self.suite / "suite.json").write_text(json.dumps(document))
+        out = self.call("suite", "validate", str(self.suite), code=1)
+        self.assertIn("task fizz/fizzbuzz", out)
+
+    def test_validate_defaults_to_the_suites_of_the_config(self) -> None:
+        self.assertIn("ok    fizz@1.0.0", self.call("suite", "validate", "--config", self.write_config(), code=None))
+
+    def test_validate_run_reports_ok_when_the_tests_fail_untouched_and_pass_with_the_solution(self) -> None:
+        out = self.call("suite", "validate", "--run", "--allow-unsandboxed", str(self.suite), code=None)
+        self.assertIn("fizz/fizzbuzz: ok", out)
+
+    def test_validate_run_flags_a_task_whose_untouched_repo_already_passes(self) -> None:
+        (self.suite / "fizzbuzz" / "repo" / "fizzbuzz.py").write_text(fixtures.FIXED_FIZZBUZZ)
+        out = self.call("suite", "validate", "--run", "--allow-unsandboxed", str(self.suite), code=1)
+        self.assertIn("fizz/fizzbuzz: trivially passing", out)
+
+    def test_validate_run_flags_a_solution_that_fails_the_tests(self) -> None:
+        buggy = (fixtures.FIZZBUZZ / "repo" / "fizzbuzz.py").read_text()
+        (self.suite / "fizzbuzz" / "solution" / "fizzbuzz.py").write_text(buggy)
+        out = self.call("suite", "validate", "--run", "--allow-unsandboxed", str(self.suite), code=1)
+        self.assertIn("fizz/fizzbuzz: solution fails", out)
+
+    def test_a_static_failure_skips_the_behavioral_run_of_the_valid_suites(self) -> None:
+        bad = self.base / "suites" / "bad"
+        bad.mkdir()
+        (bad / "suite.json").write_text("{}")
+        out = self.call("suite", "validate", "--run", "--allow-unsandboxed", str(bad), str(self.suite), code=1)
+        self.assertIn("FAIL  ", out)
+        self.assertNotIn("fizz/fizzbuzz", out)
+
+    def test_validate_run_does_not_write_through_a_symlink_the_solution_meets_in_the_workdir(self) -> None:
+        """A suite with a symlink never loads, so `validate --run` never copies a solution through one."""
+        outside = fixtures.tmpdir(self)
+        (self.suite / "fizzbuzz" / "repo" / "esc").symlink_to(outside, target_is_directory=True)
+        (self.suite / "fizzbuzz" / "solution" / "esc").mkdir()
+        (self.suite / "fizzbuzz" / "solution" / "esc" / "PWNED").write_text("x")
+        out = self.call("suite", "validate", "--run", "--allow-unsandboxed", str(self.suite), code=1)
+        self.assertIn("symlink esc", out)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_validate_run_flags_a_task_without_a_solution_and_does_not_run_it(self) -> None:
+        document = json.loads((self.suite / "suite.json").read_text())
+        del document["tasks"][0]["solution"]
+        (self.suite / "suite.json").write_text(json.dumps(document))
+        out = self.call("suite", "validate", "--run", "--allow-unsandboxed", str(self.suite), code=1)
+        self.assertIn("fizz/fizzbuzz: no solution", out)
+
+    def test_validate_run_without_a_sandbox_refuses_like_run(self) -> None:
+        out = self.call("suite", "validate", "--run", str(self.suite), code=1)
+        self.assertIn("No sandbox configured", out)
+        self.assertNotIn("fizz/fizzbuzz", out)
+
+    def test_validate_run_uses_the_sandbox_prefix_of_the_config(self) -> None:
+        marker = self.base / "sandboxed.txt"
+        self.cfg["sandbox"] = {"prefix": ["env", f"MARKER={marker}"]}
+        calls: list[list[str]] = []
+        real_run_proc = importlib.import_module("harness_bench").run_proc
+
+        def spy(argv: list[str], *rest: Any) -> Any:
+            calls.append(argv)
+            return real_run_proc(argv, *rest)
+
+        with mock.patch("harness_bench.run_proc", spy):
+            out = self.call("suite", "validate", "--run", "--config", self.write_config(), code=None)
+        self.assertIn("fizz/fizzbuzz: ok", out)
+        self.assertTrue(calls and all(c[:2] == ["env", f"MARKER={marker}"] for c in calls), calls)
+
+    def test_validate_run_runs_repo_code_in_a_workdir_outside_the_suite_and_removes_it(self) -> None:
+        work = fixtures.tmpdir(self) / "work"
+        self.cfg["work_dir"] = str(work)
+        self.cfg["tasks"] = []
+        out = self.call("suite", "validate", "--run", "--allow-unsandboxed", "--config", self.write_config(), code=None)
+        self.assertIn("fizz/fizzbuzz: ok", out)
+        self.assertEqual([p.name for p in work.iterdir() if not p.name.startswith(".")], ["logs"])
+        self.assertEqual(sorted(p.name for p in self.suite.iterdir()), ["fizzbuzz", "suite.json"])
+
+    def test_validate_run_keeps_the_env_allowlist_and_redacts_the_spend_key(self) -> None:
+        secret = "-".join(["spend", "fake", "value", "12345"])  # built at runtime so secret scanners skip it
+        self.cfg["litellm"] = {"base_url": "http://localhost:1", "api_key": "${HB_TEST_SPEND_KEY}"}
+        document = json.loads((self.suite / "suite.json").read_text())
+        document["tasks"][0]["setup"] = f"echo spend=${{HB_TEST_SPEND_KEY:-unset}} >&2; echo {secret}"
+        (self.suite / "suite.json").write_text(json.dumps(document))
+        work = fixtures.tmpdir(self) / "work"
+        self.cfg["work_dir"] = str(work)
+        with mock.patch.dict("os.environ", {"HB_TEST_SPEND_KEY": secret}):
+            self.call("suite", "validate", "--run", "--allow-unsandboxed", "--config", self.write_config(), code=None)
+        log = next((work / "logs").glob("*.setup.log")).read_text()
+        self.assertEqual((secret in log, "spend=unset" in log, "***REDACTED***" in log), (False, True, True))
 
 
 class ReportOptionsTests(unittest.TestCase):
@@ -9026,6 +10529,23 @@ class HiddenTestsGraderTests(unittest.TestCase):
         task = {"test": "pytest", "hidden_tests": "hidden"}
         result = HiddenTestsGrader({}).grade(GradeContext(workdir=workdir, task=task, base=base, changes=(), run=run))
         self.assertEqual((seen, result.passed, result.score, result.grader), ([True], True, 1.0, "hidden_tests"))
+
+    def test_a_symlink_the_agent_planted_at_a_hidden_test_path_is_replaced_not_followed(self) -> None:
+        base, workdir, outside = fixtures.tmpdir(self), fixtures.tmpdir(self), fixtures.tmpdir(self)
+        (base / "hidden").mkdir()
+        (base / "hidden" / "test_hidden.py").write_text("hidden")
+        canary = outside / "canary"
+        canary.write_text("host file")
+        (workdir / "test_hidden.py").symlink_to(canary)
+        task = {"test": "pytest", "hidden_tests": "hidden"}
+        seen: list[str] = []
+
+        def run(command: str, timeout: int, log_name: str) -> tuple[int | None, bool, str, str]:
+            seen.append((workdir / "test_hidden.py").read_text())
+            return 0, False, "", ""
+
+        HiddenTestsGrader({}).grade(GradeContext(workdir=workdir, task=task, base=base, changes=(), run=run))
+        self.assertEqual((canary.read_text(), seen), ("host file", ["hidden"]))
 
     def test_without_hidden_tests_only_the_command_runs_with_the_task_timeout(self) -> None:
         run = FakeRun(rc=1)
@@ -9535,6 +11055,419 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
+`tests/test_suites.py`:
+
+```python
+"""Tests for `hbench.suites`: the suite format, the loader and the expansion into engine tasks."""
+
+import json
+import os
+import unittest
+from pathlib import Path
+from typing import Any
+
+import fixtures
+from hbench import cli, suites
+
+SUITES = fixtures.ROOT / "suites"
+EXAMPLE_SUITES = (SUITES / "regression", SUITES / "examples-capability")
+# Built at runtime: this file is not a hidden test, so it must not hold the marker the contamination probe looks for.
+MARKER = "HIDDEN-TEST" + "-MARKER"
+
+
+def task_entry(**overrides: Any) -> dict[str, Any]:
+    """A valid task entry of a suite file (paths relative to the suite directory)."""
+    entry: dict[str, Any] = {
+        "id": "fizz",
+        "repo": "fizz/repo",
+        "prompt": "fix it",
+        "hidden_tests": "fizz/hidden_tests",
+        "test": "python3 -m unittest -q",
+        "solution": "fizz/solution",
+        "tags": ["bugfix", "python"],
+        "provenance": {"source": "synthetic", "license": "MIT", "url": None},
+    }
+    entry.update(overrides)
+    return entry
+
+
+def suite_file(**overrides: Any) -> dict[str, Any]:
+    doc: dict[str, Any] = {
+        "schema_version": "1.0.0",
+        "name": "demo",
+        "version": "1.2.3",
+        "kind": "capability",
+        "description": "A demo suite.",
+        "tasks": [task_entry()],
+    }
+    doc.update(overrides)
+    return doc
+
+
+def write_suite(root: Path, doc: Any = None, dirs: tuple[str, ...] = ()) -> Path:
+    """A suite directory under `root` holding `doc` (default: a valid one) and the directories of task `fizz`."""
+    suite_dir = root / "demo"
+    for rel in dirs or ("fizz/repo", "fizz/hidden_tests", "fizz/solution"):
+        (suite_dir / rel).mkdir(parents=True, exist_ok=True)
+    (suite_dir / "suite.json").write_text(json.dumps(suite_file() if doc is None else doc))
+    return suite_dir
+
+
+class SuiteCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.root = fixtures.tmpdir(self)
+
+    def assert_rejected(self, suite_dir: Path, fragment: str) -> None:
+        with self.assertRaises(suites.SuiteError) as cm:
+            suites.load_suite(suite_dir)
+        self.assertIn(fragment, str(cm.exception))
+
+
+class LoadSuiteTests(SuiteCase):
+    def test_a_valid_suite_loads_with_its_metadata_and_tasks(self) -> None:
+        suite = suites.load_suite(write_suite(self.root))
+        (task,) = suite.tasks
+        self.assertEqual(
+            (suite.name, suite.version, suite.kind, suite.description, task.id, task.tags),
+            ("demo", "1.2.3", "capability", "A demo suite.", "fizz", ("bugfix", "python")),
+        )
+        self.assertEqual(
+            (task.provenance.source, task.provenance.license, task.provenance.url), ("synthetic", "MIT", None)
+        )
+
+    def test_paths_are_resolved_against_the_suite_directory(self) -> None:
+        suite_dir = write_suite(self.root)
+        suite = suites.load_suite(suite_dir)
+        (task,) = suite.tasks
+        root = suite_dir.resolve()
+        self.assertEqual(
+            (suite.path, task.data["repo"], task.data["hidden_tests"], task.solution),
+            (root, str(root / "fizz/repo"), str(root / "fizz/hidden_tests"), root / "fizz/solution"),
+        )
+
+    def test_a_task_without_a_solution_has_none(self) -> None:
+        entry = task_entry()
+        del entry["solution"]
+        suite = suites.load_suite(write_suite(self.root, suite_file(tasks=[entry])))
+        self.assertIsNone(suite.tasks[0].solution)
+
+    def test_task_keys_the_engine_reads_pass_through_and_the_suite_only_keys_stay_out(self) -> None:
+        entry = task_entry(
+            ref="main", setup="true", timeout=5, setup_timeout=6, test_timeout=7, protected_paths=["a.py"], grade={}
+        )
+        entry["graders"] = [{"type": "hidden_tests"}]
+        (task,) = suites.load_suite(write_suite(self.root, suite_file(tasks=[entry]))).tasks
+        data = dict(task.data)
+        self.assertEqual(
+            (data["ref"], data["timeout"], data["protected_paths"], data["graders"]),
+            ("main", 5, ["a.py"], [{"type": "hidden_tests"}]),
+        )
+        self.assertFalse({"tags", "solution", "provenance"} & set(data))
+
+    def test_a_git_url_repo_is_kept_as_is_with_its_ref(self) -> None:
+        entry = task_entry(repo="https://example.com/x/y.git", ref="v1")
+        (task,) = suites.load_suite(write_suite(self.root, suite_file(tasks=[entry]))).tasks
+        self.assertEqual((task.data["repo"], task.data["ref"]), ("https://example.com/x/y.git", "v1"))
+
+    def test_a_repo_url_other_than_https_is_rejected(self) -> None:
+        """A suite is someone else's data: `file://` reads private local repos, `ssh`/`git@` use the user's keys,
+        `ext::` runs a command, and plain `http://` is unauthenticated."""
+        for repo in (
+            "file:///home/user/private",
+            "ssh://git@example.com/x/y.git",
+            "git://example.com/x/y.git",
+            "http://example.com/x/y.git",
+            "git@example.com:x/y.git",
+            "ext::sh -c touch% /tmp/pwned",
+            "https://",
+            "https://example.com/a b",
+        ):
+            with self.subTest(repo=repo):
+                entry = task_entry(repo=repo)
+                self.assert_rejected(write_suite(self.root, suite_file(tasks=[entry])), "https://")
+
+    def test_a_regression_suite_and_a_task_without_hidden_tests_load(self) -> None:
+        entry = task_entry()
+        del entry["hidden_tests"]
+        suite = suites.load_suite(write_suite(self.root, suite_file(kind="regression", tasks=[entry])))
+        self.assertEqual((suite.kind, "hidden_tests" in suite.tasks[0].data), ("regression", False))
+
+    def test_a_missing_suite_file_is_rejected(self) -> None:
+        self.assert_rejected(self.root, "suite.json")
+
+    def test_invalid_json_is_rejected(self) -> None:
+        suite_dir = write_suite(self.root)
+        (suite_dir / "suite.json").write_text("{nope")
+        self.assert_rejected(suite_dir, "not valid JSON")
+
+    def test_a_suite_that_is_not_an_object_is_rejected(self) -> None:
+        self.assert_rejected(write_suite(self.root, []), "must be a JSON object")
+
+
+class SuiteFieldTests(SuiteCase):
+    def test_an_unknown_top_level_key_is_rejected_by_name(self) -> None:
+        self.assert_rejected(write_suite(self.root, suite_file(colour="red")), "colour")
+
+    def test_an_unknown_task_key_is_rejected_by_name(self) -> None:
+        self.assert_rejected(write_suite(self.root, suite_file(tasks=[task_entry(shell="rm")])), "shell")
+
+    def test_a_missing_top_level_key_is_rejected_by_name(self) -> None:
+        doc = suite_file()
+        del doc["kind"]
+        self.assert_rejected(write_suite(self.root, doc), "kind")
+
+    def test_a_missing_task_key_is_rejected_by_name(self) -> None:
+        entry = task_entry()
+        del entry["prompt"]
+        self.assert_rejected(write_suite(self.root, suite_file(tasks=[entry])), "prompt")
+
+    def test_a_bad_name_is_rejected(self) -> None:
+        for name in ("Demo", "a/b", "a b", "", "../x", 3):
+            with self.subTest(name=name):
+                self.assert_rejected(write_suite(self.root, suite_file(name=name)), "name")
+
+    def test_a_bad_version_is_rejected(self) -> None:
+        for version in ("1.2", "v1.2.3", "", 1):
+            with self.subTest(version=version):
+                self.assert_rejected(write_suite(self.root, suite_file(version=version)), "version")
+
+    def test_a_bad_kind_is_rejected(self) -> None:
+        self.assert_rejected(write_suite(self.root, suite_file(kind="smoke")), "kind")
+
+    def test_another_schema_major_is_rejected_and_a_newer_minor_is_accepted(self) -> None:
+        self.assert_rejected(write_suite(self.root, suite_file(schema_version="2.0.0")), "schema_version")
+        self.assert_rejected(write_suite(self.root, suite_file(schema_version="nope")), "schema_version")
+        suite = suites.load_suite(write_suite(self.root, suite_file(schema_version="1.4.0")))
+        self.assertEqual(suite.name, "demo")
+
+    def test_a_bad_description_is_rejected(self) -> None:
+        self.assert_rejected(write_suite(self.root, suite_file(description=3)), "description")
+
+    def test_tasks_must_be_a_non_empty_list_of_objects(self) -> None:
+        bad: list[Any] = [[], {}, ["x"]]
+        for tasks in bad:
+            with self.subTest(tasks=tasks):
+                self.assert_rejected(write_suite(self.root, suite_file(tasks=tasks)), "tasks")
+
+    def test_a_bad_task_id_is_rejected(self) -> None:
+        for task_id in ("A", "a/b", ".x", "", 3):
+            with self.subTest(task_id=task_id):
+                self.assert_rejected(write_suite(self.root, suite_file(tasks=[task_entry(id=task_id)])), "id")
+
+    def test_duplicate_task_ids_in_one_suite_are_rejected_naming_the_id(self) -> None:
+        doc = suite_file(tasks=[task_entry(), task_entry()])
+        self.assert_rejected(write_suite(self.root, doc), "duplicate task id 'fizz'")
+
+    def test_wrongly_typed_task_values_are_rejected_by_key(self) -> None:
+        for key, value in (
+            ("prompt", 3),
+            ("test", ["x"]),
+            ("setup", 1),
+            ("ref", 1),
+            ("timeout", "5"),
+            ("timeout", True),
+            ("timeout", 0),
+            ("setup_timeout", -1),
+            ("test_timeout", 1.5),
+            ("protected_paths", "a"),
+            ("protected_paths", [1]),
+            ("graders", {}),
+            ("grade", []),
+            ("tags", "x"),
+            ("tags", [1]),
+            ("repo", 3),
+            ("hidden_tests", 3),
+        ):
+            with self.subTest(key=key, value=value):
+                self.assert_rejected(write_suite(self.root, suite_file(tasks=[task_entry(**{key: value})])), key)
+
+    def test_provenance_must_have_a_source_and_a_license_and_no_other_keys(self) -> None:
+        for prov in ("x", {"source": "s"}, {"license": "MIT"}, {"source": 1, "license": "MIT"}):
+            with self.subTest(prov=prov):
+                self.assert_rejected(
+                    write_suite(self.root, suite_file(tasks=[task_entry(provenance=prov)])), "provenance"
+                )
+        extra = {"source": "s", "license": "MIT", "owner": "x"}
+        self.assert_rejected(write_suite(self.root, suite_file(tasks=[task_entry(provenance=extra)])), "owner")
+        bad_url = {"source": "s", "license": "MIT", "url": 3}
+        self.assert_rejected(write_suite(self.root, suite_file(tasks=[task_entry(provenance=bad_url)])), "url")
+
+    def test_provenance_url_is_optional_and_may_be_a_string(self) -> None:
+        prov = {"source": "exercism", "license": "MIT", "url": "https://example.com/x"}
+        (task,) = suites.load_suite(write_suite(self.root, suite_file(tasks=[task_entry(provenance=prov)]))).tasks
+        self.assertEqual(task.provenance.url, "https://example.com/x")
+        no_url = {"source": "synthetic", "license": "MIT"}
+        (task,) = suites.load_suite(write_suite(self.root, suite_file(tasks=[task_entry(provenance=no_url)]))).tasks
+        self.assertIsNone(task.provenance.url)
+
+
+class SuitePathTests(SuiteCase):
+    def test_a_relative_path_that_escapes_the_suite_directory_is_rejected(self) -> None:
+        for key in ("repo", "hidden_tests", "solution"):
+            with self.subTest(key=key):
+                outside = self.root / "outside"
+                outside.mkdir(exist_ok=True)
+                entry = task_entry(**{key: "../outside"})
+                self.assert_rejected(write_suite(self.root, suite_file(tasks=[entry])), "inside the suite")
+
+    def test_the_etc_style_escape_is_rejected(self) -> None:
+        entry = task_entry(repo="../../etc")
+        self.assert_rejected(write_suite(self.root, suite_file(tasks=[entry])), "inside the suite")
+
+    def test_an_absolute_path_is_rejected(self) -> None:
+        for key in ("repo", "hidden_tests", "solution"):
+            with self.subTest(key=key):
+                entry = task_entry(**{key: str(self.root)})
+                self.assert_rejected(write_suite(self.root, suite_file(tasks=[entry])), "relative")
+
+    def test_a_symlinked_directory_pointing_outside_is_rejected(self) -> None:
+        outside = self.root / "outside"
+        outside.mkdir()
+        suite_dir = write_suite(self.root, dirs=("fizz/hidden_tests", "fizz/solution"))
+        (suite_dir / "fizz" / "repo").symlink_to(outside, target_is_directory=True)
+        self.assert_rejected(suite_dir, "inside the suite")
+
+    def test_a_symlink_anywhere_in_a_task_directory_is_rejected(self) -> None:
+        """Files and directories, absolute and relative targets, inside and outside the suite, at any depth."""
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "secret.txt").write_text("secret")
+        for key in ("repo", "hidden_tests", "solution"):
+            suite_dir = write_suite(self.root / key)
+            link = suite_dir / "fizz" / key / "sub" / "link"
+            link.parent.mkdir()
+            targets = {
+                "file outside": outside / "secret.txt",
+                "dir outside": outside,
+                "file inside": suite_dir / "suite.json",
+                "dir inside": suite_dir / "fizz",
+            }
+            for label, target in targets.items():
+                for style, value in (("absolute", str(target)), ("relative", os.path.relpath(target, link.parent))):
+                    with self.subTest(key=key, target=label, style=style):
+                        link.symlink_to(value, target_is_directory=target.is_dir())
+                        try:
+                            self.assert_rejected(suite_dir, "symlink sub/link")
+                        finally:
+                            link.unlink()
+
+    def test_a_symlink_to_a_directory_inside_the_task_is_rejected_by_name(self) -> None:
+        suite_dir = write_suite(self.root)
+        (suite_dir / "fizz" / "repo" / "esc").symlink_to("../..", target_is_directory=True)
+        self.assert_rejected(suite_dir, "symlink esc")
+
+    def test_an_absolute_symlink_into_the_hidden_tests_cannot_reach_the_workdir(self) -> None:
+        suite_dir = write_suite(self.root)
+        (suite_dir / "fizz" / "repo" / "peek").symlink_to(suite_dir / "fizz" / "hidden_tests", target_is_directory=True)
+        self.assert_rejected(suite_dir, "symlink peek")
+
+    def test_a_task_directory_reached_through_a_symlinked_parent_is_rejected(self) -> None:
+        suite_dir = write_suite(self.root)
+        (suite_dir / "alias").symlink_to(suite_dir / "fizz", target_is_directory=True)
+        doc = suite_file(tasks=[task_entry(repo="alias/repo")])
+        (suite_dir / "suite.json").write_text(json.dumps(doc))
+        self.assert_rejected(suite_dir, "symlink")
+
+    def test_a_repo_directory_that_is_a_git_repository_is_rejected(self) -> None:
+        for how in (".git", "named.git"):
+            with self.subTest(how=how):
+                suite_dir = write_suite(self.root / how)
+                repo = suite_dir / "fizz" / "repo"
+                if how == ".git":
+                    (repo / ".git").mkdir()
+                    entry = task_entry()
+                else:
+                    (suite_dir / "fizz" / "x.git").mkdir()
+                    entry = task_entry(repo="fizz/x.git")
+                (suite_dir / "suite.json").write_text(json.dumps(suite_file(tasks=[entry])))
+                self.assert_rejected(suite_dir, "must not be a git repository")
+
+    def test_a_missing_directory_is_rejected_by_key(self) -> None:
+        suite_dir = write_suite(self.root, dirs=("fizz/repo", "fizz/hidden_tests"))
+        self.assert_rejected(suite_dir, "solution")
+
+    def test_a_path_that_is_a_file_is_rejected(self) -> None:
+        suite_dir = write_suite(self.root)
+        (suite_dir / "fizz" / "file").write_text("x")
+        doc = suite_file(tasks=[task_entry(repo="fizz/file")])
+        (suite_dir / "suite.json").write_text(json.dumps(doc))
+        self.assert_rejected(suite_dir, "not a directory")
+
+
+class SuiteTasksTests(SuiteCase):
+    def test_engine_tasks_are_prefixed_with_the_suite_name_and_carry_the_suite_keys(self) -> None:
+        suite = suites.load_suite(write_suite(self.root))
+        (task,) = suites.suite_tasks(suite)
+        self.assertEqual(
+            (task["id"], task["suite"], task["suite_kind"], task["tags"], task["prompt"]),
+            ("demo/fizz", "demo", "capability", ["bugfix", "python"], "fix it"),
+        )
+        self.assertEqual(task["solution"], str(suite.path / "fizz/solution"))
+
+    def test_a_task_without_a_solution_has_no_solution_key(self) -> None:
+        entry = task_entry()
+        del entry["solution"]
+        suite = suites.load_suite(write_suite(self.root, suite_file(tasks=[entry])))
+        self.assertNotIn("solution", suites.suite_tasks(suite)[0])
+
+    def test_the_label_is_name_at_version(self) -> None:
+        suite = suites.load_suite(write_suite(self.root))
+        self.assertEqual(suites.suite_label(suite), "demo@1.2.3")
+
+
+class ExampleSuiteTests(unittest.TestCase):
+    """The suites shipped in `suites/`: synthetic, offline, and every task checked by running it."""
+
+    def test_every_example_task_fails_untouched_and_passes_with_its_solution(self) -> None:
+        with fixtures.quiet() as out:
+            cli.main(["suite", "validate", "--run", "--allow-unsandboxed", *map(str, EXAMPLE_SUITES)])
+        lines = [line for line in out.getvalue().splitlines() if "/" in line and not line.startswith("ok  ")]
+        self.assertEqual(
+            sorted(lines),
+            [
+                "examples-capability/dependency-upgrade: ok",
+                "examples-capability/extract-function: ok",
+                "examples-capability/path-traversal-fix: ok",
+                "regression/fizzbuzz: ok",
+            ],
+        )
+
+    def test_suite_kinds_and_provenance(self) -> None:
+        loaded = {s.name: s for s in map(suites.load_suite, EXAMPLE_SUITES)}
+        self.assertEqual(
+            {name: (s.kind, s.version) for name, s in loaded.items()},
+            {"regression": ("regression", "1.0.0"), "examples-capability": ("capability", "1.0.0")},
+        )
+        for suite in loaded.values():
+            for task in suite.tasks:
+                self.assertEqual((task.provenance.source, task.provenance.license), ("synthetic", "MIT"), task.id)
+                self.assertIsNotNone(task.solution, task.id)
+
+    def test_every_hidden_test_file_carries_the_contamination_marker(self) -> None:
+        files = [p for suite in EXAMPLE_SUITES for p in suite.glob("*/hidden_tests/test_*.py")]
+        self.assertEqual(len(files), 4)
+        self.assertTrue(all(MARKER in p.read_text() for p in files), files)
+
+    def test_the_example_configs_use_the_example_suites(self) -> None:
+        for name in ("config.example.json", "config.litellm.example.json"):
+            cfg = json.loads((fixtures.ROOT / name).read_text())
+            self.assertEqual(cfg["suites"], ["suites/regression", "suites/examples-capability"], name)
+            self.assertNotIn("fizzbuzz", [t["id"] for t in cfg["tasks"]], name)
+
+    def test_the_example_suites_expand_into_engine_tasks_of_a_valid_config(self) -> None:
+        import harness_bench as hb
+
+        cfg = hb.expand_suites(
+            {"suites": ["suites/regression", "suites/examples-capability"], "tasks": []}, fixtures.ROOT
+        )
+        hb.validate_config({**cfg, "harnesses": {}})
+        self.assertEqual(len(cfg["tasks"]), 4)
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
 ## Sandbox
 
 `sandbox/Dockerfile`:
@@ -9677,7 +11610,7 @@ def main() -> None:
     try:
         shutil.copy(ROOT / "harness_bench.py", tmp)
         shutil.copytree(ROOT / "hbench", tmp / "hbench", ignore=shutil.ignore_patterns("__pycache__"))
-        shutil.copytree(ROOT / "tasks" / "fizzbuzz", tmp / "tasks" / "fizzbuzz")
+        shutil.copytree(ROOT / "suites" / "regression" / "fizzbuzz", tmp / "tasks" / "fizzbuzz")
         env = dict(
             os.environ,
             FAKE_TAGS_FILE=str(shared / "tags.txt"),

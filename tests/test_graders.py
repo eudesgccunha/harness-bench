@@ -157,6 +157,23 @@ class HiddenTestsGraderTests(unittest.TestCase):
         result = HiddenTestsGrader({}).grade(GradeContext(workdir=workdir, task=task, base=base, changes=(), run=run))
         self.assertEqual((seen, result.passed, result.score, result.grader), ([True], True, 1.0, "hidden_tests"))
 
+    def test_a_symlink_the_agent_planted_at_a_hidden_test_path_is_replaced_not_followed(self) -> None:
+        base, workdir, outside = fixtures.tmpdir(self), fixtures.tmpdir(self), fixtures.tmpdir(self)
+        (base / "hidden").mkdir()
+        (base / "hidden" / "test_hidden.py").write_text("hidden")
+        canary = outside / "canary"
+        canary.write_text("host file")
+        (workdir / "test_hidden.py").symlink_to(canary)
+        task = {"test": "pytest", "hidden_tests": "hidden"}
+        seen: list[str] = []
+
+        def run(command: str, timeout: int, log_name: str) -> tuple[int | None, bool, str, str]:
+            seen.append((workdir / "test_hidden.py").read_text())
+            return 0, False, "", ""
+
+        HiddenTestsGrader({}).grade(GradeContext(workdir=workdir, task=task, base=base, changes=(), run=run))
+        self.assertEqual((canary.read_text(), seen), ("host file", ["hidden"]))
+
     def test_without_hidden_tests_only_the_command_runs_with_the_task_timeout(self) -> None:
         run = FakeRun(rc=1)
         result = HiddenTestsGrader({}).grade(context(run, {"test": "t", "test_timeout": 5}))

@@ -138,7 +138,7 @@ class CliDispatchTests(unittest.TestCase):
         self.server = ScriptedServer()
         self.addCleanup(self.server.close)
         self.base = fixtures.tmpdir(self)
-        shutil.copytree(ROOT / "tasks" / "fizzbuzz", self.base / "tasks" / "fizzbuzz")
+        shutil.copytree(fixtures.FIZZBUZZ, self.base / "tasks" / "fizzbuzz")
         self.cfg = fixtures.fake_config({})
         self.cfg["litellm"] = {"base_url": self.server.url, "api_key": "k-test"}
         self.cfg_path = self.base / "config.json"
@@ -193,6 +193,162 @@ class CliDispatchTests(unittest.TestCase):
         self.cli("run", "--allow-unsandboxed", "--only", "claude")
         shutil.copytree(self.base / "results", self.base / "results-litellm")
         self.assertIn("Cost source: `litellm`", self.cli("report", "--litellm"))
+
+
+class SuiteCommandTests(unittest.TestCase):
+    """`suite list` and `suite validate [--run]` over a one-task suite built on the fizzbuzz sample."""
+
+    def setUp(self) -> None:
+        self.base = fixtures.tmpdir(self)
+        self.suite = fixtures.write_fizzbuzz_suite(self.base, "fizz")
+        self.cfg: dict[str, Any] = {"harnesses": {}, "suites": ["suites/fizz"]}
+        self.cfg_path = self.base / "config.json"
+
+    def write_config(self) -> str:
+        self.cfg_path.write_text(json.dumps(self.cfg))
+        return str(self.cfg_path)
+
+    def call(self, *argv: str, code: int | None = 0) -> str:
+        """Output of `cli.main(argv)`; the exit code is checked (None means it must not exit)."""
+        err = io.StringIO()
+        with fixtures.quiet() as out, contextlib.redirect_stderr(err):
+            if code is None:
+                cli.main(list(argv))
+            else:
+                with self.assertRaises(SystemExit) as cm:
+                    cli.main(list(argv))
+                exit_code = cm.exception.code
+                if not isinstance(exit_code, int):  # `sys.exit("message")`: status 1 and the message on stderr
+                    err.write(str(exit_code))
+                self.assertEqual(exit_code if isinstance(exit_code, int) else 1, code, err.getvalue())
+        return out.getvalue() + err.getvalue()
+
+    def test_list_prints_name_version_kind_task_count_and_tags(self) -> None:
+        out = self.call("suite", "list", str(self.suite), code=None)
+        self.assertEqual(out.strip(), "fizz  1.0.0  capability  1 task  tags: bugfix")
+
+    def test_list_reads_the_suites_of_a_config(self) -> None:
+        out = self.call("suite", "list", "--config", self.write_config(), code=None)
+        self.assertIn("fizz  1.0.0  capability", out)
+
+    def test_list_pluralizes_tasks_and_shows_a_dash_without_tags(self) -> None:
+        document = json.loads((self.suite / "suite.json").read_text())
+        document["tasks"][0].pop("tags")
+        document["tasks"].append(dict(document["tasks"][0], id="second"))
+        (self.suite / "suite.json").write_text(json.dumps(document))
+        self.assertIn("2 tasks  tags: -", self.call("suite", "list", str(self.suite), code=None))
+
+    def test_list_without_paths_or_config_is_a_usage_error(self) -> None:
+        self.assertIn("give suite directories or --config", self.call("suite", "list", code=2))
+
+    def test_list_of_a_bad_suite_exits_with_the_problem(self) -> None:
+        (self.suite / "suite.json").write_text("{}")
+        self.assertIn("missing key", self.call("suite", "list", str(self.suite), code=1))
+
+    def test_validate_static_reports_ok_per_suite(self) -> None:
+        out = self.call("suite", "validate", str(self.suite), code=None)
+        self.assertEqual(out.strip(), "ok    fizz@1.0.0 (1 task)")
+
+    def test_validate_static_fails_with_the_message_and_still_checks_the_other_suites(self) -> None:
+        bad = self.base / "suites" / "bad"
+        bad.mkdir()
+        (bad / "suite.json").write_text("{}")
+        out = self.call("suite", "validate", str(bad), str(self.suite), code=1)
+        self.assertIn("FAIL  ", out)
+        self.assertIn("missing key", out)
+        self.assertIn("ok    fizz@1.0.0", out)
+
+    def test_validate_static_checks_the_tasks_the_way_run_does(self) -> None:
+        document = json.loads((self.suite / "suite.json").read_text())
+        document["tasks"][0]["graders"] = [{"type": "command"}]
+        (self.suite / "suite.json").write_text(json.dumps(document))
+        out = self.call("suite", "validate", str(self.suite), code=1)
+        self.assertIn("task fizz/fizzbuzz", out)
+
+    def test_validate_defaults_to_the_suites_of_the_config(self) -> None:
+        self.assertIn("ok    fizz@1.0.0", self.call("suite", "validate", "--config", self.write_config(), code=None))
+
+    def test_validate_run_reports_ok_when_the_tests_fail_untouched_and_pass_with_the_solution(self) -> None:
+        out = self.call("suite", "validate", "--run", "--allow-unsandboxed", str(self.suite), code=None)
+        self.assertIn("fizz/fizzbuzz: ok", out)
+
+    def test_validate_run_flags_a_task_whose_untouched_repo_already_passes(self) -> None:
+        (self.suite / "fizzbuzz" / "repo" / "fizzbuzz.py").write_text(fixtures.FIXED_FIZZBUZZ)
+        out = self.call("suite", "validate", "--run", "--allow-unsandboxed", str(self.suite), code=1)
+        self.assertIn("fizz/fizzbuzz: trivially passing", out)
+
+    def test_validate_run_flags_a_solution_that_fails_the_tests(self) -> None:
+        buggy = (fixtures.FIZZBUZZ / "repo" / "fizzbuzz.py").read_text()
+        (self.suite / "fizzbuzz" / "solution" / "fizzbuzz.py").write_text(buggy)
+        out = self.call("suite", "validate", "--run", "--allow-unsandboxed", str(self.suite), code=1)
+        self.assertIn("fizz/fizzbuzz: solution fails", out)
+
+    def test_a_static_failure_skips_the_behavioral_run_of_the_valid_suites(self) -> None:
+        bad = self.base / "suites" / "bad"
+        bad.mkdir()
+        (bad / "suite.json").write_text("{}")
+        out = self.call("suite", "validate", "--run", "--allow-unsandboxed", str(bad), str(self.suite), code=1)
+        self.assertIn("FAIL  ", out)
+        self.assertNotIn("fizz/fizzbuzz", out)
+
+    def test_validate_run_does_not_write_through_a_symlink_the_solution_meets_in_the_workdir(self) -> None:
+        """A suite with a symlink never loads, so `validate --run` never copies a solution through one."""
+        outside = fixtures.tmpdir(self)
+        (self.suite / "fizzbuzz" / "repo" / "esc").symlink_to(outside, target_is_directory=True)
+        (self.suite / "fizzbuzz" / "solution" / "esc").mkdir()
+        (self.suite / "fizzbuzz" / "solution" / "esc" / "PWNED").write_text("x")
+        out = self.call("suite", "validate", "--run", "--allow-unsandboxed", str(self.suite), code=1)
+        self.assertIn("symlink esc", out)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_validate_run_flags_a_task_without_a_solution_and_does_not_run_it(self) -> None:
+        document = json.loads((self.suite / "suite.json").read_text())
+        del document["tasks"][0]["solution"]
+        (self.suite / "suite.json").write_text(json.dumps(document))
+        out = self.call("suite", "validate", "--run", "--allow-unsandboxed", str(self.suite), code=1)
+        self.assertIn("fizz/fizzbuzz: no solution", out)
+
+    def test_validate_run_without_a_sandbox_refuses_like_run(self) -> None:
+        out = self.call("suite", "validate", "--run", str(self.suite), code=1)
+        self.assertIn("No sandbox configured", out)
+        self.assertNotIn("fizz/fizzbuzz", out)
+
+    def test_validate_run_uses_the_sandbox_prefix_of_the_config(self) -> None:
+        marker = self.base / "sandboxed.txt"
+        self.cfg["sandbox"] = {"prefix": ["env", f"MARKER={marker}"]}
+        calls: list[list[str]] = []
+        real_run_proc = importlib.import_module("harness_bench").run_proc
+
+        def spy(argv: list[str], *rest: Any) -> Any:
+            calls.append(argv)
+            return real_run_proc(argv, *rest)
+
+        with mock.patch("harness_bench.run_proc", spy):
+            out = self.call("suite", "validate", "--run", "--config", self.write_config(), code=None)
+        self.assertIn("fizz/fizzbuzz: ok", out)
+        self.assertTrue(calls and all(c[:2] == ["env", f"MARKER={marker}"] for c in calls), calls)
+
+    def test_validate_run_runs_repo_code_in_a_workdir_outside_the_suite_and_removes_it(self) -> None:
+        work = fixtures.tmpdir(self) / "work"
+        self.cfg["work_dir"] = str(work)
+        self.cfg["tasks"] = []
+        out = self.call("suite", "validate", "--run", "--allow-unsandboxed", "--config", self.write_config(), code=None)
+        self.assertIn("fizz/fizzbuzz: ok", out)
+        self.assertEqual([p.name for p in work.iterdir() if not p.name.startswith(".")], ["logs"])
+        self.assertEqual(sorted(p.name for p in self.suite.iterdir()), ["fizzbuzz", "suite.json"])
+
+    def test_validate_run_keeps_the_env_allowlist_and_redacts_the_spend_key(self) -> None:
+        secret = "-".join(["spend", "fake", "value", "12345"])  # built at runtime so secret scanners skip it
+        self.cfg["litellm"] = {"base_url": "http://localhost:1", "api_key": "${HB_TEST_SPEND_KEY}"}
+        document = json.loads((self.suite / "suite.json").read_text())
+        document["tasks"][0]["setup"] = f"echo spend=${{HB_TEST_SPEND_KEY:-unset}} >&2; echo {secret}"
+        (self.suite / "suite.json").write_text(json.dumps(document))
+        work = fixtures.tmpdir(self) / "work"
+        self.cfg["work_dir"] = str(work)
+        with mock.patch.dict("os.environ", {"HB_TEST_SPEND_KEY": secret}):
+            self.call("suite", "validate", "--run", "--allow-unsandboxed", "--config", self.write_config(), code=None)
+        log = next((work / "logs").glob("*.setup.log")).read_text()
+        self.assertEqual((secret in log, "spend=unset" in log, "***REDACTED***" in log), (False, True, True))
 
 
 class ReportOptionsTests(unittest.TestCase):

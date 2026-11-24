@@ -100,6 +100,7 @@ defense; runners and graders are pure adapters that the engine calls.
 | `hbench/graders/base.py` | `Grader` protocol, `GradeContext` (with the injected `run`), `Change`, `parse_score`. |
 | `hbench/graders/{hidden_tests,command,diff_constraints}.py` | The bundled graders. |
 | `hbench/graders/compose.py`, `registry.py` | `compose` (`all`, `any`, `weighted`), `GRADERS`, `grader_for`, `grade_plan` (the graders of a task). |
+| `hbench/suites.py` | Suites as data (Phase 4, [ADR 0008](adr/0008-suites-as-data.md)): `load_suite` validates `suite.json` and keeps every path inside the suite directory, `suite_tasks` expands a suite into engine task dicts (`<suite>/<task>`). The engine's `expand_suites` appends them to `tasks`; `validate_task_behavior` runs the untouched and the solution check through `prepare_workdir` and `run_step`. |
 | `hbench/plugins.py` | Entry-point loading with clear `PluginError`s. Only reached for a type that is not built in. |
 
 In `cmd_run`: the runner builds the agent argv and parses usage; `collect_changes` captures the diff right

@@ -51,7 +51,7 @@ def git(cwd: Path, *args: str) -> None:
 def make_git_task(tmp: Path) -> tuple[str, str]:
     """Repo with a buggy commit followed by the fix: the agent must only see the first."""
     repo = tmp / "gitrepo"
-    shutil.copytree(ROOT / "tasks" / "fizzbuzz" / "repo", repo)
+    shutil.copytree(fixtures.FIZZBUZZ / "repo", repo)
     (repo / "run_tests.py").write_text(
         "import sys, unittest\n"
         "r = unittest.main(module='test_hidden', exit=False).result\n"
@@ -71,7 +71,7 @@ def main() -> None:
     hide_work = Path(tempfile.mkdtemp(prefix="hb-smoke-work-"))
     try:
         fixtures.copy_engine(tmp)
-        shutil.copytree(ROOT / "tasks" / "fizzbuzz", tmp / "tasks" / "fizzbuzz")
+        shutil.copytree(fixtures.FIZZBUZZ, tmp / "tasks" / "fizzbuzz")
         tags_file, probe_file = tmp / "tags.txt", tmp / "probe.jsonl"
         marker = tmp / "host-exec-marker"
         os.environ.update(
@@ -238,6 +238,108 @@ def main() -> None:
         check(
             "***REDACTED***" in text and fake_litellm.KEY not in text and API_KEY not in text,
             "grader logs: spend key and harness secrets redacted",
+        )
+
+        # --- contamination guard: hidden tests are never copied into the workdir before grading, and an
+        # unsandboxed agent cannot find them from its workdir or its parents. It CAN read the suite sources
+        # elsewhere on the host (the sandbox, which mounts only the workdir, is what stops that).
+        example_hidden = sorted((ROOT / "suites" / "examples-capability").glob("*/hidden_tests/test_*.py"))
+        hidden_names = ",".join(p.name for p in example_hidden)
+        probe_env = dict(harness_env, FAKE_HIDDEN_NAMES=hidden_names)
+        cfg7 = dict(
+            cfg,
+            output_dir="results-probe",
+            tasks=[fizz],
+            harnesses={"claude": fixtures.harness("claude", probe_env, "probe-hidden")},
+            matrix=[{"harness": "claude", "model": "m"}],
+        )
+        (tmp / "config7.json").write_text(json.dumps(cfg7))
+        run(tmp, "harness_bench.py", "run", "--allow-unsandboxed", config="config7.json")
+        (probe_row,) = results(tmp / "results-probe/results.jsonl")
+        check(
+            probe_row["agent_rc"] == 0, "contamination guard: no hidden test file or marker in the workdir or parents"
+        )
+
+        # positive controls: the probe must find a leak wherever it claims to look, at the depth of the real hidden
+        # tests (`tasks/<task>/hidden_tests/<file>`, three levels down, four from the temp dir)
+        agent_env = {k: v for k, v in os.environ.items() if k not in ("FAKE_KEY", "SECRET_CANARY")}
+        agent_env["FAKE_HIDDEN_NAMES"] = hidden_names
+        planted = example_hidden[0]
+
+        def probe_from(cwd: Path, **extra_env: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [PY, str(ROOT / "tests" / "fake_agent.py"), "claude", "probe-hidden"],
+                cwd=cwd,
+                env=dict(agent_env, **extra_env),
+                capture_output=True,
+                text=True,
+            )
+
+        for label, leak_name, text in (
+            ("file name", planted.name, ""),
+            ("marker", "notes.py", planted.read_text()),
+        ):
+            seen = tmp / f"seen-{leak_name}"
+            seen.mkdir()
+            (seen / leak_name).write_text(text)
+            probe = probe_from(seen)
+            check(probe.returncode == 7 and leak_name in probe.stderr, f"contamination guard: finds a leaked {label}")
+
+        deep = tmp / "seen-deep"
+        (deep / "a" / "b" / "c" / "d" / "e" / "f").mkdir(parents=True)
+        (deep / "a" / "b" / "c" / "d" / "e" / "f" / "notes.py").write_text(planted.read_text())
+        check(probe_from(deep).returncode == 7, "contamination guard: finds a leak six levels down the workdir")
+
+        parent = tmp / "seen-parent"
+        (parent / "work").mkdir(parents=True)
+        (parent / planted.name).write_text("")
+        check(probe_from(parent / "work").returncode == 7, "contamination guard: finds a leak in a parent directory")
+
+        clean = tmp / "seen-clean"
+        clean.mkdir()
+        check(probe_from(clean).returncode == 0, "contamination guard: a clean workdir passes")
+        reach = probe_from(clean, FAKE_SCAN_ROOTS=str(tmp))
+        check(
+            reach.returncode == 7 and "tasks/fizzbuzz/hidden_tests" in reach.stderr,
+            "unsandboxed agents CAN read the benchmark dir: hidden-test isolation needs the sandbox",
+        )
+
+        # --- an agent that plants a symlink at a hidden test path cannot make the grader write a host file
+        canary = tmp / "host-canary.txt"
+        canary.write_text("host file")
+        link_env = dict(harness_env, FAKE_CANARY_FILE="${FAKE_CANARY_FILE}")
+        os.environ["FAKE_CANARY_FILE"] = str(canary)
+        cfg8 = dict(
+            cfg,
+            output_dir="results-link",
+            tasks=[fizz],
+            harnesses={"claude": fixtures.harness("claude", link_env, "plant-link")},
+            matrix=[{"harness": "claude", "model": "m"}],
+        )
+        (tmp / "config8.json").write_text(json.dumps(cfg8))
+        run(tmp, "harness_bench.py", "run", "--allow-unsandboxed", config="config8.json")
+        (link_row,) = results(tmp / "results-link/results.jsonl")
+        check(
+            canary.read_text() == "host file", "grader: a symlink planted at a hidden test path is not written through"
+        )
+        check(link_row["passed"], "grader: the hidden tests still run after the planted symlink is replaced")
+
+        # --- a suite with a symlink is refused, so a solution is never copied through one
+        link_suite = fixtures.write_fizzbuzz_suite(tmp, "linked")
+        outside = tmp / "outside-suite"
+        outside.mkdir()
+        (link_suite / "fizzbuzz" / "repo" / "esc").symlink_to(outside, target_is_directory=True)
+        (link_suite / "fizzbuzz" / "solution" / "esc").mkdir()
+        (link_suite / "fizzbuzz" / "solution" / "esc" / "PWNED").write_text("x")
+        p = subprocess.run(
+            [PY, "-m", "hbench", "suite", "validate", "--run", "--allow-unsandboxed", str(link_suite)],
+            cwd=tmp,
+            capture_output=True,
+            text=True,
+        )
+        check(
+            p.returncode != 0 and "symlink esc" in p.stdout and not list(outside.iterdir()),
+            "suite loader: a symlink in a suite is rejected and nothing is written outside",
         )
 
         # --- config validation and URL policy

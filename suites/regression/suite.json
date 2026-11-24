@@ -1,0 +1,28 @@
+{
+  "schema_version": "1.0.0",
+  "name": "regression",
+  "version": "1.0.0",
+  "kind": "regression",
+  "description": "Tasks every healthy harness x model pair solves. A failure here means the setup is broken, not that the model is weak.",
+  "tasks": [
+    {
+      "id": "fizzbuzz",
+      "repo": "fizzbuzz/repo",
+      "prompt": "The function fizzbuzz in fizzbuzz.py has bugs. Fix it so fizzbuzz(n) returns 'Fizz' for multiples of 3, 'Buzz' for multiples of 5, 'FizzBuzz' for multiples of both, and str(n) otherwise. Do not ask questions.",
+      "hidden_tests": "fizzbuzz/hidden_tests",
+      "test": "python3 -m unittest -q test_hidden.py",
+      "solution": "fizzbuzz/solution",
+      "protected_paths": [],
+      "tags": [
+        "python",
+        "bugfix",
+        "smoke"
+      ],
+      "provenance": {
+        "source": "synthetic",
+        "license": "MIT",
+        "url": null
+      }
+    }
+  ]
+}

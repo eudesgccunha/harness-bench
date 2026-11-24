@@ -20,8 +20,8 @@ py, pyl, cfgl, cfg, pim, ocj, cdx, fz, th = map(
         "pi-models.example.json",
         "opencode.example.json",
         "codex-config.example.toml",
-        "tasks/fizzbuzz/repo/fizzbuzz.py",
-        "tasks/fizzbuzz/hidden_tests/test_hidden.py",
+        "suites/regression/fizzbuzz/repo/fizzbuzz.py",
+        "suites/regression/fizzbuzz/hidden_tests/test_hidden.py",
     ],
 )
 smoke, fagent, flite, tgold, tfix, tpars, twork, trun, tlite, dock, entry, de2e, dign = map(
@@ -71,6 +71,7 @@ HBENCH_SOURCES = [
     "hbench/stats.py",
     "hbench/report.py",
     "hbench/profiles.py",
+    "hbench/suites.py",
     "hbench/cli.py",
     "hbench/__main__.py",
 ]
@@ -84,12 +85,31 @@ HBENCH_TESTS = [
     "tests/test_runners.py",
     "tests/test_graders.py",
     "tests/test_plugins.py",
+    "tests/test_suites.py",
 ]
 
 
 def file_blocks(paths: list[str]) -> str:
     """One heading-less `path` + fenced Python block per file."""
     return "".join(f"`{p}`:\n\n```python\n{R(p)}```\n\n" for p in paths)
+
+
+SUITE_FILES = [
+    "suites/regression/suite.json",
+    "suites/examples-capability/suite.json",
+]
+
+
+def suite_blocks(paths: list[str]) -> str:
+    """One `path` + fenced JSON block per suite file."""
+    return "".join(f"`{p}`:\n\n```json\n{R(p)}```\n\n" for p in paths)
+
+
+def suite_tree() -> str:
+    """The files of the example suites, one path per line (the suite files above hold the task definitions)."""
+    return "\n".join(
+        sorted(str(f.relative_to(b)) for f in (b / "suites").rglob("*") if f.is_file() and "__pycache__" not in f.parts)
+    )
 
 
 hbench_md = file_blocks(HBENCH_SOURCES)
@@ -150,7 +170,7 @@ If a run shows cost `n/a`, its tag did not reach LiteLLM. See the "LiteLLM: what
 harness-bench/
 ├── harness_bench.py
 ├── harness_bench_litellm.py     # LiteLLM-only variant (no Cursor)
-├── hbench/                      # data contract, report and single CLI (ADR 0005)
+├── hbench/                      # data contract, report, suites and single CLI (ADR 0005, 0008)
 ├── README.md / AGENTS.md
 ├── scripts/build_md.py          # generates this HARNESS_BENCH.md
 ├── sandbox/Dockerfile           # sandbox image with the CLIs
@@ -162,10 +182,10 @@ harness-bench/
 ├── pi-models.example.json       # goes to ~/.pi/agent/models.json
 ├── opencode.example.json        # goes to ~/.config/opencode/opencode.json (or the project's opencode.json)
 ├── codex-config.example.toml    # snippet for ~/.codex/config.toml
-└── tasks/
-    └── fizzbuzz/
-        ├── repo/fizzbuzz.py
-        └── hidden_tests/test_hidden.py   # copied in only AFTER the agent runs
+└── suites/                      # versioned suites of tasks (ADR 0008)
+    ├── regression/              # kind "regression": tasks every healthy pair solves
+    │   └── fizzbuzz/            # repo/, hidden_tests/ (copied in only AFTER the agent runs), solution/
+    └── examples-capability/     # kind "capability": dependency-upgrade, path-traversal-fix, extract-function
 ```
 
 ## Step by step
@@ -227,6 +247,7 @@ Besides the cost and token columns, the main table of `summary.md` shows how sur
 | Negative control | Pairs whose harness uses `parser: null`. Any pass prints a warning: the tests are too lenient. Null pairs are left out of the recommendation, ties, frontier and discrimination, and sort last. |
 | Discrimination | Tasks every non-null run solved (saturated) and tasks no run solved. They do not separate the pairs. `report --drop-saturated` removes the saturated ones before aggregating (also accepted by `run` and `reconcile`, which print the report). |
 | Paired comparison | Exact two-sided McNemar test between the best-ranked pair and every other pair, pairing runs by task and rep. `b` counts runs only the best pair solved, `c` runs only the other pair solved. |
+| By suite kind | Only when the trials come from more than one suite kind (`capability`, `regression`): solved/runs per pair for each kind, and a warning for every regression task a non-null pair did not solve. |
 | Repetitions | Reps per task needed for a pass-rate interval at most `target_ci_width` wide (config, default 0.20), at the observed pass rate; `more than N` when 10,000 total runs are not enough. |
 
 Both config keys are optional: `recommend_within_pp` is a number from 0 to 100, `target_ci_width` a number above 0 and up to 1.
@@ -320,7 +341,7 @@ The agents run **without asking for approval**, and the `test` command executes 
 
 What the script does on every run:
 
-1. **Workdir outside the benchmark repository**: a new temporary directory, or an absolute `work_dir` outside the repository (the script rejects a path inside it). So the agent does not work next to hidden tests, config and results.
+1. **Workdir outside the benchmark repository**: a new temporary directory, or a `work_dir` outside the repository (a relative path is relative to the config directory; the script rejects a path inside the repository). So the agent does not work next to hidden tests, config and results.
 2. **No git history**: the task repository is copied without `.git`. A clone at the commit before the fix would still contain the fix commit, and the remote would point back to the benchmark. The single `baseline` commit lives in a private temporary git directory outside the workdir and `work_dir` (deleted after the trial). Every git call on the workdir ignores its `.git`, `.gitignore`, `.gitattributes`, replace refs and git config, and every diff starts from a fresh index, so the agent cannot hide a change or run a command on the host through git. If the agent leaves a `.git` anywhere in the workdir, or `git add` fails (for example on an unreadable file), its changes count as unknown and `diff_constraints` fails; a binary file counts as more than any `max_changed_lines`. This works on any git version (an `info/attributes` file in the baseline git directory does the work; git 2.40 or newer adds `--attr-source` as a second layer). The guarantee holds for sandboxed runs: an unsandboxed agent runs as your user and could find and edit the temporary git directory.
 3. **Minimal environment**: the agent gets only `PATH`, `HOME`, `USER`, locale, `TERM`, `TMPDIR`, the variables in `env_passthrough` and those in the harness `env` block. `setup` and `test` get the same, without the harness `env`. The LiteLLM spend-read key (`litellm.api_key`) **never** reaches the agent: the script rejects a config that tries to pass it through.
 4. **Protected files**: before the agent runs, each path in `protected_paths` is copied outside the workdir. Before the test, that content is restored and anything the agent created there is deleted. Use it for the test runner and configs (`tests/`, `package.json`, `pytest.ini`, `conftest.py`, `vitest.config.ts`). Without it, an agent can "solve" the task by making the test always pass.
@@ -328,6 +349,8 @@ What the script does on every run:
 6. **Logs without secrets**: values of the harness `env` variables and the spend key are replaced with `***REDACTED***`.
 7. **Config validation**: task ids and harness names accept only letters, digits, `_`, `.` and `-`. `repo` and `ref` cannot start with `-`. `protected_paths` must be relative and without `..`. The script deletes only directories inside the work root.
 8. **LiteLLM**: `base_url` must use `https` (http only for localhost), and redirects are not followed, so the key does not go to another host.
+9. **Copies never follow a link the agent planted**: the hidden tests (before grading) and the `solution` of `suite validate --run` are copied with `hbench/safe_copy.py`, which replaces any symlink (or hard-linked file) on the destination path with a regular file instead of writing through it. Otherwise an agent that plants `test_hidden.py -> ~/.bashrc` would make the grader overwrite a host file.
+10. **Git transports**: `git clone` of a task repo runs with `GIT_ALLOW_PROTOCOL`: `https:ssh:file` for the tasks of your config, `https` only for suite tasks, so a suite can never clone a private local repo or use your SSH keys. The clone from the local cache into the workdir allows `file` alone.
 
 What the script does **not** solve on its own: without a sandbox, the agent runs as your user and can read any of your files (including `~/.ssh`) and tamper with results. That is why `run` requires `sandbox.prefix` or `--allow-unsandboxed`.
 
@@ -376,6 +399,8 @@ The `prefix` in the example configs mounts only the workdir, at the same path, a
 Integrating it would need a dedicated backend: create the sandbox, upload the workdir, run, download the result and destroy it. It is worth it when you need to restrict the agents' egress.
 
 ## Choosing tasks
+
+A task lives in a suite (see [Suites](#suites)): add it to a `suite.json` with its `solution`, bump the suite `version`, and run `suite validate --run` before using it. The list below applies to every task.
 
 - Use real bugs that were already fixed, with `ref` = the commit before the fix.
 - Write the prompt like an issue, with no hint of the solution.
@@ -440,14 +465,48 @@ New code lives in the `hbench/` package ([ADR 0005](docs/adr/0005-data-contract-
 ```json
 {cfg}```
 
-## Example task
+## Suites
 
-`tasks/fizzbuzz/repo/fizzbuzz.py` (deliberate bugs):
+A suite is a directory with a `suite.json` and the files it points to. A config lists them in `suites` (directories relative to the config); their tasks are appended to `tasks` with the id `<suite>/<task>`. A config without `suites` works as before. ([ADR 0008](docs/adr/0008-suites-as-data.md))
+
+`suite.json` has `schema_version` (`"1.0.0"`), `name` (`[a-z0-9-]+`), `version` (`MAJOR.MINOR.PATCH`), `kind` (`"capability"` or `"regression"`), `description` and `tasks`. A task takes the keys of a config task (`id`, `repo`, `ref`, `prompt`, `test`, `hidden_tests`, `setup`, `timeout`, `setup_timeout`, `test_timeout`, `protected_paths`, `graders`, `grade`) and:
+
+- `tags`: a list of strings;
+- `solution`: a directory with the reference files, copied over the repo by `suite validate --run`;
+- `provenance`: `{{"source": ..., "license": ..., "url": ... or null}}` (required).
+
+Paths are relative to the suite directory and must stay inside it (no absolute path, no `..`). A suite holds **no symlinks** at all in `repo`, `hidden_tests` or `solution` (a link could reach a host path or the hidden tests when the directory is copied). A suite `repo` directory must not be a git repository (no `.git`, no name ending in `.git`): use an `https://` URL with `ref`, or a plain directory. A suite is someone else's data, so `repo` may be a directory of the suite or an `https://` URL: `file://`, `ssh://`, `git@host:...` and `ext::` are rejected. A task in your own config keeps every form. A config task must not set the keys the engine adds to suite tasks (`suite`, `suite_kind`, `suite_label`, `suite_dir`, `solution`). Unknown keys are an error. `capability` suites hold hard tasks with a low pass rate; `regression` suites hold tasks every healthy pair solves, and the report flags a pair that fails one.
+
+```bash
+python3 -m hbench suite list     [--config C | PATH...]     # name, version, kind, task count and tags
+python3 -m hbench suite validate [--config C] PATH...       # static checks and the engine's config checks
+python3 -m hbench suite validate --run --allow-unsandboxed PATH...
+```
+
+`--run` is the behavioral check: for every task the graders must **fail** on the untouched repo and **pass** once `solution` is copied in. It runs repo and test code, so it goes through the same engine path as `run` (workdir outside the repo, `wrap()`, env allowlist, redacted logs) and follows the same sandbox rule: set `sandbox.prefix` in a `--config`, or pass `--allow-unsandboxed` inside a disposable VM. One line per task: `ok`, `trivially passing` or `solution fails`; the exit code is 1 when any task is not ok.
+
+The report adds `## By suite kind` (solved/runs per pair for each kind) when the trials come from more than one kind, and a warning for every regression task a non-null pair did not solve. Without suites the report does not change.
+
+`RunInfo.suite_version` records `name@version` of every suite used, then a hash of the tasks (the directories of a suite task enter the hash relative to the suite directory, so it does not depend on the checkout path; a git URL stays in it).
+
+The example suites hold synthetic code written for this repository (MIT), standard library only, no network: `regression/fizzbuzz`, and `examples-capability` with `dependency-upgrade` (migrate a caller to the API of a vendored library), `path-traversal-fix` (CWE-22 "zip slip" in an archive extractor) and `extract-function` (a refactor guarded by existing tests). Every hidden test file carries a marker comment. What `tests/smoke.py` proves, exactly: hidden tests are never copied into the workdir before grading, and an unsandboxed fake agent cannot find them in its workdir (searched recursively) or in its parent directories. Positive controls plant a leak at the real depth of a hidden test and the probe must find it. It does **not** prove isolation from the rest of the host: an unsandboxed agent runs as your user and can read anything you can, including the suite sources (the same smoke test shows a probe over the benchmark directory finds them). Real isolation of the hidden tests needs the sandbox, which mounts only the workdir. A clone proves the tasks are sound with:
+
+```bash
+python3 -m hbench suite validate --run --allow-unsandboxed suites/regression suites/examples-capability
+```
+
+{suite_blocks(SUITE_FILES)}Files of the example suites:
+
+```
+{suite_tree()}
+```
+
+`suites/regression/fizzbuzz/repo/fizzbuzz.py` (deliberate bugs):
 
 ```python
 {fz}```
 
-`tasks/fizzbuzz/hidden_tests/test_hidden.py`:
+`suites/regression/fizzbuzz/hidden_tests/test_hidden.py`:
 
 ```python
 {th}```

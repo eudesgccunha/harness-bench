@@ -338,6 +338,58 @@ class ToolCallStatisticsTests(unittest.TestCase):
         self.assertEqual([fmt_tool_calls(v) for v in (None, math.inf, 0.0, 2.55)], ["n/a", "inf", "0.0", "2.5"])
 
 
+KINDS = {"cap": "capability", "reg": "regression"}
+
+
+class SuiteKindTests(unittest.TestCase):
+    """`## By suite kind`: only when the trials come from more than one suite kind."""
+
+    def mixed(self, regression: list[bool], capability: list[bool] | None = None) -> list[Any]:
+        return [
+            *pair_trials("h", "m", capability or [True, False], task="cap/a"),
+            *pair_trials("h", "m", regression, task="reg/b"),
+            *pair_trials("g", "m", [True, True], task="reg/b"),
+            *pair_trials("g", "m", [True, True], task="cap/a"),
+        ]
+
+    def test_solved_over_runs_per_pair_and_kind(self) -> None:
+        md = render(self.mixed([True, True]), suite_kinds=KINDS)
+        self.assertIn("## By suite kind", md)
+        self.assertIn("| capability | 2/2 | 1/2 |", md)
+        self.assertIn("| regression | 2/2 | 2/2 |", md)
+
+    def test_a_failed_regression_task_is_flagged_for_its_pair(self) -> None:
+        md = render(self.mixed([True, False]), suite_kinds=KINDS)
+        self.assertIn("**Warning:** regression tasks failed: h/m (reg/b 1/2)", md)
+
+    def test_no_warning_when_every_regression_task_passed(self) -> None:
+        self.assertNotIn("Warning:** regression", render(self.mixed([True, True]), suite_kinds=KINDS))
+
+    def test_a_null_control_failing_a_regression_task_is_not_flagged(self) -> None:
+        trials = [*self.mixed([True, True]), *pair_trials("n", "none", [False], task="reg/b")]
+        md = render(trials, null=("n",), suite_kinds=KINDS)
+        self.assertNotIn("Warning:** regression", md)
+
+    def test_a_pair_missing_from_a_kind_shows_a_dash(self) -> None:
+        trials = [*pair_trials("h", "m", [True], task="cap/a"), *pair_trials("g", "m", [True], task="reg/b")]
+        self.assertIn("| capability | 1/1 | - |", render(trials, suite_kinds=KINDS))
+
+    def test_one_kind_only_adds_no_section(self) -> None:
+        trials = pair_trials("h", "m", [True], task="reg/b")
+        self.assertNotIn("By suite kind", render(trials, suite_kinds=KINDS))
+
+    def test_tasks_of_unknown_suites_and_config_tasks_are_left_out(self) -> None:
+        trials = [*pair_trials("h", "m", [True], task="plain"), *pair_trials("h", "m", [True], task="zzz/x")]
+        self.assertNotIn("By suite kind", render(trials, suite_kinds=KINDS))
+
+    def test_a_config_task_named_like_a_suite_does_not_count_as_that_suite(self) -> None:
+        trials = [*pair_trials("h", "m", [True], task="cap/a"), *pair_trials("h", "m", [True], task="reg")]
+        self.assertNotIn("By suite kind", render(trials, suite_kinds=KINDS))
+
+    def test_without_suite_kinds_the_report_has_no_section(self) -> None:
+        self.assertNotIn("By suite kind", render(self.mixed([True, True])))
+
+
 class WriteCsvTests(unittest.TestCase):
     def test_writes_header_and_one_line_per_pair(self) -> None:
         path: Path = fixtures.tmpdir(self) / "s.csv"

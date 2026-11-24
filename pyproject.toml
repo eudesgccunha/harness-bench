@@ -33,8 +33,8 @@ select = ["E", "F", "W", "B", "UP", "ANN"]
 ignore = ["UP036", "ANN401"]
 
 [tool.ruff.lint.per-file-ignores]
-# ANN: the sample tasks are the code under test (a deliberately buggy repo), not part of the typed codebase.
-"tasks/**" = ["ANN"]
+# ANN: the fizzbuzz sample is the code under test (a deliberately buggy repo), not part of the typed codebase.
+"suites/regression/fizzbuzz/**" = ["ANN"]
 # E501: long prose lines in the doc generator.
 "scripts/build_md.py" = ["E501"]
 # E501: long prose strings in the fake agent.
