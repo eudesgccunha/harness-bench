@@ -337,5 +337,27 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(trial().schema_version, SCHEMA_VERSION)
 
 
+class ToolCallsTests(unittest.TestCase):
+    def test_tool_calls_default_to_unknown_and_round_trip(self) -> None:
+        self.assertIsNone(usage().tool_calls)
+        for calls in (None, 0, 7):
+            self.assertEqual(Usage.from_dict(usage(tool_calls=calls).to_dict()).tool_calls, calls)
+
+    def test_a_1_0_0_trial_without_tool_calls_still_loads(self) -> None:
+        d = trial().to_dict()
+        del d["usage"]["tool_calls"]
+        d["schema_version"] = "1.0.0"
+        loaded = TrialResult.from_dict(d)
+        self.assertEqual((loaded.usage.tool_calls, loaded.schema_version), (None, "1.0.0"))
+
+    def test_the_current_contract_version_is_1_1_0(self) -> None:
+        self.assertEqual((SCHEMA_VERSION, trial().schema_version), ("1.1.0", "1.1.0"))
+
+    def test_tool_calls_must_be_a_whole_number_of_at_least_zero(self) -> None:
+        for bad in (-1, 1.5, True, "3"):
+            with self.assertRaises(ContractError, msg=repr(bad)):
+                usage(tool_calls=bad)
+
+
 if __name__ == "__main__":
     unittest.main()

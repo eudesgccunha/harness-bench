@@ -115,6 +115,28 @@ class TrialFromRowTests(unittest.TestCase):
         self.assertTrue(all("t1" in w for w in warnings))
         self.assertTrue(any("input" in w for w in warnings) and any("cost_reported" in w for w in warnings))
 
+    def test_tool_calls_come_from_the_row_and_default_to_unknown(self) -> None:
+        self.assertEqual(
+            [
+                convert(dict(MINIMAL_ROW, **extra)).usage.tool_calls
+                for extra in ({}, {"tool_calls": None}, {"tool_calls": 3})
+            ],
+            [None, None, 3],
+        )
+
+    def test_a_bad_tool_call_count_becomes_unknown_and_keeps_everything_else(self) -> None:
+        for bad in (-1, True, 1.5, "2", float("nan")):
+            warnings: list[str] = []
+            t = trial_from_row_lenient(
+                dict(MINIMAL_ROW, tool_calls=bad), run_id="r" * 32, suite_version="s1", warn=warnings.append
+            )
+            self.assertEqual((t.usage.tool_calls, t.usage.parsed, t.usage.total_tokens), (None, True, 117), repr(bad))
+            self.assertTrue(len(warnings) == 1 and "tool_calls" in warnings[0], repr(bad))
+
+    def test_a_bad_tool_call_count_is_dropped_silently_without_a_warn_callback(self) -> None:
+        t = trial_from_row_lenient(dict(MINIMAL_ROW, tool_calls=-1), run_id="r" * 32, suite_version="s1")
+        self.assertIsNone(t.usage.tool_calls)
+
     def test_a_valid_gateway_cost_survives_a_bad_harness_cost(self) -> None:
         warnings: list[str] = []
         row = dict(MINIMAL_ROW, cost_litellm=0.5, cost_computed=0.2, cost_reported=True)
@@ -387,7 +409,8 @@ class RunOutputTests(RunTestCase):
             sorted(row),
             sorted(
                 "ts task harness model rep passed agent_rc agent_timed_out wall_s parse_ok run_tag t_start t_end "
-                "sandboxed input output reasoning cache_read cache_write cost_reported turns cost_computed".split()
+                "sandboxed input output reasoning cache_read cache_write cost_reported turns tool_calls "
+                "cost_computed".split()
             ),
         )
 

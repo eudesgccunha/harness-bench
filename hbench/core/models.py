@@ -15,7 +15,7 @@ from enum import Enum, StrEnum
 from types import MappingProxyType, UnionType
 from typing import Any, ClassVar, Self, get_args, get_origin, get_type_hints
 
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = "1.1.0"
 _VERSION_RE = re.compile(r"^(\d+)\.\d+\.\d+$")
 _MAJOR = SCHEMA_VERSION.split(".")[0]
 
@@ -262,6 +262,7 @@ _COUNT_FIELDS = (
     "cache_read_tokens",
     "cache_write_tokens",
     "turns",
+    "tool_calls",
 )
 
 
@@ -275,6 +276,7 @@ class Usage(_Model):
     turns: int = 0
     parsed: bool
     costs: Costs
+    tool_calls: int | None = None
 
     DERIVED_KEYS: ClassVar[tuple[str, ...]] = ("cost_usd", "cost_source")
     DECODERS: ClassVar[Mapping[str, Callable[[Any], Any]]] = {"costs": Costs.from_dict}

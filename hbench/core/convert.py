@@ -6,7 +6,7 @@ Phase 1 lack some keys (`parse_ok`, `sandboxed`, `cost_*`), so every optional ke
 
 import math
 import re
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
@@ -72,6 +72,7 @@ def trial_from_row(
     suite_version: str,
     harness_version: str = "unknown",
     test_timed_out: bool = False,
+    graders: Sequence[GraderResult] | None = None,
 ) -> TrialResult:
     target = Target(harness=row["harness"], harness_version=harness_version, model=row["model"], params={})
     passed = bool(row["passed"])
@@ -82,6 +83,7 @@ def trial_from_row(
         cache_read_tokens=_count("cache_read_tokens", row["cache_read"]),
         cache_write_tokens=_count("cache_write_tokens", row["cache_write"]),
         turns=_count("turns", row["turns"]),
+        tool_calls=None if row.get("tool_calls") is None else _count("tool_calls", row["tool_calls"]),
         parsed=bool(row.get("parse_ok", True)),
         costs=Costs(
             gateway=row.get("cost_litellm"), price_table=row.get("cost_computed"), harness=row.get("cost_reported")
@@ -95,7 +97,9 @@ def trial_from_row(
         target=target,
         rep=row["rep"],
         status=_status(passed, bool(row.get("agent_timed_out")) or test_timed_out),
-        graders=(GraderResult(grader="test", grader_version="1", passed=passed, timed_out=test_timed_out),),
+        graders=tuple(graders)
+        if graders is not None
+        else (GraderResult(grader="test", grader_version="1", passed=passed, timed_out=test_timed_out),),
         usage=usage,
         latency_s=row["wall_s"],
         started_at=_started_at(row),
@@ -137,6 +141,13 @@ def _sanitized(row: Mapping[str, Any], warn: Callable[[str], None] | None) -> di
             clean[key] = None
             if warn:
                 warn(f"warning: {_label(row)}: {key}: {e}; cost treated as unknown")
+    if row.get("tool_calls") is not None:
+        try:
+            _count("tool_calls", row["tool_calls"])
+        except ContractError as e:
+            clean["tool_calls"] = None
+            if warn:
+                warn(f"warning: {_label(row)}: {e}; tool calls treated as unknown")
     return clean
 
 
@@ -147,15 +158,16 @@ def trial_from_row_lenient(
     suite_version: str,
     harness_version: str = "unknown",
     test_timed_out: bool = False,
+    graders: Sequence[GraderResult] | None = None,
     warn: Callable[[str], None] | None = None,
 ) -> TrialResult:
     """Like `trial_from_row`, but fields that break the contract (negative, NaN, bool, fractional: parser output
     is untrusted) are dropped one by one instead of raising. See `_sanitized`."""
     kwargs = {"run_id": run_id, "suite_version": suite_version, "harness_version": harness_version}
     try:
-        return trial_from_row(row, test_timed_out=test_timed_out, **kwargs)
+        return trial_from_row(row, test_timed_out=test_timed_out, graders=graders, **kwargs)
     except ContractError:
-        return trial_from_row(_sanitized(row, warn), test_timed_out=test_timed_out, **kwargs)
+        return trial_from_row(_sanitized(row, warn), test_timed_out=test_timed_out, graders=graders, **kwargs)
 
 
 def trials_from_rows(rows: Iterable[Mapping[str, Any]], warn: Callable[[str], None] | None = None) -> list[TrialResult]:

@@ -12,9 +12,13 @@ current name in the existing config and results format until Phase 1 migrates it
 | Run | one `harness_bench.py run` call; contract model `RunInfo` (`run.json`) | All trials of one invocation, identified by `run_id`. |
 | Suite | `tasks` in the config | The list of tasks a run uses. |
 | Task | task (`id`, `repo`, `ref`, `prompt`, `test`, `hidden_tests`, `protected_paths`) | One problem with a starting repo and a way to grade it. |
-| Grader | `test` command + `hidden_tests` | Decides pass or fail. Today: exit code 0 without timeout means pass. |
+| Grader | task key `graders` (default: `test` command + `hidden_tests`); contract model `GraderResult` | Decides pass or fail and gives a score from 0 to 1. Bundled types: `hidden_tests`, `command`, `diff_constraints`. Several graders combine through the task key `grade` (`all`, `any`, `weighted`). |
+| Runner | harness entry (`command` + `parser`); `HarnessRunner` protocol | Adapter that builds the agent argv and parses its output. It never starts a process: the engine does. |
+| Plugin | entry point in `harness_bench.runners` or `harness_bench.graders` | A runner or grader shipped by another package. Built-in names always win. |
+| Score | `GraderResult.score`, the `SCORE:` line | Partial credit from 0 to 1. Pass or fail stays the exit code. |
+| Tool calls | `tool_calls` (usage), `Tool calls/run`, `Tool calls/solved` | Tool invocations the agent made, where the output exposes them; unknown is `None`, never `0`. |
 | Trial status | `passed` (bool) | Plan adds `error` and `timeout`. Today an agent crash or timeout counts as a failure. |
-| Usage | token fields in the row (`input`, `output`, `reasoning`, `cache_read`, `cache_write`, `turns`) | Tokens parsed from the harness output. |
+| Usage | token fields in the row (`input`, `output`, `reasoning`, `cache_read`, `cache_write`, `turns`, `tool_calls`) | Tokens and tool calls parsed from the harness output. |
 | Cost source | `cost_litellm`, `cost_computed`, `cost_reported` | Origin of a cost. Plan names: `gateway`, `price_table`, `harness`. Order of preference is the same. Unknown cost is `None`, never `0`. |
 | Gateway | LiteLLM | Proxy that bills the model calls and keeps spend logs. |
 | Bench tag | `run_tag`, `BENCH_TAG` | Per-trial tag sent as `x-litellm-tags`; `reconcile` matches spend logs by it. |

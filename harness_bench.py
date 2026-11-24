@@ -10,6 +10,7 @@ Usage:
   python3 harness_bench.py report --config config.json
 """
 
+import functools
 import json
 import os
 import platform
@@ -22,211 +23,43 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 if sys.version_info < (3, 12):
     sys.exit("Python 3.12+ required")
 
 from hbench import cli, report  # noqa: E402
+from hbench import runners as _runners  # noqa: E402
 from hbench.core.convert import trial_from_row_lenient, trials_from_rows  # noqa: E402
 from hbench.core.ids import new_run_id, sha256_json  # noqa: E402
-from hbench.core.models import RunInfo, Target  # noqa: E402
+from hbench.core.models import GraderResult, RunInfo, Target  # noqa: E402
+from hbench.graders import GRADERS as GRADERS, Change, GradeContext, compose, grade_plan  # noqa: E402
 from hbench.results import RunWriter, apply_gateway_costs  # noqa: E402
+from hbench.runners import PARSERS as PARSERS, empty_usage as empty_usage, json_lines as json_lines  # noqa: E402
+from hbench.runners import num as num, runner_for  # noqa: E402
+from hbench.runners.base import build_argv  # noqa: E402
 
 VERSION = "0.0.0"
+
+# The parsers live in `hbench.runners`. They are re-exported under the legacy names with a loose return type,
+# because this module and the tests that call it are not strictly typed.
+parse_claude: Callable[[str], Any] = _runners.parse_claude
+parse_opencode: Callable[[str], Any] = _runners.parse_opencode
+parse_pi: Callable[[str], Any] = _runners.parse_pi
+parse_cursor: Callable[[str], Any] = _runners.parse_cursor
+parse_codex: Callable[[str], Any] = _runners.parse_codex
+parse_null: Callable[[str], Any] = _runners.parse_null
 
 
 # ---------------------------------------------------------------- helpers
 
 
-def num(d, *keys):
-    """First numeric value found under any of keys, else 0."""
-    if not isinstance(d, dict):
-        return 0
-    for k in keys:
-        v = d.get(k)
-        if isinstance(v, (int, float)) and not isinstance(v, bool):
-            return v
-    return 0
-
-
-def json_lines(text):
-    """Yield JSON objects from a JSONL stream; skip non-JSON lines."""
-    for line in text.splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            yield json.loads(line)
-        except json.JSONDecodeError:
-            continue
-
-
-def empty_usage():
-    return {
-        "input": 0,
-        "output": 0,
-        "reasoning": 0,
-        "cache_read": 0,
-        "cache_write": 0,
-        "cost_reported": None,
-        "turns": 0,
-    }
-
-
 def expand_env(value):
     return re.sub(r"\$\{(\w+)\}", lambda m: os.environ.get(m.group(1), ""), value)
-
-
-# ---------------------------------------------------------------- parsers
-# Each parser takes the agent stdout and returns a usage dict or None.
-
-
-def parse_claude(stdout):
-    """claude -p --output-format json (single result object; stream-json also works)."""
-    result = None
-    for obj in json_lines(stdout):
-        if obj.get("type") == "result":
-            result = obj
-    if result is None:
-        try:
-            result = json.loads(stdout)
-        except json.JSONDecodeError:
-            return None
-    u = empty_usage()
-    model_usage = result.get("modelUsage")
-    if isinstance(model_usage, dict) and model_usage:
-        # Includes side calls (subagents, small helper model), not only the main model.
-        for m in model_usage.values():
-            u["input"] += num(m, "inputTokens")
-            u["output"] += num(m, "outputTokens")
-            u["cache_read"] += num(m, "cacheReadInputTokens")
-            u["cache_write"] += num(m, "cacheCreationInputTokens")
-    else:
-        usage = result.get("usage", {})
-        u["input"] = num(usage, "input_tokens")
-        u["output"] = num(usage, "output_tokens")
-        u["cache_read"] = num(usage, "cache_read_input_tokens")
-        u["cache_write"] = num(usage, "cache_creation_input_tokens")
-    if isinstance(result.get("total_cost_usd"), (int, float)):
-        u["cost_reported"] = result["total_cost_usd"]
-    u["turns"] = num(result, "num_turns")
-    return u
-
-
-def parse_opencode(stdout):
-    """opencode run --format json: sum every step_finish event."""
-    u = empty_usage()
-    cost, seen = 0.0, False
-    for obj in json_lines(stdout):
-        if str(obj.get("type", "")).replace("-", "_") != "step_finish":
-            continue
-        part = obj.get("part", obj)
-        tok = part.get("tokens", {}) or {}
-        cache = tok.get("cache") if isinstance(tok.get("cache"), dict) else {}
-        u["input"] += num(tok, "input")
-        u["output"] += num(tok, "output")
-        u["reasoning"] += num(tok, "reasoning")
-        u["cache_read"] += num(cache, "read") or num(tok, "cacheRead", "cache_read")
-        u["cache_write"] += num(cache, "write") or num(tok, "cacheWrite", "cache_write")
-        cost += num(part, "cost")
-        u["turns"] += 1
-        seen = True
-    if not seen:
-        return None
-    u["cost_reported"] = cost
-    return u
-
-
-def parse_pi(stdout):
-    """pi --mode json: sum usage of assistant messages on message_end events only."""
-    u = empty_usage()
-    cost, seen, has_cost = 0.0, False, False
-    for obj in json_lines(stdout):
-        if obj.get("type") != "message_end":
-            continue
-        msg = obj.get("message", {}) or {}
-        if msg.get("role") != "assistant":
-            continue
-        usage = msg.get("usage", {}) or {}
-        u["input"] += num(usage, "input", "inputTokens", "input_tokens")
-        u["output"] += num(usage, "output", "outputTokens", "output_tokens")
-        u["cache_read"] += num(usage, "cacheRead", "cache_read")
-        u["cache_write"] += num(usage, "cacheWrite", "cache_write")
-        c = usage.get("cost")
-        if isinstance(c, dict) and isinstance(c.get("total"), (int, float)):
-            cost += c["total"]
-            has_cost = True
-        elif isinstance(c, (int, float)):
-            cost += c
-            has_cost = True
-        u["turns"] += 1
-        seen = True
-    if not seen:
-        return None
-    u["cost_reported"] = cost if has_cost else None
-    return u
-
-
-def parse_cursor(stdout):
-    """agent -p --output-format json. Official docs show no usage fields; some versions
-    emit usage{inputTokens,outputTokens,cacheReadTokens,cacheWriteTokens}. Returns None
-    when no usage is present (pass rate and time are still recorded)."""
-    result = None
-    for obj in json_lines(stdout):
-        if obj.get("type") == "result":
-            result = obj
-    if not result or not isinstance(result.get("usage"), dict):
-        return None
-    usage = result["usage"]
-    u = empty_usage()
-    u["input"] = num(usage, "inputTokens", "input_tokens")
-    u["output"] = num(usage, "outputTokens", "output_tokens")
-    u["cache_read"] = num(usage, "cacheReadTokens", "cache_read_tokens")
-    u["cache_write"] = num(usage, "cacheWriteTokens", "cache_write_tokens")
-    cost = num(usage, "totalCostUSD") or num(result, "total_cost_usd")
-    u["cost_reported"] = cost or None
-    u["turns"] = 1
-    return u
-
-
-def parse_codex(stdout):
-    """codex exec --json: usage on turn.completed is the thread's running total, so take
-    the last one. cached_input_tokens is a subset of input_tokens; reasoning_output_tokens
-    is a subset of output_tokens (not added again)."""
-    last, turns = None, 0
-    for obj in json_lines(stdout):
-        if obj.get("type") == "turn.completed" and isinstance(obj.get("usage"), dict):
-            last = obj["usage"]
-            turns += 1
-    if last is None:
-        return None
-    u = empty_usage()
-    cached = num(last, "cached_input_tokens")
-    u["input"] = max(num(last, "input_tokens") - cached, 0)
-    u["cache_read"] = cached
-    u["output"] = num(last, "output_tokens")
-    u["turns"] = turns
-    return u
-
-
-def parse_null(stdout):
-    """Negative control: no model is called, so usage is zero and the cost is a real 0.0.
-    A `null` pair that solves a task means the hidden tests are too lenient."""
-    u = empty_usage()
-    u["cost_reported"] = 0.0
-    return u
-
-
-PARSERS = {
-    "claude": parse_claude,
-    "opencode": parse_opencode,
-    "pi": parse_pi,
-    "cursor": parse_cursor,
-    "codex": parse_codex,
-    "null": parse_null,
-}
 
 
 # ---------------------------------------------------------------- cost
@@ -313,9 +146,25 @@ def validate_config(cfg):
         for p in task.get("protected_paths", []):
             if Path(p).is_absolute() or ".." in Path(p).parts:
                 sys.exit(f"task {task['id']}: protected path {p!r} must be relative, without '..'")
-    for name in cfg["harnesses"]:
+        try:
+            grade_plan(task)
+        except ValueError as e:
+            sys.exit(f"task {task['id']}: {e}")
+        if (
+            task.get("hidden_tests")
+            and "graders" in task
+            and not any(g.get("type") == "hidden_tests" for g in task["graders"])
+        ):
+            print(
+                f"warning: task {task['id']} sets 'hidden_tests' but its graders have no hidden_tests grader: ignored"
+            )
+    for name, harness in cfg["harnesses"].items():
         if SAFE_NAME.search(name):
             sys.exit(f"invalid harness name {name!r}")
+        try:
+            runner_for(harness)
+        except ValueError as e:
+            sys.exit(f"harness {name}: {e}")
     leaked = spend_key_vars(cfg) & (
         set(cfg.get("env_passthrough", []))
         | {v for h in cfg["harnesses"].values() for val in h.get("env", {}).values() for v in env_var_names(val)}
@@ -404,15 +253,118 @@ def prepare_workdir(task, base, workdir):
         shutil.copytree(src, workdir, symlinks=True)
 
 
-def make_baseline(workdir):
-    """Single commit with the state the agent starts from (after setup). Returns its SHA."""
-    ident = ["-c", "user.name=harness-bench", "-c", "user.email=bench@localhost", "-c", "commit.gpgsign=false"]
-    git("init", "--quiet", "-b", "main", cwd=workdir)
-    git("add", "-A", cwd=workdir)
-    git(*ident, "commit", "--quiet", "--allow-empty", "-m", "baseline", cwd=workdir)
+# Options of every git call on the agent's workdir, so nothing the agent leaves there can steer or hide the diff:
+# no replace refs, no ignore rules from any config, no fsmonitor, no hooks, no untracked cache.
+# Defense in depth: the baseline git dir is outside the workdir and its config is ours, so most of these are
+# already inert. They stay on because each one closes a way to hide a change or run a command on the host if the
+# first line of defense ever fails (a git dir moved into the workdir, a config written next to it, a new git default).
+GIT_HARDENING = (
+    "--no-replace-objects",
+    "-c",
+    "core.excludesFile=/dev/null",
+    "-c",
+    "core.attributesFile=/dev/null",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.untrackedCache=false",
+)
+
+
+# Attributes the diff must not see. `info/attributes` in the baseline git dir has the highest precedence, so with this
+# line no `.gitattributes` in the workdir can change how a file is added or counted: `working-tree-encoding` would
+# make `git add` fail, `-diff` or `binary` would turn counts into `-`, `text`/`eol`/`ident`/`filter` would rewrite
+# the content. It works on every git version. Real binary detection (NUL bytes) is not affected.
+INFO_ATTRIBUTES = "* !text !eol !crlf !working-tree-encoding !filter !ident !diff !merge !export-subst\n"
+# The empty tree: with `--attr-source` git also ignores the workdir's `.gitattributes` (git 2.40 or newer).
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+MIN_GIT_FOR_ATTR_SOURCE = (2, 40)
+
+
+class GitError(Exception):
+    """A git call the diff depends on failed. Callers fail closed."""
+
+
+@functools.cache
+def git_version():
+    """`(major, minor)` of the git on PATH."""
+    out = subprocess.run([git_bin(), "--version"], capture_output=True, text=True, check=True).stdout
+    match = re.search(r"(\d+)\.(\d+)", out)
+    return (int(match.group(1)), int(match.group(2))) if match else (0, 0)
+
+
+def git_env(index_file=None):
+    """Environment for the hardened git: PATH only, no user or system config, no inherited GIT_* variable.
+    `index_file` is the one thing added: a throwaway index for a diff."""
+    return {
+        "PATH": os.environ.get("PATH", os.defpath),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_ATTR_NOSYSTEM": "1",
+        **({"GIT_INDEX_FILE": str(index_file)} if index_file else {}),
+    }
+
+
+def hardened_git(git_dir, work_tree, *args, check=False, timeout=300, index_file=None):
+    """Run git against the baseline `git_dir` (outside the workdir) and the agent's `work_tree`.
+
+    The workdir's own `.git` (config, `info/exclude`, index flags, replace refs) is never read: the agent controls
+    it, and its config could run commands on the host (`core.fsmonitor`, `filter.*`, `diff.*.textconv`). Its
+    `.gitattributes` files are ignored too (`info/attributes` of the git dir, see `make_baseline`)."""
+    # Defense in depth: `info/attributes` already outranks the workdir's `.gitattributes`. On git 2.40 or newer
+    # `--attr-source` with the empty tree adds a second layer, in case that file is ever missing or changed.
+    attr_source = [f"--attr-source={EMPTY_TREE}"] if git_version() >= MIN_GIT_FOR_ATTR_SOURCE else []
     return subprocess.run(
-        [git_bin(), "rev-parse", "HEAD"], cwd=workdir, capture_output=True, text=True, check=True
-    ).stdout.strip()
+        [
+            git_bin(),
+            f"--git-dir={git_dir}",
+            f"--work-tree={work_tree}",
+            *attr_source,
+            *GIT_HARDENING,
+            *args,
+        ],
+        cwd=work_tree,
+        env=git_env(index_file),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        check=check,
+        timeout=timeout,
+    )
+
+
+@dataclass(frozen=True)
+class Baseline:
+    """The state the agent starts from: a git dir outside the workdir, the workdir and the baseline commit."""
+
+    git_dir: Path
+    workdir: Path
+    sha: str
+
+
+def write_info_attributes(git_dir):
+    """Write `INFO_ATTRIBUTES` to `<git_dir>/info/attributes`, before the first `git add`."""
+    info = Path(git_dir) / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "attributes").write_text(INFO_ATTRIBUTES)
+
+
+def make_baseline(workdir, git_dir):
+    """Single commit with the state the agent starts from (after setup), in a git dir outside the workdir.
+    Ignore rules do not apply, so files a `.gitignore` lists are part of the baseline too."""
+    ident = ["-c", "user.name=harness-bench", "-c", "user.email=bench@localhost", "-c", "commit.gpgsign=false"]
+    hardened_git(git_dir, workdir, "init", "--quiet", "-b", "main", check=True)
+    try:
+        write_info_attributes(git_dir)
+    except OSError:
+        pass  # `staged_diff` checks the file before every diff and fails closed when it is missing
+    hardened_git(git_dir, workdir, "add", "-A", "--force", check=True)
+    hardened_git(git_dir, workdir, *ident, "commit", "--quiet", "--allow-empty", "-m", "baseline", check=True)
+    sha = hardened_git(git_dir, workdir, "rev-parse", "HEAD", check=True).stdout.strip()
+    return Baseline(git_dir=Path(git_dir), workdir=Path(workdir), sha=sha)
 
 
 def _remove(path):
@@ -447,27 +399,110 @@ def restore_protected(task, workdir, snap):
             shutil.copy2(saved, target, follow_symlinks=False)
 
 
-def save_diff(workdir, baseline, path, limit=2_000_000):
-    """Everything the agent changed vs baseline, including new files (for audit)."""
+def staged_diff(baseline, *flags):
+    """`git diff --cached` of everything in the workdir (new files and ignored files included) against baseline.
+
+    Every call builds a fresh index from the baseline commit, so flags kept in a stored index (`skip-worktree`,
+    `assume-unchanged`) have no effect. Raises `GitError` when git cannot read the baseline or add the workdir:
+    a diff without those files would compare the baseline with itself and show no change at all."""
     try:
-        git("add", "-A", cwd=workdir)
-        p = subprocess.run(
-            [git_bin(), "diff", "--cached", "--stat", "--patch", baseline],
-            cwd=workdir,
-            capture_output=True,
-            text=True,
-            timeout=300,
+        attributes_ok = (baseline.git_dir / "info" / "attributes").read_text() == INFO_ATTRIBUTES
+    except OSError:
+        attributes_ok = False
+    if not attributes_ok:
+        raise GitError("git diff failed: info/attributes of the baseline git dir is missing or changed")
+    with tempfile.TemporaryDirectory(prefix="harness-bench-index-") as tmp:
+        index = Path(tmp) / "index"
+        git_dir, workdir = baseline.git_dir, baseline.workdir
+        # Defense in depth: `add` into the fresh index would do, this also checks that the baseline sha exists.
+        read = hardened_git(git_dir, workdir, "read-tree", baseline.sha, index_file=index)
+        if read.returncode != 0:
+            raise GitError(f"git diff failed: {read.stderr.strip()}")
+        added = hardened_git(git_dir, workdir, "add", "-A", "--force", index_file=index)
+        if added.returncode != 0:
+            raise GitError(f"git add failed: {added.stderr.strip()}")
+        # Defense in depth: the config is ours, so no external diff or textconv is set; these refuse one anyway.
+        return hardened_git(
+            git_dir,
+            workdir,
+            "diff",
+            "--cached",
+            "--no-ext-diff",
+            "--no-textconv",
+            *flags,
+            baseline.sha,
+            index_file=index,
         )
-        text = p.stdout if p.returncode == 0 else f"git diff failed (agent changed .git?):\n{p.stderr}"
-    except (subprocess.SubprocessError, OSError) as e:
-        text = f"git diff failed (agent changed .git?): {e}"
+
+
+def nested_git_entries(workdir):
+    """Paths (relative to the workdir) of every `.git` file, directory or link inside it. After the agent ran there
+    should be none: `git add` would treat such a directory as a repository and hide what it holds."""
+    found = []
+    for dirpath, dirnames, filenames in os.walk(workdir):
+        found += [str((Path(dirpath) / n).relative_to(workdir)) for n in (*dirnames, *filenames) if n == ".git"]
+        dirnames[:] = [d for d in dirnames if d != ".git"]
+    return sorted(found)
+
+
+def save_diff(baseline, path, limit=2_000_000, secrets=()):
+    """Everything the agent changed vs baseline, including new files (for audit). A diff that cannot be built is
+    reported in the file (stderr redacted with `secrets`), never left empty."""
+    nested = nested_git_entries(baseline.workdir)
+    note = (
+        f"nested .git: {', '.join(nested)} (changes inside them are not shown; counted as unknown)\n" if nested else ""
+    )
+    try:
+        p = staged_diff(baseline, "--stat", "--patch")
+        text = p.stdout if p.returncode == 0 else f"git diff failed:\n{p.stderr}"
+    except (GitError, subprocess.SubprocessError, OSError) as e:
+        text = f"{e}" if isinstance(e, GitError) else f"git diff failed: {e}"
+    text = redact(note + text, secrets)
     path.write_text(text[:limit] + ("\n[truncated]" if len(text) > limit else ""))
 
 
+# A path outside the workdir: `diff_constraints` treats it as forbidden, so an unreadable diff fails closed.
+UNKNOWN_CHANGES = (Change(path="../unknown-changes", added=0, deleted=0),)
+
+
+# What a binary file counts as: more than any `max_changed_lines`. Git prints `-` for it and gives no line count, so
+# fail closed; counting it as 0 would let the agent dodge the limit with a blob.
+BINARY_LINES = 10**9
+
+
+def parse_numstat(text):
+    """Changes from `git diff --numstat -z --no-renames` output. A binary file (`-`) counts as `BINARY_LINES`."""
+    changes = []
+    for record in text.split("\0"):
+        if not record:
+            continue
+        added, deleted, path = record.split("\t", 2)
+        # A binary file prints `-\t-`: `deleted` stays 0 and `added` carries the whole (huge) count.
+        changes.append(
+            Change(
+                path=path,
+                added=int(added) if added.isdigit() else BINARY_LINES,
+                deleted=int(deleted) if deleted.isdigit() else 0,
+            )
+        )
+    return tuple(changes)
+
+
+def collect_changes(baseline):
+    """What the agent changed vs baseline as `Change`s (renames show as a delete and an add), for the graders.
+    Fails closed with `UNKNOWN_CHANGES` when the diff is unreadable (git cannot add a file, git is too old) or the
+    agent left a `.git` in the workdir."""
+    if nested_git_entries(baseline.workdir):
+        return UNKNOWN_CHANGES
+    try:
+        p = staged_diff(baseline, "--numstat", "-z", "--no-renames")
+        return parse_numstat(p.stdout) if p.returncode == 0 else UNKNOWN_CHANGES
+    except (GitError, subprocess.SubprocessError, OSError, ValueError):
+        return UNKNOWN_CHANGES
+
+
 def build_cmd(template, model, prompt):
-    provider, _, model_name = model.partition("/") if "/" in model else ("", "", model)
-    fields = {"model": model, "provider": provider, "model_name": model_name, "prompt": prompt}
-    return [part.format(**fields) for part in template]
+    return build_argv(template, model, prompt)
 
 
 def done_keys(results_path):
@@ -491,14 +526,34 @@ def resolve_work_root(cfg, base):
 
 
 def run_step(cfg, command, env, timeout, log_path, workdir, env_file, secrets):
-    """Run a setup/test command through the sandbox wrapper, write its redacted log; return (rc, timed_out)."""
+    """Run a setup or grader command in the sandbox wrapper and write its redacted log (stdout, then stderr).
+    Returns `(rc, timed_out, stdout, stderr)`, both redacted and kept apart: a score is only read from stdout."""
     write_env_file(env, env_file)
     try:
         rc, to, out, err = run_proc(wrap(cfg, ["sh", "-c", command], workdir, env_file), workdir, env, timeout)
     finally:
         env_file.unlink(missing_ok=True)
-    log_path.write_text(redact(out + "\n--- stderr ---\n" + err, secrets))
-    return rc, to
+    out, err = redact(out, secrets), redact(err, secrets)
+    log_path.write_text(out + "\n--- stderr ---\n" + err)
+    return rc, to, out, err
+
+
+def grade_trial(plan, task, base, workdir, changes, run_for):
+    """Run the task's graders over the finished workdir and compose them: `(passed, results)`.
+
+    `run_for(prefix)` gives a grader its `run`: the engine's `run_step`, with log names starting at `prefix`.
+    A grader that raises fails (only its exception type is printed, since the message may hold agent output)."""
+    results = []
+    for index, grader in enumerate(plan.graders):
+        prefix = "" if grader.name == "hidden_tests" else f"grader-{index}-"
+        ctx = GradeContext(workdir=workdir, task=task, base=base, changes=changes, run=run_for(prefix))
+        try:
+            results.append(grader.grade(ctx))
+        except Exception as e:
+            print(f"warning: grader {grader.name} failed with {type(e).__name__}; counted as failed")
+            results.append(GraderResult(grader=grader.name, grader_version=grader.version, passed=False, score=0.0))
+    passed, _ = compose(results, plan.mode, plan.weights, plan.threshold)
+    return passed, results
 
 
 def make_run_info(cfg, only, sandboxed):
@@ -506,7 +561,7 @@ def make_run_info(cfg, only, sandboxed):
     targets = tuple(
         Target(
             harness=pair["harness"],
-            harness_version=cfg["harnesses"][pair["harness"]].get("version", "unknown"),
+            harness_version=runner_for(cfg["harnesses"][pair["harness"]]).version(),
             model=pair["model"],
             params={},
         )
@@ -528,6 +583,13 @@ def make_run_info(cfg, only, sandboxed):
 
 
 def cmd_run(args, cfg, base):
+    """Run the matrix. The baseline git dirs of the trials live in a private temp dir that is always removed: not in
+    `work_dir`, whose names an unsandboxed agent could guess."""
+    with tempfile.TemporaryDirectory(prefix="harness-bench-git-") as git_root:
+        _run_matrix(args, cfg, base, Path(git_root))
+
+
+def _run_matrix(args, cfg, base, git_root):
     validate_config(cfg)
     sandboxed = bool((cfg.get("sandbox") or {}).get("prefix"))
     if not sandboxed and not args.dry_run and not args.allow_unsandboxed:
@@ -549,6 +611,7 @@ def cmd_run(args, cfg, base):
     if work_root:
         print(f"work dir: {work_root}")
     secrets_all = [os.environ.get(v, "") for v in spend_key_vars(cfg)]
+    plans = {task["id"]: grade_plan(task) for task in cfg["tasks"]}
     writer = None if args.dry_run else RunWriter(out_dir, make_run_info(cfg, args.only, sandboxed))
 
     for pair in cfg["matrix"]:
@@ -563,7 +626,8 @@ def cmd_run(args, cfg, base):
                 if key in finished and not args.dry_run:
                     print(f"skip  {key} (done)")
                     continue
-                cmd = build_cmd(h["command"], model, task["prompt"])
+                runner = runner_for(h)
+                cmd = runner.command(model, task["prompt"])
                 if args.dry_run:
                     print(shlex.join(cmd))
                     continue
@@ -591,7 +655,9 @@ def cmd_run(args, cfg, base):
                         env_file,
                         secrets,
                     )
-                baseline = make_baseline(workdir)
+                runner.prepare(workdir)
+                git_dir = git_root / f"{tag}.git"
+                baseline = make_baseline(workdir, git_dir)
                 snap = work_root / f".{tag}.protected"
                 if snap.exists():
                     rmtree_inside(snap, work_root)
@@ -614,26 +680,26 @@ def cmd_run(args, cfg, base):
                 (logs_dir / f"{tag}.agent.jsonl").write_text(redact(stdout, secrets))
                 (logs_dir / f"{tag}.agent.stderr").write_text(redact(stderr, secrets))
 
-                usage = PARSERS[h["parser"]](stdout)
+                usage = runner.parse_usage(stdout)
                 parse_ok = usage is not None
                 usage = usage or empty_usage()
 
-                save_diff(workdir, baseline, logs_dir / f"{tag}.diff")
+                # Captured before the protected paths are restored: an edit there must still count as a change.
+                changes = collect_changes(baseline)
+                save_diff(baseline, logs_dir / f"{tag}.diff", secrets=secrets)
+                rmtree_inside(git_dir, git_root)
                 restore_protected(task, workdir, snap)
                 rmtree_inside(snap, work_root)
-                if task.get("hidden_tests"):
-                    src = (base / task["hidden_tests"]).resolve()
-                    shutil.copytree(src, workdir, dirs_exist_ok=True)
-                test_rc, test_to = run_step(
-                    cfg,
-                    task["test"],
-                    cmd_env,
-                    task.get("test_timeout", 900),
-                    logs_dir / f"{tag}.test.log",
-                    workdir,
-                    env_file,
-                    secrets,
-                )
+
+                def run_for(prefix, tag=tag, workdir=workdir, env_file=env_file, secrets=secrets, cmd_env=cmd_env):
+                    def run(command, timeout, log_name):
+                        log = logs_dir / f"{tag}.{prefix}{safe(log_name)}.log"
+                        return run_step(cfg, command, cmd_env, timeout, log, workdir, env_file, secrets)
+
+                    return run
+
+                passed, grader_results = grade_trial(plans[task["id"]], task, base, workdir, changes, run_for)
+                test_to = any(r.timed_out for r in grader_results)
 
                 row = {
                     "ts": datetime.now(UTC).isoformat(timespec="seconds"),
@@ -641,7 +707,7 @@ def cmd_run(args, cfg, base):
                     "harness": hname,
                     "model": model,
                     "rep": rep,
-                    "passed": test_rc == 0 and not test_to,
+                    "passed": passed,
                     "agent_rc": rc,
                     "agent_timed_out": timed_out,
                     "wall_s": round(wall, 1),
@@ -658,8 +724,9 @@ def cmd_run(args, cfg, base):
                     row,
                     run_id=writer.info.run_id,  # dry runs never reach this point, so the writer exists
                     suite_version=writer.info.suite_version,
-                    harness_version=h.get("version", "unknown"),
+                    harness_version=runner.version(),
                     test_timed_out=test_to,
+                    graders=grader_results if task.get("graders") else None,
                     warn=print,
                 )
                 with results_path.open("a") as f:

@@ -67,16 +67,19 @@ def make_git_task(tmp):
 
 def main():
     tmp = Path(tempfile.mkdtemp(prefix="hb-smoke-"))
+    hide_work = Path(tempfile.mkdtemp(prefix="hb-smoke-work-"))
     try:
         fixtures.copy_engine(tmp)
         shutil.copytree(ROOT / "tasks" / "fizzbuzz", tmp / "tasks" / "fizzbuzz")
         tags_file, probe_file = tmp / "tags.txt", tmp / "probe.jsonl"
+        marker = tmp / "host-exec-marker"
         os.environ.update(
             FAKE_TAGS_FILE=str(tags_file),
             FAKE_PROBE_FILE=str(probe_file),
             FAKE_KEY=fake_litellm.KEY,
             SECRET_CANARY="must-not-leak",
             FAKE_API_KEY=API_KEY,
+            FAKE_MARKER=str(marker),
         )
 
         srv, port = fake_litellm.serve()
@@ -86,6 +89,7 @@ def main():
             "FAKE_TAGS_FILE": "${FAKE_TAGS_FILE}",
             "FAKE_PROBE_FILE": "${FAKE_PROBE_FILE}",
             "FAKE_API_KEY": "${FAKE_API_KEY}",
+            "FAKE_MARKER": "${FAKE_MARKER}",
         }
         fizz = fixtures.fizzbuzz_task()
         cfg = dict(
@@ -109,6 +113,11 @@ def main():
             rows["codex"]["input"] == 5000 and rows["codex"]["cache_read"] == 15000, "codex: cached is subset of input"
         )
         check(abs(rows["codex"]["cost_computed"] - 0.0735) < 1e-9, "codex: computed cost from prices")
+        counts = {name: r["tool_calls"] for name, r in rows.items()}
+        check(
+            counts == {"claude": 2, "opencode": 2, "pi": 3, "codex": 2, "cursor": None},
+            "tool calls counted per format, unknown (never 0) for cursor",
+        )
         check(
             not rows["cursor"]["parse_ok"] and rows["cursor"]["cost_computed"] is None, "cursor: no usage, no fake $0"
         )
@@ -161,12 +170,74 @@ def main():
         (tmp / "config2.json").write_text(json.dumps(cfg2))
         run(tmp, "harness_bench.py", "run", config="config2.json")
         pr = json.loads(probe_file.read_text().splitlines()[0])
-        check(pr["depth"] == "1" and pr["remotes"] == "", "workdir: no git history or remote (fix commit hidden)")
+        check(pr["depth"] == "" and pr["remotes"] == "", "workdir: no git repo, history or remote (fix commit hidden)")
         check(pr["sandbox"] == pr["cwd"], "sandbox prefix wraps the agent command")
         row = results(tmp / "results-sec/results.jsonl")[0]
         check(not row["passed"] and row["sandboxed"], "protected paths restored: test-runner hack does not pass")
         diff = next((tmp / "results-sec/logs").glob("*.diff")).read_text()
         check("run_tests.py" in diff and "conftest.py" in diff, "audit diff shows tampering")
+
+        # --- graders: a failing `command` grader and `diff_constraints` decide the verdict
+        open_hist = {key: val for key, val in hist.items() if key != "protected_paths"}
+        no_graders = dict(open_hist, id="tampered")  # the hack agent makes run_tests.py exit 0
+        forbid = [{"type": "hidden_tests"}, {"type": "diff_constraints", "forbidden": ["run_tests.py"]}]
+        guarded = dict(open_hist, id="guarded", graders=forbid)
+        failing = dict(fizz, id="failing", graders=[{"type": "hidden_tests"}, {"type": "command", "command": "false"}])
+        cfg3 = dict(
+            cfg2,
+            output_dir="results-grade",
+            tasks=[no_graders, guarded],
+            matrix=[{"harness": "claude", "model": "m"}],
+        )
+        (tmp / "config3.json").write_text(json.dumps(cfg3))
+        run(tmp, "harness_bench.py", "run", config="config3.json")
+        by_task = {r["task"]: r for r in results(tmp / "results-grade/results.jsonl")}
+        check(by_task["tampered"]["passed"], "graders: without constraints the test-runner hack passes the tests")
+        check(not by_task["guarded"]["passed"], "graders: diff_constraints fails the hack even though the tests pass")
+        cfg4 = dict(cfg, output_dir="results-cmd", tasks=[failing], matrix=[{"harness": "claude", "model": "fix"}])
+        (tmp / "config4.json").write_text(json.dumps(cfg4))
+        run(tmp, "harness_bench.py", "run", "--allow-unsandboxed", config="config4.json")
+        row = results(tmp / "results-cmd/results.jsonl")[0]
+        check(not row["passed"], "graders: a failing command grader fails the run although the hidden tests pass")
+        check(any((tmp / "results-cmd/logs").glob("*grader-1-command.log")), "graders: command log written")
+
+        # --- the agent cannot hide a forbidden change from `diff_constraints` through git, or run host commands
+        modes = {"hg": "hide-git", "hgc": "hide-git-clean", "hi": "hide-ignore", "ha": "hide-attr", "hc": "hide-config"}
+        guard = [{"type": "hidden_tests"}, {"type": "diff_constraints", "forbidden": ["run_tests.py", "conftest.py"]}]
+        cfg5 = dict(
+            cfg2,
+            output_dir="results-hide",
+            work_dir=str(hide_work),
+            tasks=[dict(open_hist, id="hide", graders=guard)],
+            harnesses={name: fixtures.harness("claude", harness_env, mode) for name, mode in modes.items()},
+            matrix=[{"harness": name, "model": "m"} for name in modes],
+        )
+        (tmp / "config5.json").write_text(json.dumps(cfg5))
+        run(tmp, "harness_bench.py", "run", config="config5.json")
+        (hide_run,) = [p.parent for p in (tmp / "results-hide").glob("*/trials.jsonl")]
+        trials = results(hide_run / "trials.jsonl")  # in matrix order
+        check(len(trials) == len(modes), "git hiding: one trial per mode")
+        for trial, mode in zip(trials, modes.values(), strict=True):
+            by_grader = {g["grader"]: g["passed"] for g in trial["graders"]}
+            check(
+                by_grader == {"hidden_tests": True, "diff_constraints": False},
+                f"git hiding ({mode}): the tests pass but diff_constraints fails the run",
+            )
+        check(not marker.exists(), "workdir .git/config: fsmonitor, filter and textconv commands never run on the host")
+        check(not list(hide_work.glob(".*")), "baseline git dir and snapshot removed after each trial")
+
+        # --- grader logs are redacted like the agent logs
+        leak_cmd = f"echo spend={fake_litellm.KEY} agent={API_KEY}"
+        leaky = dict(fizz, id="leaky", graders=[{"type": "hidden_tests"}, {"type": "command", "command": leak_cmd}])
+        cfg6 = dict(cfg, output_dir="results-leak", tasks=[leaky], matrix=[{"harness": "claude", "model": "fix"}])
+        (tmp / "config6.json").write_text(json.dumps(cfg6))
+        run(tmp, "harness_bench.py", "run", "--allow-unsandboxed", config="config6.json")
+        (grader_log,) = (tmp / "results-leak/logs").glob("*grader-1-command.log")
+        text = grader_log.read_text()
+        check(
+            "***REDACTED***" in text and fake_litellm.KEY not in text and API_KEY not in text,
+            "grader logs: spend key and harness secrets redacted",
+        )
 
         # --- config validation and URL policy
         for bad, why in (
@@ -195,6 +266,7 @@ def main():
         print("\nPASS")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(hide_work, ignore_errors=True)
 
 
 if __name__ == "__main__":

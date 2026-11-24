@@ -281,15 +281,19 @@ with known cases.
 
 ### Phase 3 — Runner and grader protocols
 
-- [ ] `HarnessRunner` protocol: `prepare`, `run`, `collect_usage`, `version`. Move the
-      current harnesses to adapters.
-- [ ] `Grader` protocol: takes the final workspace and metadata, returns `GraderResult`.
-- [ ] Bundled graders:
+- [x] `HarnessRunner` protocol: `prepare`, `command`, `parse_usage`, `version` (the engine
+      keeps running the process). Move the current harnesses to adapters.
+- [x] `Grader` protocol: takes the final workspace and metadata, returns `GraderResult`.
+- [x] Bundled graders:
   - `hidden_tests` (the current one)
   - `command` (any command with an exit code, for example lint, type-check, build)
   - `diff_constraints` (allowed/forbidden files, diff size)
-- [ ] Grader composition: `all`, `any`, weighted.
-- [ ] Registration through entry points.
+- [x] Grader composition: `all`, `any`, weighted.
+- [x] Registration through entry points.
+- [x] M9 partial credit (`SCORE:` line) and M10 tool calls (contract 1.1.0).
+
+Plan: [`superpowers/plans/2026-11-24-phase-3-runners-graders.md`](superpowers/plans/2026-11-24-phase-3-runners-graders.md).
+Decisions: [ADR 0007](adr/0007-runner-and-grader-protocols.md).
 
 Acceptance: a new grader can be added from another package without touching the core.
 

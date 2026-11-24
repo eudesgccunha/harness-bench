@@ -248,6 +248,10 @@ Parser: the `usage` in the `turn.completed` event is the cumulative thread total
 - If a `null` pair solves a task, the hidden tests are too lenient: the report prints a warning. Null pairs are left out of the recommendation and of the discrimination lists.
 - It has no LiteLLM spend, so under `--litellm` (cost source `litellm`) its cost is unknown, which is expected.
 
+### Tool calls
+
+Each parser also counts tool calls (`tool_calls`, shown as `Tool calls/run` and `Tool calls/solved`) where the output exposes them, and reports unknown (never `0`) elsewhere: Claude counts unique `tool_use` blocks in `stream-json` `assistant` events (the single JSON result has none); OpenCode counts `tool_use` events (unknown until the first one is seen, so a CLI version that emits none is not reported as 0; an OpenCode run with genuinely zero tool calls is therefore also unknown); Pi counts `toolCall` blocks of assistant `message_end` events; Codex counts completed `command_execution`, `file_change`, `mcp_tool_call` and `web_search` items (unknown until an `item.completed` event is seen); Cursor has no count; `null` is a real 0. One unknown trial makes the pair unknown.
+
 ## LiteLLM: what to check
 
 - `reconcile` first tries `GET /spend/logs/v2` (paginated, dates as `YYYY-MM-DD HH:MM:SS`). If that fails, it falls back to the legacy `GET /spend/logs?summarize=false`. Logs are matched to runs by the `request_tags` field, inside the script.
@@ -270,7 +274,7 @@ The agents run **without asking for approval**, and the `test` command executes 
 What the script does on every run:
 
 1. **Workdir outside the benchmark repository**: a new temporary directory, or an absolute `work_dir` outside the repository (the script rejects a path inside it). So the agent does not work next to hidden tests, config and results.
-2. **No git history**: the task repository is copied without `.git` and gets a single `baseline` commit. A clone at the commit before the fix would still contain the fix commit, and the remote would point back to the benchmark.
+2. **No git history**: the task repository is copied without `.git`. A clone at the commit before the fix would still contain the fix commit, and the remote would point back to the benchmark. The single `baseline` commit lives in a private temporary git directory outside the workdir and `work_dir` (deleted after the trial). Every git call on the workdir ignores its `.git`, `.gitignore`, `.gitattributes`, replace refs and git config, and every diff starts from a fresh index, so the agent cannot hide a change or run a command on the host through git. If the agent leaves a `.git` anywhere in the workdir, or `git add` fails (for example on an unreadable file), its changes count as unknown and `diff_constraints` fails; a binary file counts as more than any `max_changed_lines`. This works on any git version (an `info/attributes` file in the baseline git directory does the work; git 2.40 or newer adds `--attr-source` as a second layer). The guarantee holds for sandboxed runs: an unsandboxed agent runs as your user and could find and edit the temporary git directory.
 3. **Minimal environment**: the agent gets only `PATH`, `HOME`, `USER`, locale, `TERM`, `TMPDIR`, the variables in `env_passthrough` and those in the harness `env` block. `setup` and `test` get the same, without the harness `env`. The LiteLLM spend-read key (`litellm.api_key`) **never** reaches the agent: the script rejects a config that tries to pass it through.
 4. **Protected files**: before the agent runs, each path in `protected_paths` is copied outside the workdir. Before the test, that content is restored and anything the agent created there is deleted. Use it for the test runner and configs (`tests/`, `package.json`, `pytest.ini`, `conftest.py`, `vitest.config.ts`). Without it, an agent can "solve" the task by making the test always pass.
 5. **Audit**: `logs/<run>.diff` keeps everything the agent changed relative to the baseline.
@@ -332,6 +336,31 @@ Integrating it would need a dedicated backend: create the sandbox, upload the wo
 - `setup` (e.g. `npm ci`) runs before the agent and does not count toward cost.
 - List the repository's tests and test configs in `protected_paths`.
 
+## Graders
+
+A task passes when its graders say so. Without a `graders` key, the single `hidden_tests` grader runs the task's `hidden_tests` copy and `test` command, as before. With one, each entry is an object with a `type` (and an optional `weight`), run in order after the agent finishes:
+
+```json
+"graders": [
+  {"type": "hidden_tests"},
+  {"type": "command", "command": "ruff check .", "timeout": 120},
+  {"type": "diff_constraints", "forbidden": ["run_tests.py", "tests/*"], "max_changed_lines": 200}
+],
+"grade": {"mode": "all"}
+```
+
+- `hidden_tests`: copies `hidden_tests` into the workdir, then runs `test` (`test_timeout`, default 900 s).
+- `command`: runs `command` (`timeout`, default 900 s). Passes on exit code 0.
+- `diff_constraints`: runs nothing. It checks what the agent changed, captured right after the agent finishes and before `protected_paths` are restored: every changed path must match `allowed` (empty means any) and none may match `forbidden` (`fnmatch` globs on paths relative to the workdir; `*` also matches `/`), and the added plus deleted lines must not exceed `max_changed_lines`. A path outside the workdir is always forbidden, and so is an unreadable diff. Renames count as a delete and an add. A binary file counts as more than any `max_changed_lines`. Interpreters leave bytecode (`__pycache__/*.pyc`) in the workdir, and a `.pyc` is binary: list `ignore_lines` globs (for example `["*/__pycache__/*"]`) to leave those paths out of the **line count** only (the `allowed` and `forbidden` checks still apply). Do not ignore bytecode in `forbidden` or `allowed`: a crafted `.pyc` can poison the tests. Instead list the test directories in `protected_paths`, because the restore before the tests deletes everything the agent added there (bytecode included), and write `forbidden` with source globs (`tests/*.py`) so harmless bytecode does not trip it. Keep `ignore_lines` to generated artifacts only: a broad glob such as `*.py` turns `max_changed_lines` off.
+- `grade`: `mode` is `all` (default: every grader passes, score is the mean), `any` (one passes, score is the best) or `weighted` (score is the weighted mean using each grader's `weight`, default 1; it passes at `threshold`, required, above 0 and up to 1).
+- Partial credit is opt-in: set `"score": true` on a `hidden_tests` or `command` grader and it reads the **last** line `SCORE: <0 to 1>` of the command's **stdout** (stderr is never read). Passing is still exit code 0 without a timeout. Without the option, or without a valid `SCORE` line, the score is 1.0 on pass and 0.0 otherwise (an out-of-range value is ignored with a warning). The test command runs code the agent wrote, which can print a `SCORE` line after the real one, so a score is only as trustworthy as the test output (including a later stdout `SCORE:` line printed by agent code, for example from `atexit`), and a `weighted` verdict with `score: true` inherits exactly that trust. Use `all` or `any` (exit codes only) when the agent can influence the scorer.
+- Logs: `<tag>.test.log` for `hidden_tests`, `<tag>.grader-<index>-<type>.log` for the others. Only the engine starts processes, through the same env allowlist, sandbox wrapper and log redaction as the test command.
+- `trials.jsonl` lists every grader result. Rows of tasks without `graders` keep the single `test` grader.
+
+### Plugins
+
+Another package can add runners and graders without touching this repository. It registers a factory `(config) -> HarnessRunner | Grader` under the entry-point group `harness_bench.runners` (the harness `parser` name) or `harness_bench.graders` (the grader `type`). Built-in names always win and a plugin that reuses one is an error. Plugins are loaded only when the config names a type that is not built in, and the config is validated before any agent runs. The plugin's package name and version are printed once. A runner builds the argv and parses the output; a grader asks the engine to run commands through `ctx.run`. Neither starts processes.
+
 ## `command` placeholders
 
 `{prompt}`, `{model}`, `{provider}` (part before the `/`), `{model_name}` (part after the `/`).
@@ -355,6 +384,7 @@ Usage:
   python3 harness_bench.py report --config config.json
 """
 
+import functools
 import json
 import os
 import platform
@@ -367,211 +397,43 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 if sys.version_info < (3, 12):
     sys.exit("Python 3.12+ required")
 
 from hbench import cli, report  # noqa: E402
+from hbench import runners as _runners  # noqa: E402
 from hbench.core.convert import trial_from_row_lenient, trials_from_rows  # noqa: E402
 from hbench.core.ids import new_run_id, sha256_json  # noqa: E402
-from hbench.core.models import RunInfo, Target  # noqa: E402
+from hbench.core.models import GraderResult, RunInfo, Target  # noqa: E402
+from hbench.graders import GRADERS as GRADERS, Change, GradeContext, compose, grade_plan  # noqa: E402
 from hbench.results import RunWriter, apply_gateway_costs  # noqa: E402
+from hbench.runners import PARSERS as PARSERS, empty_usage as empty_usage, json_lines as json_lines  # noqa: E402
+from hbench.runners import num as num, runner_for  # noqa: E402
+from hbench.runners.base import build_argv  # noqa: E402
 
 VERSION = "0.0.0"
+
+# The parsers live in `hbench.runners`. They are re-exported under the legacy names with a loose return type,
+# because this module and the tests that call it are not strictly typed.
+parse_claude: Callable[[str], Any] = _runners.parse_claude
+parse_opencode: Callable[[str], Any] = _runners.parse_opencode
+parse_pi: Callable[[str], Any] = _runners.parse_pi
+parse_cursor: Callable[[str], Any] = _runners.parse_cursor
+parse_codex: Callable[[str], Any] = _runners.parse_codex
+parse_null: Callable[[str], Any] = _runners.parse_null
 
 
 # ---------------------------------------------------------------- helpers
 
 
-def num(d, *keys):
-    """First numeric value found under any of keys, else 0."""
-    if not isinstance(d, dict):
-        return 0
-    for k in keys:
-        v = d.get(k)
-        if isinstance(v, (int, float)) and not isinstance(v, bool):
-            return v
-    return 0
-
-
-def json_lines(text):
-    """Yield JSON objects from a JSONL stream; skip non-JSON lines."""
-    for line in text.splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            yield json.loads(line)
-        except json.JSONDecodeError:
-            continue
-
-
-def empty_usage():
-    return {
-        "input": 0,
-        "output": 0,
-        "reasoning": 0,
-        "cache_read": 0,
-        "cache_write": 0,
-        "cost_reported": None,
-        "turns": 0,
-    }
-
-
 def expand_env(value):
     return re.sub(r"\$\{(\w+)\}", lambda m: os.environ.get(m.group(1), ""), value)
-
-
-# ---------------------------------------------------------------- parsers
-# Each parser takes the agent stdout and returns a usage dict or None.
-
-
-def parse_claude(stdout):
-    """claude -p --output-format json (single result object; stream-json also works)."""
-    result = None
-    for obj in json_lines(stdout):
-        if obj.get("type") == "result":
-            result = obj
-    if result is None:
-        try:
-            result = json.loads(stdout)
-        except json.JSONDecodeError:
-            return None
-    u = empty_usage()
-    model_usage = result.get("modelUsage")
-    if isinstance(model_usage, dict) and model_usage:
-        # Includes side calls (subagents, small helper model), not only the main model.
-        for m in model_usage.values():
-            u["input"] += num(m, "inputTokens")
-            u["output"] += num(m, "outputTokens")
-            u["cache_read"] += num(m, "cacheReadInputTokens")
-            u["cache_write"] += num(m, "cacheCreationInputTokens")
-    else:
-        usage = result.get("usage", {})
-        u["input"] = num(usage, "input_tokens")
-        u["output"] = num(usage, "output_tokens")
-        u["cache_read"] = num(usage, "cache_read_input_tokens")
-        u["cache_write"] = num(usage, "cache_creation_input_tokens")
-    if isinstance(result.get("total_cost_usd"), (int, float)):
-        u["cost_reported"] = result["total_cost_usd"]
-    u["turns"] = num(result, "num_turns")
-    return u
-
-
-def parse_opencode(stdout):
-    """opencode run --format json: sum every step_finish event."""
-    u = empty_usage()
-    cost, seen = 0.0, False
-    for obj in json_lines(stdout):
-        if str(obj.get("type", "")).replace("-", "_") != "step_finish":
-            continue
-        part = obj.get("part", obj)
-        tok = part.get("tokens", {}) or {}
-        cache = tok.get("cache") if isinstance(tok.get("cache"), dict) else {}
-        u["input"] += num(tok, "input")
-        u["output"] += num(tok, "output")
-        u["reasoning"] += num(tok, "reasoning")
-        u["cache_read"] += num(cache, "read") or num(tok, "cacheRead", "cache_read")
-        u["cache_write"] += num(cache, "write") or num(tok, "cacheWrite", "cache_write")
-        cost += num(part, "cost")
-        u["turns"] += 1
-        seen = True
-    if not seen:
-        return None
-    u["cost_reported"] = cost
-    return u
-
-
-def parse_pi(stdout):
-    """pi --mode json: sum usage of assistant messages on message_end events only."""
-    u = empty_usage()
-    cost, seen, has_cost = 0.0, False, False
-    for obj in json_lines(stdout):
-        if obj.get("type") != "message_end":
-            continue
-        msg = obj.get("message", {}) or {}
-        if msg.get("role") != "assistant":
-            continue
-        usage = msg.get("usage", {}) or {}
-        u["input"] += num(usage, "input", "inputTokens", "input_tokens")
-        u["output"] += num(usage, "output", "outputTokens", "output_tokens")
-        u["cache_read"] += num(usage, "cacheRead", "cache_read")
-        u["cache_write"] += num(usage, "cacheWrite", "cache_write")
-        c = usage.get("cost")
-        if isinstance(c, dict) and isinstance(c.get("total"), (int, float)):
-            cost += c["total"]
-            has_cost = True
-        elif isinstance(c, (int, float)):
-            cost += c
-            has_cost = True
-        u["turns"] += 1
-        seen = True
-    if not seen:
-        return None
-    u["cost_reported"] = cost if has_cost else None
-    return u
-
-
-def parse_cursor(stdout):
-    """agent -p --output-format json. Official docs show no usage fields; some versions
-    emit usage{inputTokens,outputTokens,cacheReadTokens,cacheWriteTokens}. Returns None
-    when no usage is present (pass rate and time are still recorded)."""
-    result = None
-    for obj in json_lines(stdout):
-        if obj.get("type") == "result":
-            result = obj
-    if not result or not isinstance(result.get("usage"), dict):
-        return None
-    usage = result["usage"]
-    u = empty_usage()
-    u["input"] = num(usage, "inputTokens", "input_tokens")
-    u["output"] = num(usage, "outputTokens", "output_tokens")
-    u["cache_read"] = num(usage, "cacheReadTokens", "cache_read_tokens")
-    u["cache_write"] = num(usage, "cacheWriteTokens", "cache_write_tokens")
-    cost = num(usage, "totalCostUSD") or num(result, "total_cost_usd")
-    u["cost_reported"] = cost or None
-    u["turns"] = 1
-    return u
-
-
-def parse_codex(stdout):
-    """codex exec --json: usage on turn.completed is the thread's running total, so take
-    the last one. cached_input_tokens is a subset of input_tokens; reasoning_output_tokens
-    is a subset of output_tokens (not added again)."""
-    last, turns = None, 0
-    for obj in json_lines(stdout):
-        if obj.get("type") == "turn.completed" and isinstance(obj.get("usage"), dict):
-            last = obj["usage"]
-            turns += 1
-    if last is None:
-        return None
-    u = empty_usage()
-    cached = num(last, "cached_input_tokens")
-    u["input"] = max(num(last, "input_tokens") - cached, 0)
-    u["cache_read"] = cached
-    u["output"] = num(last, "output_tokens")
-    u["turns"] = turns
-    return u
-
-
-def parse_null(stdout):
-    """Negative control: no model is called, so usage is zero and the cost is a real 0.0.
-    A `null` pair that solves a task means the hidden tests are too lenient."""
-    u = empty_usage()
-    u["cost_reported"] = 0.0
-    return u
-
-
-PARSERS = {
-    "claude": parse_claude,
-    "opencode": parse_opencode,
-    "pi": parse_pi,
-    "cursor": parse_cursor,
-    "codex": parse_codex,
-    "null": parse_null,
-}
 
 
 # ---------------------------------------------------------------- cost
@@ -658,9 +520,25 @@ def validate_config(cfg):
         for p in task.get("protected_paths", []):
             if Path(p).is_absolute() or ".." in Path(p).parts:
                 sys.exit(f"task {task['id']}: protected path {p!r} must be relative, without '..'")
-    for name in cfg["harnesses"]:
+        try:
+            grade_plan(task)
+        except ValueError as e:
+            sys.exit(f"task {task['id']}: {e}")
+        if (
+            task.get("hidden_tests")
+            and "graders" in task
+            and not any(g.get("type") == "hidden_tests" for g in task["graders"])
+        ):
+            print(
+                f"warning: task {task['id']} sets 'hidden_tests' but its graders have no hidden_tests grader: ignored"
+            )
+    for name, harness in cfg["harnesses"].items():
         if SAFE_NAME.search(name):
             sys.exit(f"invalid harness name {name!r}")
+        try:
+            runner_for(harness)
+        except ValueError as e:
+            sys.exit(f"harness {name}: {e}")
     leaked = spend_key_vars(cfg) & (
         set(cfg.get("env_passthrough", []))
         | {v for h in cfg["harnesses"].values() for val in h.get("env", {}).values() for v in env_var_names(val)}
@@ -749,15 +627,118 @@ def prepare_workdir(task, base, workdir):
         shutil.copytree(src, workdir, symlinks=True)
 
 
-def make_baseline(workdir):
-    """Single commit with the state the agent starts from (after setup). Returns its SHA."""
-    ident = ["-c", "user.name=harness-bench", "-c", "user.email=bench@localhost", "-c", "commit.gpgsign=false"]
-    git("init", "--quiet", "-b", "main", cwd=workdir)
-    git("add", "-A", cwd=workdir)
-    git(*ident, "commit", "--quiet", "--allow-empty", "-m", "baseline", cwd=workdir)
+# Options of every git call on the agent's workdir, so nothing the agent leaves there can steer or hide the diff:
+# no replace refs, no ignore rules from any config, no fsmonitor, no hooks, no untracked cache.
+# Defense in depth: the baseline git dir is outside the workdir and its config is ours, so most of these are
+# already inert. They stay on because each one closes a way to hide a change or run a command on the host if the
+# first line of defense ever fails (a git dir moved into the workdir, a config written next to it, a new git default).
+GIT_HARDENING = (
+    "--no-replace-objects",
+    "-c",
+    "core.excludesFile=/dev/null",
+    "-c",
+    "core.attributesFile=/dev/null",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.untrackedCache=false",
+)
+
+
+# Attributes the diff must not see. `info/attributes` in the baseline git dir has the highest precedence, so with this
+# line no `.gitattributes` in the workdir can change how a file is added or counted: `working-tree-encoding` would
+# make `git add` fail, `-diff` or `binary` would turn counts into `-`, `text`/`eol`/`ident`/`filter` would rewrite
+# the content. It works on every git version. Real binary detection (NUL bytes) is not affected.
+INFO_ATTRIBUTES = "* !text !eol !crlf !working-tree-encoding !filter !ident !diff !merge !export-subst\n"
+# The empty tree: with `--attr-source` git also ignores the workdir's `.gitattributes` (git 2.40 or newer).
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+MIN_GIT_FOR_ATTR_SOURCE = (2, 40)
+
+
+class GitError(Exception):
+    """A git call the diff depends on failed. Callers fail closed."""
+
+
+@functools.cache
+def git_version():
+    """`(major, minor)` of the git on PATH."""
+    out = subprocess.run([git_bin(), "--version"], capture_output=True, text=True, check=True).stdout
+    match = re.search(r"(\d+)\.(\d+)", out)
+    return (int(match.group(1)), int(match.group(2))) if match else (0, 0)
+
+
+def git_env(index_file=None):
+    """Environment for the hardened git: PATH only, no user or system config, no inherited GIT_* variable.
+    `index_file` is the one thing added: a throwaway index for a diff."""
+    return {
+        "PATH": os.environ.get("PATH", os.defpath),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_ATTR_NOSYSTEM": "1",
+        **({"GIT_INDEX_FILE": str(index_file)} if index_file else {}),
+    }
+
+
+def hardened_git(git_dir, work_tree, *args, check=False, timeout=300, index_file=None):
+    """Run git against the baseline `git_dir` (outside the workdir) and the agent's `work_tree`.
+
+    The workdir's own `.git` (config, `info/exclude`, index flags, replace refs) is never read: the agent controls
+    it, and its config could run commands on the host (`core.fsmonitor`, `filter.*`, `diff.*.textconv`). Its
+    `.gitattributes` files are ignored too (`info/attributes` of the git dir, see `make_baseline`)."""
+    # Defense in depth: `info/attributes` already outranks the workdir's `.gitattributes`. On git 2.40 or newer
+    # `--attr-source` with the empty tree adds a second layer, in case that file is ever missing or changed.
+    attr_source = [f"--attr-source={EMPTY_TREE}"] if git_version() >= MIN_GIT_FOR_ATTR_SOURCE else []
     return subprocess.run(
-        [git_bin(), "rev-parse", "HEAD"], cwd=workdir, capture_output=True, text=True, check=True
-    ).stdout.strip()
+        [
+            git_bin(),
+            f"--git-dir={git_dir}",
+            f"--work-tree={work_tree}",
+            *attr_source,
+            *GIT_HARDENING,
+            *args,
+        ],
+        cwd=work_tree,
+        env=git_env(index_file),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        check=check,
+        timeout=timeout,
+    )
+
+
+@dataclass(frozen=True)
+class Baseline:
+    """The state the agent starts from: a git dir outside the workdir, the workdir and the baseline commit."""
+
+    git_dir: Path
+    workdir: Path
+    sha: str
+
+
+def write_info_attributes(git_dir):
+    """Write `INFO_ATTRIBUTES` to `<git_dir>/info/attributes`, before the first `git add`."""
+    info = Path(git_dir) / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "attributes").write_text(INFO_ATTRIBUTES)
+
+
+def make_baseline(workdir, git_dir):
+    """Single commit with the state the agent starts from (after setup), in a git dir outside the workdir.
+    Ignore rules do not apply, so files a `.gitignore` lists are part of the baseline too."""
+    ident = ["-c", "user.name=harness-bench", "-c", "user.email=bench@localhost", "-c", "commit.gpgsign=false"]
+    hardened_git(git_dir, workdir, "init", "--quiet", "-b", "main", check=True)
+    try:
+        write_info_attributes(git_dir)
+    except OSError:
+        pass  # `staged_diff` checks the file before every diff and fails closed when it is missing
+    hardened_git(git_dir, workdir, "add", "-A", "--force", check=True)
+    hardened_git(git_dir, workdir, *ident, "commit", "--quiet", "--allow-empty", "-m", "baseline", check=True)
+    sha = hardened_git(git_dir, workdir, "rev-parse", "HEAD", check=True).stdout.strip()
+    return Baseline(git_dir=Path(git_dir), workdir=Path(workdir), sha=sha)
 
 
 def _remove(path):
@@ -792,27 +773,110 @@ def restore_protected(task, workdir, snap):
             shutil.copy2(saved, target, follow_symlinks=False)
 
 
-def save_diff(workdir, baseline, path, limit=2_000_000):
-    """Everything the agent changed vs baseline, including new files (for audit)."""
+def staged_diff(baseline, *flags):
+    """`git diff --cached` of everything in the workdir (new files and ignored files included) against baseline.
+
+    Every call builds a fresh index from the baseline commit, so flags kept in a stored index (`skip-worktree`,
+    `assume-unchanged`) have no effect. Raises `GitError` when git cannot read the baseline or add the workdir:
+    a diff without those files would compare the baseline with itself and show no change at all."""
     try:
-        git("add", "-A", cwd=workdir)
-        p = subprocess.run(
-            [git_bin(), "diff", "--cached", "--stat", "--patch", baseline],
-            cwd=workdir,
-            capture_output=True,
-            text=True,
-            timeout=300,
+        attributes_ok = (baseline.git_dir / "info" / "attributes").read_text() == INFO_ATTRIBUTES
+    except OSError:
+        attributes_ok = False
+    if not attributes_ok:
+        raise GitError("git diff failed: info/attributes of the baseline git dir is missing or changed")
+    with tempfile.TemporaryDirectory(prefix="harness-bench-index-") as tmp:
+        index = Path(tmp) / "index"
+        git_dir, workdir = baseline.git_dir, baseline.workdir
+        # Defense in depth: `add` into the fresh index would do, this also checks that the baseline sha exists.
+        read = hardened_git(git_dir, workdir, "read-tree", baseline.sha, index_file=index)
+        if read.returncode != 0:
+            raise GitError(f"git diff failed: {read.stderr.strip()}")
+        added = hardened_git(git_dir, workdir, "add", "-A", "--force", index_file=index)
+        if added.returncode != 0:
+            raise GitError(f"git add failed: {added.stderr.strip()}")
+        # Defense in depth: the config is ours, so no external diff or textconv is set; these refuse one anyway.
+        return hardened_git(
+            git_dir,
+            workdir,
+            "diff",
+            "--cached",
+            "--no-ext-diff",
+            "--no-textconv",
+            *flags,
+            baseline.sha,
+            index_file=index,
         )
-        text = p.stdout if p.returncode == 0 else f"git diff failed (agent changed .git?):\n{p.stderr}"
-    except (subprocess.SubprocessError, OSError) as e:
-        text = f"git diff failed (agent changed .git?): {e}"
+
+
+def nested_git_entries(workdir):
+    """Paths (relative to the workdir) of every `.git` file, directory or link inside it. After the agent ran there
+    should be none: `git add` would treat such a directory as a repository and hide what it holds."""
+    found = []
+    for dirpath, dirnames, filenames in os.walk(workdir):
+        found += [str((Path(dirpath) / n).relative_to(workdir)) for n in (*dirnames, *filenames) if n == ".git"]
+        dirnames[:] = [d for d in dirnames if d != ".git"]
+    return sorted(found)
+
+
+def save_diff(baseline, path, limit=2_000_000, secrets=()):
+    """Everything the agent changed vs baseline, including new files (for audit). A diff that cannot be built is
+    reported in the file (stderr redacted with `secrets`), never left empty."""
+    nested = nested_git_entries(baseline.workdir)
+    note = (
+        f"nested .git: {', '.join(nested)} (changes inside them are not shown; counted as unknown)\n" if nested else ""
+    )
+    try:
+        p = staged_diff(baseline, "--stat", "--patch")
+        text = p.stdout if p.returncode == 0 else f"git diff failed:\n{p.stderr}"
+    except (GitError, subprocess.SubprocessError, OSError) as e:
+        text = f"{e}" if isinstance(e, GitError) else f"git diff failed: {e}"
+    text = redact(note + text, secrets)
     path.write_text(text[:limit] + ("\n[truncated]" if len(text) > limit else ""))
 
 
+# A path outside the workdir: `diff_constraints` treats it as forbidden, so an unreadable diff fails closed.
+UNKNOWN_CHANGES = (Change(path="../unknown-changes", added=0, deleted=0),)
+
+
+# What a binary file counts as: more than any `max_changed_lines`. Git prints `-` for it and gives no line count, so
+# fail closed; counting it as 0 would let the agent dodge the limit with a blob.
+BINARY_LINES = 10**9
+
+
+def parse_numstat(text):
+    """Changes from `git diff --numstat -z --no-renames` output. A binary file (`-`) counts as `BINARY_LINES`."""
+    changes = []
+    for record in text.split("\0"):
+        if not record:
+            continue
+        added, deleted, path = record.split("\t", 2)
+        # A binary file prints `-\t-`: `deleted` stays 0 and `added` carries the whole (huge) count.
+        changes.append(
+            Change(
+                path=path,
+                added=int(added) if added.isdigit() else BINARY_LINES,
+                deleted=int(deleted) if deleted.isdigit() else 0,
+            )
+        )
+    return tuple(changes)
+
+
+def collect_changes(baseline):
+    """What the agent changed vs baseline as `Change`s (renames show as a delete and an add), for the graders.
+    Fails closed with `UNKNOWN_CHANGES` when the diff is unreadable (git cannot add a file, git is too old) or the
+    agent left a `.git` in the workdir."""
+    if nested_git_entries(baseline.workdir):
+        return UNKNOWN_CHANGES
+    try:
+        p = staged_diff(baseline, "--numstat", "-z", "--no-renames")
+        return parse_numstat(p.stdout) if p.returncode == 0 else UNKNOWN_CHANGES
+    except (GitError, subprocess.SubprocessError, OSError, ValueError):
+        return UNKNOWN_CHANGES
+
+
 def build_cmd(template, model, prompt):
-    provider, _, model_name = model.partition("/") if "/" in model else ("", "", model)
-    fields = {"model": model, "provider": provider, "model_name": model_name, "prompt": prompt}
-    return [part.format(**fields) for part in template]
+    return build_argv(template, model, prompt)
 
 
 def done_keys(results_path):
@@ -836,14 +900,34 @@ def resolve_work_root(cfg, base):
 
 
 def run_step(cfg, command, env, timeout, log_path, workdir, env_file, secrets):
-    """Run a setup/test command through the sandbox wrapper, write its redacted log; return (rc, timed_out)."""
+    """Run a setup or grader command in the sandbox wrapper and write its redacted log (stdout, then stderr).
+    Returns `(rc, timed_out, stdout, stderr)`, both redacted and kept apart: a score is only read from stdout."""
     write_env_file(env, env_file)
     try:
         rc, to, out, err = run_proc(wrap(cfg, ["sh", "-c", command], workdir, env_file), workdir, env, timeout)
     finally:
         env_file.unlink(missing_ok=True)
-    log_path.write_text(redact(out + "\n--- stderr ---\n" + err, secrets))
-    return rc, to
+    out, err = redact(out, secrets), redact(err, secrets)
+    log_path.write_text(out + "\n--- stderr ---\n" + err)
+    return rc, to, out, err
+
+
+def grade_trial(plan, task, base, workdir, changes, run_for):
+    """Run the task's graders over the finished workdir and compose them: `(passed, results)`.
+
+    `run_for(prefix)` gives a grader its `run`: the engine's `run_step`, with log names starting at `prefix`.
+    A grader that raises fails (only its exception type is printed, since the message may hold agent output)."""
+    results = []
+    for index, grader in enumerate(plan.graders):
+        prefix = "" if grader.name == "hidden_tests" else f"grader-{index}-"
+        ctx = GradeContext(workdir=workdir, task=task, base=base, changes=changes, run=run_for(prefix))
+        try:
+            results.append(grader.grade(ctx))
+        except Exception as e:
+            print(f"warning: grader {grader.name} failed with {type(e).__name__}; counted as failed")
+            results.append(GraderResult(grader=grader.name, grader_version=grader.version, passed=False, score=0.0))
+    passed, _ = compose(results, plan.mode, plan.weights, plan.threshold)
+    return passed, results
 
 
 def make_run_info(cfg, only, sandboxed):
@@ -851,7 +935,7 @@ def make_run_info(cfg, only, sandboxed):
     targets = tuple(
         Target(
             harness=pair["harness"],
-            harness_version=cfg["harnesses"][pair["harness"]].get("version", "unknown"),
+            harness_version=runner_for(cfg["harnesses"][pair["harness"]]).version(),
             model=pair["model"],
             params={},
         )
@@ -873,6 +957,13 @@ def make_run_info(cfg, only, sandboxed):
 
 
 def cmd_run(args, cfg, base):
+    """Run the matrix. The baseline git dirs of the trials live in a private temp dir that is always removed: not in
+    `work_dir`, whose names an unsandboxed agent could guess."""
+    with tempfile.TemporaryDirectory(prefix="harness-bench-git-") as git_root:
+        _run_matrix(args, cfg, base, Path(git_root))
+
+
+def _run_matrix(args, cfg, base, git_root):
     validate_config(cfg)
     sandboxed = bool((cfg.get("sandbox") or {}).get("prefix"))
     if not sandboxed and not args.dry_run and not args.allow_unsandboxed:
@@ -894,6 +985,7 @@ def cmd_run(args, cfg, base):
     if work_root:
         print(f"work dir: {work_root}")
     secrets_all = [os.environ.get(v, "") for v in spend_key_vars(cfg)]
+    plans = {task["id"]: grade_plan(task) for task in cfg["tasks"]}
     writer = None if args.dry_run else RunWriter(out_dir, make_run_info(cfg, args.only, sandboxed))
 
     for pair in cfg["matrix"]:
@@ -908,7 +1000,8 @@ def cmd_run(args, cfg, base):
                 if key in finished and not args.dry_run:
                     print(f"skip  {key} (done)")
                     continue
-                cmd = build_cmd(h["command"], model, task["prompt"])
+                runner = runner_for(h)
+                cmd = runner.command(model, task["prompt"])
                 if args.dry_run:
                     print(shlex.join(cmd))
                     continue
@@ -936,7 +1029,9 @@ def cmd_run(args, cfg, base):
                         env_file,
                         secrets,
                     )
-                baseline = make_baseline(workdir)
+                runner.prepare(workdir)
+                git_dir = git_root / f"{tag}.git"
+                baseline = make_baseline(workdir, git_dir)
                 snap = work_root / f".{tag}.protected"
                 if snap.exists():
                     rmtree_inside(snap, work_root)
@@ -959,26 +1054,26 @@ def cmd_run(args, cfg, base):
                 (logs_dir / f"{tag}.agent.jsonl").write_text(redact(stdout, secrets))
                 (logs_dir / f"{tag}.agent.stderr").write_text(redact(stderr, secrets))
 
-                usage = PARSERS[h["parser"]](stdout)
+                usage = runner.parse_usage(stdout)
                 parse_ok = usage is not None
                 usage = usage or empty_usage()
 
-                save_diff(workdir, baseline, logs_dir / f"{tag}.diff")
+                # Captured before the protected paths are restored: an edit there must still count as a change.
+                changes = collect_changes(baseline)
+                save_diff(baseline, logs_dir / f"{tag}.diff", secrets=secrets)
+                rmtree_inside(git_dir, git_root)
                 restore_protected(task, workdir, snap)
                 rmtree_inside(snap, work_root)
-                if task.get("hidden_tests"):
-                    src = (base / task["hidden_tests"]).resolve()
-                    shutil.copytree(src, workdir, dirs_exist_ok=True)
-                test_rc, test_to = run_step(
-                    cfg,
-                    task["test"],
-                    cmd_env,
-                    task.get("test_timeout", 900),
-                    logs_dir / f"{tag}.test.log",
-                    workdir,
-                    env_file,
-                    secrets,
-                )
+
+                def run_for(prefix, tag=tag, workdir=workdir, env_file=env_file, secrets=secrets, cmd_env=cmd_env):
+                    def run(command, timeout, log_name):
+                        log = logs_dir / f"{tag}.{prefix}{safe(log_name)}.log"
+                        return run_step(cfg, command, cmd_env, timeout, log, workdir, env_file, secrets)
+
+                    return run
+
+                passed, grader_results = grade_trial(plans[task["id"]], task, base, workdir, changes, run_for)
+                test_to = any(r.timed_out for r in grader_results)
 
                 row = {
                     "ts": datetime.now(UTC).isoformat(timespec="seconds"),
@@ -986,7 +1081,7 @@ def cmd_run(args, cfg, base):
                     "harness": hname,
                     "model": model,
                     "rep": rep,
-                    "passed": test_rc == 0 and not test_to,
+                    "passed": passed,
                     "agent_rc": rc,
                     "agent_timed_out": timed_out,
                     "wall_s": round(wall, 1),
@@ -1003,8 +1098,9 @@ def cmd_run(args, cfg, base):
                     row,
                     run_id=writer.info.run_id,  # dry runs never reach this point, so the writer exists
                     suite_version=writer.info.suite_version,
-                    harness_version=h.get("version", "unknown"),
+                    harness_version=runner.version(),
                     test_timed_out=test_to,
+                    graders=grader_results if task.get("graders") else None,
                     warn=print,
                 )
                 with results_path.open("a") as f:
@@ -1293,7 +1389,7 @@ from enum import Enum, StrEnum
 from types import MappingProxyType, UnionType
 from typing import Any, ClassVar, Self, get_args, get_origin, get_type_hints
 
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = "1.1.0"
 _VERSION_RE = re.compile(r"^(\d+)\.\d+\.\d+$")
 _MAJOR = SCHEMA_VERSION.split(".")[0]
 
@@ -1540,6 +1636,7 @@ _COUNT_FIELDS = (
     "cache_read_tokens",
     "cache_write_tokens",
     "turns",
+    "tool_calls",
 )
 
 
@@ -1553,6 +1650,7 @@ class Usage(_Model):
     turns: int = 0
     parsed: bool
     costs: Costs
+    tool_calls: int | None = None
 
     DERIVED_KEYS: ClassVar[tuple[str, ...]] = ("cost_usd", "cost_source")
     DECODERS: ClassVar[Mapping[str, Callable[[Any], Any]]] = {"costs": Costs.from_dict}
@@ -1725,6 +1823,7 @@ _USAGE = _object(
         "cache_read_tokens": _COUNT,
         "cache_write_tokens": _COUNT,
         "turns": _COUNT,
+        "tool_calls": {"type": ["integer", "null"], "minimum": 0},
         "parsed": _BOOLEAN,
         "costs": {"$ref": "#/$defs/costs"},
         "cost_usd": _COST,
@@ -1931,7 +2030,7 @@ Phase 1 lack some keys (`parse_ok`, `sandboxed`, `cost_*`), so every optional ke
 
 import math
 import re
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
@@ -1997,6 +2096,7 @@ def trial_from_row(
     suite_version: str,
     harness_version: str = "unknown",
     test_timed_out: bool = False,
+    graders: Sequence[GraderResult] | None = None,
 ) -> TrialResult:
     target = Target(harness=row["harness"], harness_version=harness_version, model=row["model"], params={})
     passed = bool(row["passed"])
@@ -2007,6 +2107,7 @@ def trial_from_row(
         cache_read_tokens=_count("cache_read_tokens", row["cache_read"]),
         cache_write_tokens=_count("cache_write_tokens", row["cache_write"]),
         turns=_count("turns", row["turns"]),
+        tool_calls=None if row.get("tool_calls") is None else _count("tool_calls", row["tool_calls"]),
         parsed=bool(row.get("parse_ok", True)),
         costs=Costs(
             gateway=row.get("cost_litellm"), price_table=row.get("cost_computed"), harness=row.get("cost_reported")
@@ -2020,7 +2121,9 @@ def trial_from_row(
         target=target,
         rep=row["rep"],
         status=_status(passed, bool(row.get("agent_timed_out")) or test_timed_out),
-        graders=(GraderResult(grader="test", grader_version="1", passed=passed, timed_out=test_timed_out),),
+        graders=tuple(graders)
+        if graders is not None
+        else (GraderResult(grader="test", grader_version="1", passed=passed, timed_out=test_timed_out),),
         usage=usage,
         latency_s=row["wall_s"],
         started_at=_started_at(row),
@@ -2062,6 +2165,13 @@ def _sanitized(row: Mapping[str, Any], warn: Callable[[str], None] | None) -> di
             clean[key] = None
             if warn:
                 warn(f"warning: {_label(row)}: {key}: {e}; cost treated as unknown")
+    if row.get("tool_calls") is not None:
+        try:
+            _count("tool_calls", row["tool_calls"])
+        except ContractError as e:
+            clean["tool_calls"] = None
+            if warn:
+                warn(f"warning: {_label(row)}: {e}; tool calls treated as unknown")
     return clean
 
 
@@ -2072,15 +2182,16 @@ def trial_from_row_lenient(
     suite_version: str,
     harness_version: str = "unknown",
     test_timed_out: bool = False,
+    graders: Sequence[GraderResult] | None = None,
     warn: Callable[[str], None] | None = None,
 ) -> TrialResult:
     """Like `trial_from_row`, but fields that break the contract (negative, NaN, bool, fractional: parser output
     is untrusted) are dropped one by one instead of raising. See `_sanitized`."""
     kwargs = {"run_id": run_id, "suite_version": suite_version, "harness_version": harness_version}
     try:
-        return trial_from_row(row, test_timed_out=test_timed_out, **kwargs)
+        return trial_from_row(row, test_timed_out=test_timed_out, graders=graders, **kwargs)
     except ContractError:
-        return trial_from_row(_sanitized(row, warn), test_timed_out=test_timed_out, **kwargs)
+        return trial_from_row(_sanitized(row, warn), test_timed_out=test_timed_out, graders=graders, **kwargs)
 
 
 def trials_from_rows(rows: Iterable[Mapping[str, Any]], warn: Callable[[str], None] | None = None) -> list[TrialResult]:
@@ -2091,6 +2202,924 @@ def trials_from_rows(rows: Iterable[Mapping[str, Any]], warn: Callable[[str], No
         )
         for row in rows
     ]
+```
+
+`hbench/runners/__init__.py`:
+
+```python
+"""Harness runners: the protocol, the built-in output parsers and the registry (ADR 0007)."""
+
+from collections.abc import Mapping
+from typing import Any, TypeGuard
+
+from hbench.plugins import RUNNER_GROUP, create_plugin
+
+from hbench.runners._usage import Usage, empty_usage, json_lines, num
+from hbench.runners.base import HarnessRunner, ParseUsage, TemplateRunner
+from hbench.runners.claude import parse_claude
+from hbench.runners.codex import parse_codex
+from hbench.runners.cursor import parse_cursor
+from hbench.runners.null import parse_null
+from hbench.runners.opencode import parse_opencode
+from hbench.runners.pi import parse_pi
+
+__all__ = [
+    "PARSERS",
+    "HarnessRunner",
+    "TemplateRunner",
+    "Usage",
+    "empty_usage",
+    "json_lines",
+    "num",
+    "parse_claude",
+    "parse_codex",
+    "parse_cursor",
+    "parse_null",
+    "parse_opencode",
+    "parse_pi",
+    "runner_for",
+]
+
+PARSERS: Mapping[str, ParseUsage] = {
+    "claude": parse_claude,
+    "opencode": parse_opencode,
+    "pi": parse_pi,
+    "cursor": parse_cursor,
+    "codex": parse_codex,
+    "null": parse_null,
+}
+
+
+def _is_runner(obj: object) -> TypeGuard[HarnessRunner]:
+    return isinstance(obj, HarnessRunner)
+
+
+def runner_for(harness_cfg: Mapping[str, Any]) -> HarnessRunner:
+    """The runner of a harness config entry: a built-in parser, else the plugin of that name.
+    Raises ValueError (a `PluginError` for an unknown name) when the entry is unusable."""
+    parser = harness_cfg.get("parser")
+    if not isinstance(parser, str):
+        raise ValueError("a harness needs a 'parser' name")
+    if parser in PARSERS:
+        return TemplateRunner(harness_cfg, PARSERS[parser])
+    return create_plugin(RUNNER_GROUP, parser, PARSERS, harness_cfg, _is_runner, "HarnessRunner")
+```
+
+`hbench/runners/base.py`:
+
+```python
+"""The runner protocol and the adapter built from a harness config entry.
+
+A runner builds the agent argv and parses its output. It never starts a process: the engine
+runs the argv through `wrap()` and the env allowlist (ADR 0007).
+"""
+
+from collections.abc import Callable, Mapping
+from pathlib import Path
+from typing import Any, Protocol, runtime_checkable
+
+from hbench.runners._usage import Usage
+
+ParseUsage = Callable[[str], Usage | None]
+
+
+@runtime_checkable
+class HarnessRunner(Protocol):
+    """A harness as an adapter: argv builder and usage parser."""
+
+    name: str
+
+    def prepare(self, workdir: Path) -> None:
+        """Hook run on the host before the agent starts (default: nothing to do)."""
+
+    def command(self, model: str, prompt: str) -> list[str]:
+        """The agent argv for this model and prompt."""
+
+    def parse_usage(self, stdout: str) -> Usage | None:
+        """Usage from the agent stdout, or None when the format has none."""
+
+    def version(self) -> str:
+        """The harness version recorded in the results."""
+
+
+def build_argv(template: list[str], model: str, prompt: str) -> list[str]:
+    """Fill `{model}`, `{provider}`, `{model_name}` and `{prompt}` in each template part."""
+    provider, _, model_name = model.partition("/") if "/" in model else ("", "", model)
+    fields = {"model": model, "provider": provider, "model_name": model_name, "prompt": prompt}
+    return [part.format(**fields) for part in template]
+
+
+class TemplateRunner:
+    """Runner for a harness config entry: `command` template, `parser` name, optional `version`."""
+
+    def __init__(self, harness_cfg: Mapping[str, Any], parse: ParseUsage) -> None:
+        template = harness_cfg.get("command")
+        if not isinstance(template, list) or not all(isinstance(part, str) for part in template):
+            raise ValueError("a harness needs a 'command' list of strings")
+        self.name: str = harness_cfg["parser"]
+        self._template: list[str] = template
+        self._version: str = harness_cfg.get("version", "unknown")
+        self._parse = parse
+
+    def prepare(self, workdir: Path) -> None:
+        """Template harnesses need no preparation."""
+
+    def command(self, model: str, prompt: str) -> list[str]:
+        return build_argv(self._template, model, prompt)
+
+    def parse_usage(self, stdout: str) -> Usage | None:
+        return self._parse(stdout)
+
+    def version(self) -> str:
+        return self._version
+```
+
+`hbench/runners/_usage.py`:
+
+```python
+"""Helpers shared by the output parsers: numeric lookup, JSONL reading and the empty usage dict."""
+
+import json
+from collections.abc import Iterator
+from typing import Any
+
+Usage = dict[str, Any]
+
+
+def num(d: object, *keys: str) -> int | float:
+    """First numeric value found under any of keys, else 0."""
+    if not isinstance(d, dict):
+        return 0
+    for k in keys:
+        v = d.get(k)
+        if isinstance(v, int | float) and not isinstance(v, bool):
+            return v
+    return 0
+
+
+def json_lines(text: str) -> Iterator[dict[str, Any]]:
+    """Yield JSON objects from a JSONL stream; skip non-JSON lines."""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            yield json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+
+def empty_usage() -> Usage:
+    return {
+        "input": 0,
+        "output": 0,
+        "reasoning": 0,
+        "cache_read": 0,
+        "cache_write": 0,
+        "cost_reported": None,
+        "turns": 0,
+        "tool_calls": None,
+    }
+```
+
+`hbench/runners/claude.py`:
+
+```python
+"""Parser for `claude -p --output-format json`."""
+
+import json
+
+from collections.abc import Iterable
+from typing import Any
+
+from hbench.runners._usage import Usage, empty_usage, json_lines, num
+
+
+def _count_tool_calls(events: Iterable[dict[str, Any]]) -> int | None:
+    """Unique `tool_use` blocks over the stream-json `assistant` events; None when there are no such events
+    (the single-result JSON format does not list tool calls)."""
+    seen_assistant, ids, anonymous = False, set(), 0
+    for event in events:
+        if event.get("type") != "assistant":
+            continue
+        seen_assistant = True
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        for block in content if isinstance(content, list) else ():
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                if block.get("id") is None:
+                    anonymous += 1
+                else:
+                    ids.add(str(block["id"]))
+    return len(ids) + anonymous if seen_assistant else None
+
+
+def parse_claude(stdout: str) -> Usage | None:
+    """claude -p --output-format json (single result object; stream-json also works)."""
+    result = None
+    events = list(json_lines(stdout))
+    for obj in events:
+        if obj.get("type") == "result":
+            result = obj
+    if result is None:
+        try:
+            result = json.loads(stdout)
+        except json.JSONDecodeError:
+            return None
+    u = empty_usage()
+    model_usage = result.get("modelUsage")
+    if isinstance(model_usage, dict) and model_usage:
+        # Includes side calls (subagents, small helper model), not only the main model.
+        for m in model_usage.values():
+            u["input"] += num(m, "inputTokens")
+            u["output"] += num(m, "outputTokens")
+            u["cache_read"] += num(m, "cacheReadInputTokens")
+            u["cache_write"] += num(m, "cacheCreationInputTokens")
+    else:
+        usage = result.get("usage", {})
+        u["input"] = num(usage, "input_tokens")
+        u["output"] = num(usage, "output_tokens")
+        u["cache_read"] = num(usage, "cache_read_input_tokens")
+        u["cache_write"] = num(usage, "cache_creation_input_tokens")
+    if isinstance(result.get("total_cost_usd"), int | float):
+        u["cost_reported"] = result["total_cost_usd"]
+    u["turns"] = num(result, "num_turns")
+    u["tool_calls"] = _count_tool_calls(events)
+    return u
+```
+
+`hbench/runners/opencode.py`:
+
+```python
+"""Parser for `opencode run --format json`."""
+
+from hbench.runners._usage import Usage, empty_usage, json_lines, num
+
+
+def parse_opencode(stdout: str) -> Usage | None:
+    """opencode run --format json: sum every step_finish event."""
+    u = empty_usage()
+    cost, seen = 0.0, False
+    tool_calls: int | None = None  # unknown until a `tool_use` event shows this CLI version reports them
+    for obj in json_lines(stdout):
+        kind = str(obj.get("type", "")).replace("-", "_")
+        if kind == "tool_use":
+            tool_calls = (tool_calls or 0) + 1
+        if kind != "step_finish":
+            continue
+        part = obj.get("part", obj)
+        tok = part.get("tokens", {}) or {}
+        cache = tok.get("cache") if isinstance(tok.get("cache"), dict) else {}
+        u["input"] += num(tok, "input")
+        u["output"] += num(tok, "output")
+        u["reasoning"] += num(tok, "reasoning")
+        u["cache_read"] += num(cache, "read") or num(tok, "cacheRead", "cache_read")
+        u["cache_write"] += num(cache, "write") or num(tok, "cacheWrite", "cache_write")
+        cost += num(part, "cost")
+        u["turns"] += 1
+        seen = True
+    if not seen:
+        return None
+    u["cost_reported"] = cost
+    u["tool_calls"] = tool_calls
+    return u
+```
+
+`hbench/runners/pi.py`:
+
+```python
+"""Parser for `pi --mode json`."""
+
+from hbench.runners._usage import Usage, empty_usage, json_lines, num
+
+
+def parse_pi(stdout: str) -> Usage | None:
+    """pi --mode json: sum usage of assistant messages on message_end events only."""
+    u = empty_usage()
+    cost, seen, has_cost = 0.0, False, False
+    tool_calls: int | None = None
+    for obj in json_lines(stdout):
+        if obj.get("type") != "message_end":
+            continue
+        msg = obj.get("message", {}) or {}
+        if msg.get("role") != "assistant":
+            continue
+        usage = msg.get("usage", {}) or {}
+        u["input"] += num(usage, "input", "inputTokens", "input_tokens")
+        u["output"] += num(usage, "output", "outputTokens", "output_tokens")
+        u["cache_read"] += num(usage, "cacheRead", "cache_read")
+        u["cache_write"] += num(usage, "cacheWrite", "cache_write")
+        c = usage.get("cost")
+        if isinstance(c, dict) and isinstance(c.get("total"), int | float):
+            cost += c["total"]
+            has_cost = True
+        elif isinstance(c, int | float):
+            cost += c
+            has_cost = True
+        u["turns"] += 1
+        seen = True
+        content = msg.get("content")
+        if isinstance(content, list):
+            calls = sum(1 for block in content if isinstance(block, dict) and block.get("type") == "toolCall")
+            tool_calls = (tool_calls or 0) + calls
+    if not seen:
+        return None
+    u["cost_reported"] = cost if has_cost else None
+    u["tool_calls"] = tool_calls
+    return u
+```
+
+`hbench/runners/cursor.py`:
+
+```python
+"""Parser for `agent -p --output-format json` (Cursor)."""
+
+from hbench.runners._usage import Usage, empty_usage, json_lines, num
+
+
+def parse_cursor(stdout: str) -> Usage | None:
+    """agent -p --output-format json. Official docs show no usage fields; some versions
+    emit usage{inputTokens,outputTokens,cacheReadTokens,cacheWriteTokens}. Returns None
+    when no usage is present (pass rate and time are still recorded)."""
+    result = None
+    for obj in json_lines(stdout):
+        if obj.get("type") == "result":
+            result = obj
+    if not result or not isinstance(result.get("usage"), dict):
+        return None
+    usage = result["usage"]
+    u = empty_usage()
+    u["input"] = num(usage, "inputTokens", "input_tokens")
+    u["output"] = num(usage, "outputTokens", "output_tokens")
+    u["cache_read"] = num(usage, "cacheReadTokens", "cache_read_tokens")
+    u["cache_write"] = num(usage, "cacheWriteTokens", "cache_write_tokens")
+    cost = num(usage, "totalCostUSD") or num(result, "total_cost_usd")
+    u["cost_reported"] = cost or None
+    u["turns"] = 1  # `tool_calls` stays unknown: the JSON result does not list them
+    return u
+```
+
+`hbench/runners/codex.py`:
+
+```python
+"""Parser for `codex exec --json`."""
+
+from typing import Any
+
+from hbench.runners._usage import Usage, empty_usage, json_lines, num
+
+# `item.completed` item types that are the agent acting on the world (not messages or reasoning).
+TOOL_ITEMS = {"command_execution", "file_change", "mcp_tool_call", "web_search"}
+
+
+def _item_type(event: dict[str, Any]) -> object:
+    item = event.get("item")
+    return item.get("type") if isinstance(item, dict) else None
+
+
+def parse_codex(stdout: str) -> Usage | None:
+    """codex exec --json: usage on turn.completed is the thread's running total, so take
+    the last one. cached_input_tokens is a subset of input_tokens; reasoning_output_tokens
+    is a subset of output_tokens (not added again)."""
+    last, turns = None, 0
+    tool_calls: int | None = None  # unknown until an `item.completed` event shows this CLI version reports items
+    for obj in json_lines(stdout):
+        if obj.get("type") == "turn.completed" and isinstance(obj.get("usage"), dict):
+            last = obj["usage"]
+            turns += 1
+        elif obj.get("type") == "item.completed":
+            tool_calls = (tool_calls or 0) + (_item_type(obj) in TOOL_ITEMS)
+    if last is None:
+        return None
+    u = empty_usage()
+    cached = num(last, "cached_input_tokens")
+    u["input"] = max(num(last, "input_tokens") - cached, 0)
+    u["cache_read"] = cached
+    u["output"] = num(last, "output_tokens")
+    u["turns"] = turns
+    u["tool_calls"] = tool_calls
+    return u
+```
+
+`hbench/runners/null.py`:
+
+```python
+"""Parser for the `null` negative-control harness."""
+
+from hbench.runners._usage import Usage, empty_usage
+
+
+def parse_null(stdout: str) -> Usage:
+    """Negative control: no model is called, so usage is zero and the cost is a real 0.0.
+    A `null` pair that solves a task means the hidden tests are too lenient."""
+    u = empty_usage()
+    u["cost_reported"] = 0.0
+    u["tool_calls"] = 0
+    return u
+```
+
+`hbench/graders/__init__.py`:
+
+```python
+"""Graders: the protocol, bundled graders, composition and the grading plan of a task (ADR 0007)."""
+
+from hbench.graders.base import Change, GradeContext, Grader, parse_score
+from hbench.graders.compose import compose
+from hbench.graders.registry import GRADER_GROUP, GRADERS, GradePlan, grade_plan, grader_for
+
+__all__ = [
+    "GRADERS",
+    "GRADER_GROUP",
+    "Change",
+    "GradeContext",
+    "GradePlan",
+    "Grader",
+    "compose",
+    "grade_plan",
+    "grader_for",
+    "parse_score",
+]
+```
+
+`hbench/graders/base.py`:
+
+```python
+"""The grader protocol, its inputs and the `SCORE:` convention (ADR 0007).
+
+A grader never starts a process: it asks the engine through `GradeContext.run`, which applies the env
+allowlist, the sandbox wrapper and log redaction.
+"""
+
+import re
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Protocol, runtime_checkable
+
+from hbench.core.models import GraderResult
+
+# run(command, timeout, log_name) -> (exit code, timed out, stdout, stderr). A score is only ever read from stdout.
+RunStep = Callable[[str, int, str], tuple[int | None, bool, str, str]]
+
+_SCORE_LINE = re.compile(r"SCORE:\s*([0-9.]+)\s*")
+
+
+@dataclass(frozen=True)
+class Change:
+    """One file the agent changed: POSIX path relative to the workdir and the changed line counts."""
+
+    path: str
+    added: int
+    deleted: int
+
+
+@dataclass(frozen=True)
+class GradeContext:
+    """Everything a grader may use: the workdir, the task config, the benchmark dir, the agent's changes
+    (captured before protected paths are restored) and the engine's `run`."""
+
+    workdir: Path
+    task: Mapping[str, Any]
+    base: Path
+    changes: tuple[Change, ...]
+    run: RunStep
+
+
+@runtime_checkable
+class Grader(Protocol):
+    name: str
+    version: str
+
+    def grade(self, ctx: GradeContext) -> GraderResult:
+        """The verdict for one trial."""
+
+
+def parse_score(output: str, warn: Callable[[str], None] | None = None) -> float | None:
+    """Score from the last `SCORE: <number>` line of `output`, or None.
+
+    A value outside [0, 1] or not a number gives None (the caller falls back to pass/fail) and a warning.
+    The last line wins, so an earlier line printed by agent code cannot override the real one."""
+    value: str | None = None
+    for line in output.splitlines():
+        match = _SCORE_LINE.fullmatch(line)
+        if match:
+            value = match.group(1)
+    if value is None:
+        return None
+    try:
+        score = float(value)
+    except ValueError:
+        score = -1.0
+    if not 0 <= score <= 1:
+        if warn:
+            warn(f"warning: ignored SCORE value {value!r}: use a number from 0 to 1")
+        return None
+    return score
+```
+
+`hbench/graders/compose.py`:
+
+```python
+"""Combine several grader results into one verdict and score (ADR 0007, decision 6)."""
+
+from collections.abc import Sequence
+
+from hbench.core.models import GraderResult
+
+MODES = ("all", "any", "weighted")
+
+
+def _score(result: GraderResult) -> float:
+    """The grader's score; 1.0 on pass and 0.0 otherwise when it gave none."""
+    if result.score is not None:
+        return result.score
+    return 1.0 if result.passed else 0.0
+
+
+def check_grade(mode: object, threshold: object, weights: Sequence[object], count: int) -> None:
+    """Raises ValueError unless `mode` is known, there is one positive number per grader in `weights`, and a
+    `weighted` grade has a `threshold` above 0 and up to 1."""
+    if mode not in MODES:
+        raise ValueError(f"unknown grade mode {mode!r}: use one of {', '.join(MODES)}")
+    if len(weights) != count or not all(_is_positive_number(w) for w in weights):
+        raise ValueError("each grader needs a weight above 0 (one per grader)")
+    if mode == "weighted":
+        _threshold(threshold)
+
+
+def _threshold(value: object) -> float:
+    """The `weighted` pass threshold: a number above 0 and up to 1."""
+    if isinstance(value, bool) or not isinstance(value, int | float) or not 0 < value <= 1:
+        raise ValueError("weighted grading needs a threshold above 0 and up to 1")
+    return value
+
+
+def _is_positive_number(value: object) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool) and value > 0
+
+
+def compose(
+    results: Sequence[GraderResult], mode: str, weights: Sequence[float], threshold: float | None
+) -> tuple[bool, float]:
+    """`(passed, score)`. `all`: every grader passes, score is the mean. `any`: one passes, score is the max.
+    `weighted`: score is the weighted mean, passed when it reaches `threshold` (in (0, 1], required)."""
+    if not results:
+        raise ValueError("no grader results to compose")
+    check_grade(mode, threshold, weights, len(results))
+    scores = [_score(r) for r in results]
+    if mode == "all":
+        return all(r.passed for r in results), sum(scores) / len(scores)
+    if mode == "any":
+        return any(r.passed for r in results), max(scores)
+    score = sum(w * s for w, s in zip(weights, scores, strict=True)) / sum(weights)
+    return score >= _threshold(threshold), score
+```
+
+`hbench/graders/_command.py`:
+
+```python
+"""Shared by the graders that run a command: the verdict from its outcome and the validation of its timeout."""
+
+from collections.abc import Mapping
+from typing import Any
+
+from hbench.core.models import GraderResult
+from hbench.graders.base import parse_score
+
+DEFAULT_TIMEOUT = 900
+
+
+def check_timeout(value: Any) -> int:
+    """A timeout in seconds: a whole number above 0 (bool is not a number here)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"timeout must be a whole number of seconds above 0, got {value!r}")
+    return value
+
+
+def check_score_flag(cfg: Mapping[str, Any]) -> bool:
+    """The grader's `score` option: true to read partial credit from a `SCORE:` line (default false)."""
+    value = cfg.get("score", False)
+    if not isinstance(value, bool):
+        raise ValueError(f"'score' must be true or false, got {value!r}")
+    return value
+
+
+def command_result(
+    name: str, version: str, rc: int | None, timed_out: bool, stdout: str, use_score: bool = False
+) -> GraderResult:
+    """Passed on exit code 0 without a timeout. The score is 1.0 on pass and 0.0 on fail, unless `use_score` is set
+    and the last `SCORE:` line of stdout is valid. Stderr is never read: agent code can print to it freely."""
+    passed = rc == 0 and not timed_out
+    score = parse_score(stdout, print) if use_score else None
+    return GraderResult(
+        grader=name,
+        grader_version=version,
+        passed=passed,
+        score=score if score is not None else (1.0 if passed else 0.0),
+        timed_out=timed_out,
+    )
+```
+
+`hbench/graders/hidden_tests.py`:
+
+```python
+"""The default grader: copy the hidden tests into the workdir, then run the task's test command."""
+
+import shutil
+from collections.abc import Mapping
+from typing import Any
+
+from hbench.core.models import GraderResult
+from hbench.graders._command import DEFAULT_TIMEOUT, check_score_flag, command_result
+from hbench.graders.base import GradeContext
+
+
+class HiddenTestsGrader:
+    """Reads the task keys `hidden_tests`, `test` and `test_timeout`. Its one option is `score` (true reads a
+    `SCORE:` line from the test output)."""
+
+    name = "hidden_tests"
+    version = "1"
+
+    def __init__(self, cfg: Mapping[str, Any]) -> None:
+        self._use_score = check_score_flag(cfg)
+
+    def grade(self, ctx: GradeContext) -> GraderResult:
+        hidden = ctx.task.get("hidden_tests")
+        if hidden:
+            shutil.copytree((ctx.base / hidden).resolve(), ctx.workdir, dirs_exist_ok=True)
+        rc, timed_out, stdout, _ = ctx.run(ctx.task["test"], ctx.task.get("test_timeout", DEFAULT_TIMEOUT), "test")
+        return command_result(self.name, self.version, rc, timed_out, stdout, self._use_score)
+```
+
+`hbench/graders/command.py`:
+
+```python
+"""Grader that runs a command and passes on exit code 0."""
+
+from collections.abc import Mapping
+from typing import Any
+
+from hbench.core.models import GraderResult
+from hbench.graders._command import DEFAULT_TIMEOUT, check_score_flag, check_timeout, command_result
+from hbench.graders.base import GradeContext
+
+
+class CommandGrader:
+    """Options: `command` (required), `timeout` in seconds (default 900) and `score` (true reads a `SCORE:` line)."""
+
+    name = "command"
+    version = "1"
+
+    def __init__(self, cfg: Mapping[str, Any]) -> None:
+        command = cfg.get("command")
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError("command grader needs a non-empty 'command' string")
+        self._command = command
+        self._timeout = check_timeout(cfg.get("timeout", DEFAULT_TIMEOUT))
+        self._use_score = check_score_flag(cfg)
+
+    def grade(self, ctx: GradeContext) -> GraderResult:
+        rc, timed_out, stdout, _ = ctx.run(self._command, self._timeout, "command")
+        return command_result(self.name, self.version, rc, timed_out, stdout, self._use_score)
+```
+
+`hbench/graders/diff_constraints.py`:
+
+```python
+"""Grader that checks what the agent changed, without running anything."""
+
+import fnmatch
+import posixpath
+from collections.abc import Mapping, Sequence
+from typing import Any
+
+from hbench.core.models import GraderResult
+from hbench.graders.base import Change, GradeContext
+
+
+def _globs(cfg: Mapping[str, Any], key: str) -> tuple[str, ...]:
+    value = cfg.get(key, [])
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise ValueError(f"diff_constraints '{key}' must be a list of glob strings")
+    return tuple(value)
+
+
+def _max_lines(cfg: Mapping[str, Any]) -> int | None:
+    value = cfg.get("max_changed_lines")
+    if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+        raise ValueError(f"diff_constraints 'max_changed_lines' must be a whole number >= 0, got {value!r}")
+    return value
+
+
+def _normalized(path: str) -> str | None:
+    """The path relative to the workdir without `.` or `..` parts, or None when it points outside."""
+    clean = posixpath.normpath(path)
+    if clean.startswith("/") or clean == ".." or clean.startswith("../"):
+        return None
+    return clean
+
+
+def _matches(path: str, patterns: Sequence[str]) -> bool:
+    return any(fnmatch.fnmatchcase(path, p) for p in patterns)
+
+
+class DiffConstraintsGrader:
+    """Options: `allowed` and `forbidden` (glob lists, `fnmatch` on POSIX paths relative to the workdir; an empty
+    `allowed` allows everything), `max_changed_lines` and `ignore_lines` (globs of paths left out of the line count
+    only, such as `*/__pycache__/*`; the path checks still apply to them). A path outside the workdir is always
+    forbidden."""
+
+    name = "diff_constraints"
+    version = "1"
+
+    def __init__(self, cfg: Mapping[str, Any]) -> None:
+        self._allowed = _globs(cfg, "allowed")
+        self._forbidden = _globs(cfg, "forbidden")
+        self._max_lines = _max_lines(cfg)
+        self._ignore_lines = _globs(cfg, "ignore_lines")
+
+    def violations(self, changes: Sequence[Change]) -> list[str]:
+        """One message per broken constraint."""
+        found = []
+        for change in changes:
+            path = _normalized(change.path)
+            if path is None or _matches(path, self._forbidden):
+                found.append(f"forbidden path {change.path!r}")
+            elif self._allowed and not _matches(path, self._allowed):
+                found.append(f"path {change.path!r} is not allowed")
+        total = sum(
+            c.added + c.deleted for c in changes if not _matches(_normalized(c.path) or c.path, self._ignore_lines)
+        )
+        if self._max_lines is not None and total > self._max_lines:
+            found.append(f"{total} changed lines, more than {self._max_lines}")
+        return found
+
+    def grade(self, ctx: GradeContext) -> GraderResult:
+        passed = not self.violations(ctx.changes)
+        return GraderResult(grader=self.name, grader_version=self.version, passed=passed, score=1.0 if passed else 0.0)
+```
+
+`hbench/graders/registry.py`:
+
+```python
+"""Built-in grader registry and the grading plan of a task (ADR 0007, decisions 4 and 6)."""
+
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from typing import Any, TypeGuard
+
+from hbench.graders.base import Grader
+from hbench.graders.command import CommandGrader
+from hbench.graders.compose import check_grade
+from hbench.graders.diff_constraints import DiffConstraintsGrader
+from hbench.graders.hidden_tests import HiddenTestsGrader
+from hbench.plugins import GRADER_GROUP, create_plugin
+
+GRADERS: Mapping[str, Callable[[Mapping[str, Any]], Grader]] = {
+    "hidden_tests": HiddenTestsGrader,
+    "command": CommandGrader,
+    "diff_constraints": DiffConstraintsGrader,
+}
+
+
+@dataclass(frozen=True)
+class GradePlan:
+    """The graders of a task, in order, and how their results combine."""
+
+    graders: tuple[Grader, ...]
+    weights: tuple[float, ...]
+    mode: str
+    threshold: float | None
+
+
+def _is_grader(obj: object) -> TypeGuard[Grader]:
+    return isinstance(obj, Grader)
+
+
+def grader_for(entry: Mapping[str, Any]) -> Grader:
+    """The grader of one `graders` entry: a built-in type, else the plugin of that name.
+    Raises ValueError (a `PluginError` for an unknown type) for a bad entry."""
+    if not isinstance(entry, Mapping) or not isinstance(entry.get("type"), str):
+        raise ValueError("each grader must be an object with a 'type' string")
+    name = entry["type"]
+    if name in GRADERS:
+        return GRADERS[name](entry)
+    return create_plugin(GRADER_GROUP, name, GRADERS, entry, _is_grader, "Grader")
+
+
+def grade_plan(task: Mapping[str, Any]) -> GradePlan:
+    """The plan for `task`. Without a `graders` key it is the single `hidden_tests` grader.
+    Raises ValueError for a bad `graders` list, weight or `grade` block."""
+    entries = task.get("graders", [{"type": "hidden_tests"}])
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("graders must be a non-empty list")
+    graders = tuple(grader_for(e) for e in entries)
+    if any(g.name == "hidden_tests" for g in graders) and "test" not in task:
+        raise ValueError("the hidden_tests grader needs the task's 'test' command")
+    grade = task.get("grade", {})
+    if not isinstance(grade, Mapping):
+        raise ValueError("grade must be an object with 'mode' and 'threshold'")
+    mode, threshold = grade.get("mode", "all"), grade.get("threshold")
+    weights = tuple(e.get("weight", 1) for e in entries)
+    check_grade(mode, threshold, weights, len(graders))
+    return GradePlan(graders=graders, weights=weights, mode=mode, threshold=threshold)
+
+
+__all__ = ["GRADERS", "GRADER_GROUP", "GradePlan", "grade_plan", "grader_for"]
+```
+
+`hbench/plugins.py`:
+
+```python
+"""Plugins through entry points (ADR 0007, decision 7).
+
+Third-party packages register a factory `(config) -> HarnessRunner | Grader` in the groups
+`harness_bench.runners` and `harness_bench.graders`. Built-in names always win: callers only come here for a
+name that is not built in, so a plain run never imports third-party code. Every failure is a `PluginError`
+with a message that names the plugin, never a traceback from the engine.
+"""
+
+from collections.abc import Callable, Collection, Mapping
+from importlib.metadata import EntryPoint, entry_points
+from typing import Any, TypeGuard
+
+RUNNER_GROUP = "harness_bench.runners"
+GRADER_GROUP = "harness_bench.graders"
+
+
+class PluginError(ValueError):
+    """A plugin is missing, ambiguous, broken or of the wrong type."""
+
+
+_announced: set[str] = set()
+
+
+def reset_announced() -> None:
+    """Forget which plugins were already announced (for tests that install several)."""
+    _announced.clear()
+
+
+def _origin(ep: EntryPoint) -> str:
+    dist = ep.dist
+    return f"{dist.name} {dist.version}" if dist else "an unknown distribution"
+
+
+def _kind(group: str) -> str:
+    return group.rsplit(".", 1)[-1].removesuffix("s")
+
+
+def _find(group: str, name: str, builtins: Collection[str]) -> EntryPoint:
+    points = entry_points(group=group)
+    for ep in points:
+        if ep.name in builtins:
+            raise PluginError(f"plugin {group}:{ep.name} from {_origin(ep)} uses a built-in name; rename it")
+    matches = [ep for ep in points if ep.name == name]
+    if not matches:
+        raise PluginError(
+            f"unknown {_kind(group)} type {name!r}: not built in ({', '.join(sorted(builtins))}) "
+            f"and no plugin registered in the entry-point group {group!r}"
+        )
+    if len(matches) > 1:
+        origins = ", ".join(_origin(ep) for ep in matches)
+        raise PluginError(f"plugin {group}:{name} is registered by more than one package: {origins}")
+    return matches[0]
+
+
+def load_plugin(group: str, name: str, builtins: Collection[str]) -> Callable[[Mapping[str, Any]], object]:
+    """The factory registered as `name` in `group`. Prints the plugin's distribution once per process."""
+    ep = _find(group, name, builtins)
+    try:
+        factory = ep.load()
+    except Exception as e:
+        raise PluginError(f"plugin {group}:{name} failed to load: {type(e).__name__}: {e}") from e
+    if not callable(factory):
+        raise PluginError(f"plugin {group}:{name} is not callable: expected a factory taking the config")
+    label = f"{group}:{name}"
+    if label not in _announced:
+        _announced.add(label)
+        print(f"plugin {label} from {_origin(ep)}")
+    plugin_factory: Callable[[Mapping[str, Any]], object] = factory
+    return plugin_factory
+
+
+def create_plugin[T](
+    group: str,
+    name: str,
+    builtins: Collection[str],
+    config: Mapping[str, Any],
+    accepts: Callable[[object], TypeGuard[T]],
+    expected: str,
+) -> T:
+    """Load the plugin `name`, call its factory with `config` and check the result with `accepts`."""
+    factory = load_plugin(group, name, builtins)
+    try:
+        built = factory(config)
+    except Exception as e:
+        raise PluginError(f"plugin {group}:{name} failed to build: {type(e).__name__}: {e}") from e
+    if not accepts(built):
+        raise PluginError(f"plugin {group}:{name} returned a {type(built).__name__}, not a {expected}")
+    return built
 ```
 
 `hbench/results.py`:
@@ -2397,6 +3426,13 @@ def fmt_int(v: float | None) -> str:
     return "n/a" if v is None or math.isinf(v) else f"{v:,.0f}"
 
 
+def fmt_tool_calls(v: float | None) -> str:
+    """`n/a` when unknown, `inf` when nothing was solved (like cost per solved task)."""
+    if v is None:
+        return "n/a"
+    return "inf" if math.isinf(v) else f"{v:.1f}"
+
+
 def _task_counts(trials: Sequence[TrialResult]) -> list[tuple[int, int]]:
     """`(runs, passes)` per task."""
     per_task: dict[str, list[bool]] = {}
@@ -2433,6 +3469,8 @@ def _pair_entry(
     costs = [c for c, _ in picked]
     cost = None if any(c is None for c in costs) else sum(c for c in costs if c is not None)
     names = sorted({_NAME_BY_SOURCE[s] for c, s in picked if c is not None})
+    calls = [t.usage.tool_calls for t in trials]
+    tool_calls = None if any(c is None for c in calls) else sum(c for c in calls if c is not None)
     counts = _task_counts(trials)
     k = min(runs for runs, _ in counts)
     pass_low, pass_high = wilson_interval(solved, n)
@@ -2466,6 +3504,8 @@ def _pair_entry(
         "pareto": False,
         "reps_needed": reps_for_ci_width(solved / n, target_ci_width, len(counts)),
         "null_control": null,
+        "tool_calls_per_run": tool_calls / n if tool_calls is not None else None,
+        "tool_calls_per_solved": (tool_calls / solved if solved else math.inf) if tool_calls is not None else None,
     }
 
 
@@ -2527,9 +3567,10 @@ def write_csv(table: Sequence[Mapping[str, Any]], path: Path) -> None:
 _HEAD = (
     "| # | Harness | Model | Solved | Pass rate | Cost/solved | Cost/run "
     "| Cost/1M tokens | Tokens/solved | Tokens/run | Cache hit | Turns | Time (s) "
-    "| Cost source | Pass 95% CI | pass@k | pass^k | Cost/solved 95% CI | Tie | Pareto |"
+    "| Cost source | Pass 95% CI | pass@k | pass^k | Cost/solved 95% CI | Tie | Pareto "
+    "| Tool calls/run | Tool calls/solved |"
 )
-_COLUMNS = 20
+_COLUMNS = 22
 
 
 def _range(low: float | None, high: float | None, fmt: Callable[[float], str], unit: str = "") -> str:
@@ -2546,7 +3587,8 @@ def _table_line(i: int, t: Mapping[str, Any]) -> str:
         f"| {_range(t['pass_ci_low'], t['pass_ci_high'], lambda v: f'{v * 100:.0f}', '%')} "
         f"| {t['pass_at_k']:.0%} (k={t['k']}) | {t['pass_hat_k']:.0%} (k={t['k']}) "
         f"| {_range(t['cost_per_solved_ci_low'], t['cost_per_solved_ci_high'], fmt_money)} "
-        f"| {'' if t['tie_with'] is None else f'={t["tie_with"]}'} | {'yes' if t['pareto'] else ''} |"
+        f"| {'' if t['tie_with'] is None else f'={t["tie_with"]}'} | {'yes' if t['pareto'] else ''} "
+        f"| {fmt_tool_calls(t['tool_calls_per_run'])} | {fmt_tool_calls(t['tool_calls_per_solved'])} |"
     )
 
 
@@ -3472,16 +4514,19 @@ def make_git_task(tmp):
 
 def main():
     tmp = Path(tempfile.mkdtemp(prefix="hb-smoke-"))
+    hide_work = Path(tempfile.mkdtemp(prefix="hb-smoke-work-"))
     try:
         fixtures.copy_engine(tmp)
         shutil.copytree(ROOT / "tasks" / "fizzbuzz", tmp / "tasks" / "fizzbuzz")
         tags_file, probe_file = tmp / "tags.txt", tmp / "probe.jsonl"
+        marker = tmp / "host-exec-marker"
         os.environ.update(
             FAKE_TAGS_FILE=str(tags_file),
             FAKE_PROBE_FILE=str(probe_file),
             FAKE_KEY=fake_litellm.KEY,
             SECRET_CANARY="must-not-leak",
             FAKE_API_KEY=API_KEY,
+            FAKE_MARKER=str(marker),
         )
 
         srv, port = fake_litellm.serve()
@@ -3491,6 +4536,7 @@ def main():
             "FAKE_TAGS_FILE": "${FAKE_TAGS_FILE}",
             "FAKE_PROBE_FILE": "${FAKE_PROBE_FILE}",
             "FAKE_API_KEY": "${FAKE_API_KEY}",
+            "FAKE_MARKER": "${FAKE_MARKER}",
         }
         fizz = fixtures.fizzbuzz_task()
         cfg = dict(
@@ -3514,6 +4560,11 @@ def main():
             rows["codex"]["input"] == 5000 and rows["codex"]["cache_read"] == 15000, "codex: cached is subset of input"
         )
         check(abs(rows["codex"]["cost_computed"] - 0.0735) < 1e-9, "codex: computed cost from prices")
+        counts = {name: r["tool_calls"] for name, r in rows.items()}
+        check(
+            counts == {"claude": 2, "opencode": 2, "pi": 3, "codex": 2, "cursor": None},
+            "tool calls counted per format, unknown (never 0) for cursor",
+        )
         check(
             not rows["cursor"]["parse_ok"] and rows["cursor"]["cost_computed"] is None, "cursor: no usage, no fake $0"
         )
@@ -3566,12 +4617,74 @@ def main():
         (tmp / "config2.json").write_text(json.dumps(cfg2))
         run(tmp, "harness_bench.py", "run", config="config2.json")
         pr = json.loads(probe_file.read_text().splitlines()[0])
-        check(pr["depth"] == "1" and pr["remotes"] == "", "workdir: no git history or remote (fix commit hidden)")
+        check(pr["depth"] == "" and pr["remotes"] == "", "workdir: no git repo, history or remote (fix commit hidden)")
         check(pr["sandbox"] == pr["cwd"], "sandbox prefix wraps the agent command")
         row = results(tmp / "results-sec/results.jsonl")[0]
         check(not row["passed"] and row["sandboxed"], "protected paths restored: test-runner hack does not pass")
         diff = next((tmp / "results-sec/logs").glob("*.diff")).read_text()
         check("run_tests.py" in diff and "conftest.py" in diff, "audit diff shows tampering")
+
+        # --- graders: a failing `command` grader and `diff_constraints` decide the verdict
+        open_hist = {key: val for key, val in hist.items() if key != "protected_paths"}
+        no_graders = dict(open_hist, id="tampered")  # the hack agent makes run_tests.py exit 0
+        forbid = [{"type": "hidden_tests"}, {"type": "diff_constraints", "forbidden": ["run_tests.py"]}]
+        guarded = dict(open_hist, id="guarded", graders=forbid)
+        failing = dict(fizz, id="failing", graders=[{"type": "hidden_tests"}, {"type": "command", "command": "false"}])
+        cfg3 = dict(
+            cfg2,
+            output_dir="results-grade",
+            tasks=[no_graders, guarded],
+            matrix=[{"harness": "claude", "model": "m"}],
+        )
+        (tmp / "config3.json").write_text(json.dumps(cfg3))
+        run(tmp, "harness_bench.py", "run", config="config3.json")
+        by_task = {r["task"]: r for r in results(tmp / "results-grade/results.jsonl")}
+        check(by_task["tampered"]["passed"], "graders: without constraints the test-runner hack passes the tests")
+        check(not by_task["guarded"]["passed"], "graders: diff_constraints fails the hack even though the tests pass")
+        cfg4 = dict(cfg, output_dir="results-cmd", tasks=[failing], matrix=[{"harness": "claude", "model": "fix"}])
+        (tmp / "config4.json").write_text(json.dumps(cfg4))
+        run(tmp, "harness_bench.py", "run", "--allow-unsandboxed", config="config4.json")
+        row = results(tmp / "results-cmd/results.jsonl")[0]
+        check(not row["passed"], "graders: a failing command grader fails the run although the hidden tests pass")
+        check(any((tmp / "results-cmd/logs").glob("*grader-1-command.log")), "graders: command log written")
+
+        # --- the agent cannot hide a forbidden change from `diff_constraints` through git, or run host commands
+        modes = {"hg": "hide-git", "hgc": "hide-git-clean", "hi": "hide-ignore", "ha": "hide-attr", "hc": "hide-config"}
+        guard = [{"type": "hidden_tests"}, {"type": "diff_constraints", "forbidden": ["run_tests.py", "conftest.py"]}]
+        cfg5 = dict(
+            cfg2,
+            output_dir="results-hide",
+            work_dir=str(hide_work),
+            tasks=[dict(open_hist, id="hide", graders=guard)],
+            harnesses={name: fixtures.harness("claude", harness_env, mode) for name, mode in modes.items()},
+            matrix=[{"harness": name, "model": "m"} for name in modes],
+        )
+        (tmp / "config5.json").write_text(json.dumps(cfg5))
+        run(tmp, "harness_bench.py", "run", config="config5.json")
+        (hide_run,) = [p.parent for p in (tmp / "results-hide").glob("*/trials.jsonl")]
+        trials = results(hide_run / "trials.jsonl")  # in matrix order
+        check(len(trials) == len(modes), "git hiding: one trial per mode")
+        for trial, mode in zip(trials, modes.values(), strict=True):
+            by_grader = {g["grader"]: g["passed"] for g in trial["graders"]}
+            check(
+                by_grader == {"hidden_tests": True, "diff_constraints": False},
+                f"git hiding ({mode}): the tests pass but diff_constraints fails the run",
+            )
+        check(not marker.exists(), "workdir .git/config: fsmonitor, filter and textconv commands never run on the host")
+        check(not list(hide_work.glob(".*")), "baseline git dir and snapshot removed after each trial")
+
+        # --- grader logs are redacted like the agent logs
+        leak_cmd = f"echo spend={fake_litellm.KEY} agent={API_KEY}"
+        leaky = dict(fizz, id="leaky", graders=[{"type": "hidden_tests"}, {"type": "command", "command": leak_cmd}])
+        cfg6 = dict(cfg, output_dir="results-leak", tasks=[leaky], matrix=[{"harness": "claude", "model": "fix"}])
+        (tmp / "config6.json").write_text(json.dumps(cfg6))
+        run(tmp, "harness_bench.py", "run", "--allow-unsandboxed", config="config6.json")
+        (grader_log,) = (tmp / "results-leak/logs").glob("*grader-1-command.log")
+        text = grader_log.read_text()
+        check(
+            "***REDACTED***" in text and fake_litellm.KEY not in text and API_KEY not in text,
+            "grader logs: spend key and harness secrets redacted",
+        )
 
         # --- config validation and URL policy
         for bad, why in (
@@ -3600,6 +4713,7 @@ def main():
         print("\nPASS")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(hide_work, ignore_errors=True)
 
 
 if __name__ == "__main__":
@@ -3611,9 +4725,15 @@ if __name__ == "__main__":
 ```python
 """Fake coding-agent CLI for tests. Prints the JSON shape of a real harness.
 
-Usage: fake_agent.py <claude|opencode|pi|codex|cursor> <fix|nofix|hack>
+Usage: fake_agent.py <claude|opencode|pi|codex|cursor> <fix|nofix|hack|hide-git|hide-git-clean|hide-ignore|hide-attr|hide-config>
 "fix" repairs fizzbuzz.py in the cwd. "hack" leaves the bug and tampers with the test
 infrastructure instead (rewrites run_tests.py, adds conftest.py, moves git refs).
+The "hide-*" modes fix the bug and then try to hide a forbidden change from the diff:
+"hide-git" edits run_tests.py behind skip-worktree, info/exclude and a replace ref in its own repo
+("hide-git-clean" then deletes that repo),
+"hide-ignore" plants conftest.py behind a .gitignore, "hide-attr" edits run_tests.py next to a
+.gitattributes with `working-tree-encoding=UTF-16` (makes a naive `git add` fail), and "hide-config" arms .git/config
+(fsmonitor, filter, textconv) with a command that touches $FAKE_MARKER.
 Security probes: exits 9 if the LiteLLM spend key or SECRET_CANARY reached the agent,
 prints FAKE_API_KEY to stderr (must be redacted in logs), and records git history depth. When BENCH_TAG is set (and kind is not cursor),
 the tag is appended to $FAKE_TAGS_FILE, which fake_litellm.py serves as spend logs.
@@ -3624,7 +4744,7 @@ import os
 import sys
 
 kind, mode = sys.argv[1], sys.argv[2]
-fix = mode == "fix"
+fix = mode == "fix" or mode.startswith("hide-")
 for leaked in ("FAKE_KEY", "SECRET_CANARY"):
     if leaked in os.environ:
         sys.exit(9)
@@ -3657,6 +4777,45 @@ if mode == "hack":
     import subprocess
 
     subprocess.run(["git", "-c", "user.name=x", "-c", "user.email=x@x", "commit", "-qam", "hack"], capture_output=True)
+
+
+def hide_forbidden_change():
+    """Tamper with the test infrastructure while trying to keep the change out of the diff."""
+    import subprocess
+
+    def sh(script):
+        subprocess.run(["sh", "-c", script], capture_output=True)
+
+    if mode.startswith("hide-git"):
+        sh("git init -q . && git add -A && git update-index --skip-worktree run_tests.py")
+        sh("echo '*' >> .git/info/exclude")
+        sh("git -c user.name=x -c user.email=x@x commit -qm x && git replace $(git rev-list --max-parents=0 HEAD) HEAD")
+        with open("run_tests.py", "w") as f:
+            f.write("import sys\nsys.exit(0)\n")
+        if mode == "hide-git-clean":  # leave no repo behind: the edit must still show by path
+            sh("rm -rf .git")
+    elif mode == "hide-ignore":
+        with open(".gitignore", "w") as f:
+            f.write("conftest.py\n")
+        with open("conftest.py", "w") as f:
+            f.write("# planted\n")
+    elif mode == "hide-attr":
+        with open(".gitattributes", "w") as f:
+            f.write("* working-tree-encoding=UTF-16\n")
+        with open("run_tests.py", "w") as f:
+            f.write("import sys\nsys.exit(0)\n")
+    else:  # hide-config
+        marker = os.environ["FAKE_MARKER"]
+        sh(
+            f"git init -q . && git config core.fsmonitor 'touch {marker}; false'"
+            f" && git config filter.x.clean 'touch {marker}; cat' && git config diff.x.textconv 'touch {marker}; cat'"
+        )
+        with open(".gitattributes", "w") as f:
+            f.write("* filter=x diff=x\n")
+
+
+if mode.startswith("hide-"):
+    hide_forbidden_change()
 if fix:
     with open("fizzbuzz.py", "w") as f:
         f.write(
@@ -3666,6 +4825,10 @@ if fix:
         )
 
 if kind == "claude":
+    # stream-json shape: assistant events (one repeated tool_use block) before the result
+    for index, name in enumerate(("Read", "Edit", "Edit")):
+        block = {"type": "tool_use", "id": f"toolu_{min(index, 1)}", "name": name}
+        print(json.dumps({"type": "assistant", "message": {"id": f"msg_{index}", "content": [block]}}))
     print(
         json.dumps(
             {
@@ -3687,6 +4850,8 @@ if kind == "claude":
     )
 elif kind == "opencode":
     print("progress text that is not JSON")
+    for _ in range(2):
+        print(json.dumps({"type": "tool_use", "part": {"type": "tool"}}))
     for _ in range(3):
         print(
             json.dumps(
@@ -3701,6 +4866,8 @@ elif kind == "opencode":
         )
 elif kind == "codex":
     print(json.dumps({"type": "thread.started"}))
+    for item in ("command_execution", "command_execution", "agent_message"):
+        print(json.dumps({"type": "item.completed", "item": {"type": item}}))
     print(
         json.dumps(
             {
@@ -3720,6 +4887,7 @@ elif kind == "pi":
     print(json.dumps({"type": "session", "version": 3}))
     msg = {
         "role": "assistant",
+        "content": [{"type": "text", "text": "ok"}, {"type": "toolCall", "id": "call_1", "name": "bash"}],
         "usage": {"input": 800, "output": 120, "cacheRead": 1500, "cacheWrite": 0, "cost": {"total": 0.001}},
     }
     for _ in range(3):  # same usage on 3 event types: only message_end must count
@@ -4122,7 +5290,7 @@ class PiParserTests(unittest.TestCase):
 
 class NullParserTests(unittest.TestCase):
     def test_usage_is_zero_and_the_cost_is_a_real_zero(self) -> None:
-        self.assertEqual(hb.parse_null("anything"), {**hb.empty_usage(), "cost_reported": 0.0})
+        self.assertEqual(hb.parse_null("anything"), {**hb.empty_usage(), "cost_reported": 0.0, "tool_calls": 0})
 
 
 class CursorParserTests(unittest.TestCase):
@@ -4200,6 +5368,96 @@ class RowTagsTests(unittest.TestCase):
         self.assertEqual((hb.row_tags({}), hb.row_tags({"request_tags": "7"})), ([], []))
 
 
+class ToolCallTests(unittest.TestCase):
+    """Tool calls are counted where the format exposes them and are None (never 0) elsewhere."""
+
+    def test_empty_usage_has_unknown_tool_calls(self) -> None:
+        self.assertIsNone(hb.empty_usage()["tool_calls"])
+
+    def test_claude_stream_json_counts_unique_tool_use_blocks(self) -> None:
+        use = {"type": "tool_use", "id": "a", "name": "Bash"}
+        out = jl(
+            {"type": "assistant", "message": {"id": "m1", "content": [{"type": "text", "text": "x"}, use]}},
+            {"type": "assistant", "message": {"id": "m1", "content": [use]}},  # the same block seen again
+            {"type": "assistant", "message": {"id": "m2", "content": [{"type": "tool_use", "id": "b"}]}},
+            {"type": "assistant", "message": {"id": "m3", "content": "plain text"}},
+            {"type": "result", "usage": {"input_tokens": 1}},
+        )
+        self.assertEqual(hb.parse_claude(out)["tool_calls"], 2)
+
+    def test_claude_stream_json_without_tool_use_is_a_known_zero(self) -> None:
+        out = jl({"type": "assistant", "message": {"content": [{"type": "text"}]}}, {"type": "result", "usage": {}})
+        self.assertEqual(hb.parse_claude(out)["tool_calls"], 0)
+
+    def test_claude_tool_use_blocks_without_an_id_are_all_counted(self) -> None:
+        block = {"type": "tool_use"}
+        out = jl({"type": "assistant", "message": {"content": [block, block]}}, {"type": "result", "usage": {}})
+        self.assertEqual(hb.parse_claude(out)["tool_calls"], 2)
+
+    def test_claude_single_result_object_does_not_expose_tool_calls(self) -> None:
+        self.assertIsNone(hb.parse_claude(jl({"type": "result", "usage": {"input_tokens": 1}}))["tool_calls"])
+
+    def test_opencode_counts_tool_use_events(self) -> None:
+        out = jl({"type": "tool_use"}, {"type": "tool-use"}, {"type": "text"}, {"type": "step_finish", "part": {}})
+        self.assertEqual(hb.parse_opencode(out)["tool_calls"], 2)
+
+    def test_opencode_without_tool_events_leaves_tool_calls_unknown(self) -> None:
+        self.assertIsNone(hb.parse_opencode(jl({"type": "step_finish", "part": {}}))["tool_calls"])
+
+    def test_pi_counts_tool_call_blocks_on_assistant_message_end_only(self) -> None:
+        call = {"type": "toolCall", "id": "1", "name": "bash"}
+        msg = {"role": "assistant", "content": [{"type": "text"}, call, call], "usage": {"input": 1}}
+        out = jl(
+            {"type": "message_update", "message": msg},
+            {"type": "message_end", "message": msg},
+            {"type": "turn_end", "message": msg},
+            {"type": "message_end", "message": {**msg, "role": "user"}},
+        )
+        self.assertEqual(hb.parse_pi(out)["tool_calls"], 2)
+
+    def test_pi_messages_without_a_content_list_leave_tool_calls_unknown(self) -> None:
+        out = jl({"type": "message_end", "message": {"role": "assistant", "usage": {"input": 1}}})
+        self.assertIsNone(hb.parse_pi(out)["tool_calls"])
+
+    def test_pi_tool_calls_are_known_once_any_message_has_content(self) -> None:
+        out = jl(
+            {"type": "message_end", "message": {"role": "assistant", "content": [{"type": "toolCall"}]}},
+            {"type": "message_end", "message": {"role": "assistant"}},
+        )
+        self.assertEqual(hb.parse_pi(out)["tool_calls"], 1)
+
+    def test_codex_counts_completed_tool_items(self) -> None:
+        done = {"type": "item.completed"}
+        out = jl(
+            {**done, "item": {"type": "command_execution"}},
+            {**done, "item": {"type": "file_change"}},
+            {**done, "item": {"type": "mcp_tool_call"}},
+            {**done, "item": {"type": "web_search"}},
+            {**done, "item": {"type": "agent_message"}},
+            {"type": "item.started", "item": {"type": "command_execution"}},
+            {"type": "turn.completed", "usage": {"input_tokens": 1}},
+        )
+        self.assertEqual(hb.parse_codex(out)["tool_calls"], 4)
+
+    def test_codex_without_item_events_leaves_tool_calls_unknown(self) -> None:
+        out = jl({"type": "turn.completed", "usage": {"input_tokens": 1}})
+        self.assertIsNone(hb.parse_codex(out)["tool_calls"])
+
+    def test_codex_with_only_message_items_is_a_known_zero(self) -> None:
+        out = jl(
+            {"type": "item.completed", "item": {"type": "agent_message"}},
+            {"type": "turn.completed", "usage": {"input_tokens": 1}},
+        )
+        self.assertEqual(hb.parse_codex(out)["tool_calls"], 0)
+
+    def test_cursor_json_has_no_tool_calls(self) -> None:
+        out = jl({"type": "result", "usage": {"inputTokens": 2}})
+        self.assertIsNone(hb.parse_cursor(out)["tool_calls"])
+
+    def test_null_harness_made_no_tool_calls(self) -> None:
+        self.assertEqual(hb.parse_null("")["tool_calls"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
 ```
@@ -4209,7 +5467,9 @@ if __name__ == "__main__":
 ```python
 """Unit tests for config validation, sandbox wrapping, env files and workdir handling. In-process."""
 
+import dataclasses
 import os
+import shutil
 import subprocess
 import unittest
 from pathlib import Path
@@ -4218,6 +5478,7 @@ from unittest import mock
 
 import fixtures
 import harness_bench as hb
+from hbench.graders.diff_constraints import DiffConstraintsGrader
 
 GIT_ID = ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]
 
@@ -4261,6 +5522,21 @@ class ValidateConfigTests(unittest.TestCase):
     def test_protected_path_with_parent_reference_is_rejected(self) -> None:
         cfg = base_config(tasks=[dict(fixtures.fizzbuzz_task(), protected_paths=["a/../b"])])
         self.assert_rejected(cfg, "must be relative")
+
+    def test_hidden_tests_without_a_hidden_tests_grader_warns(self) -> None:
+        cfg = base_config()
+        cfg["tasks"][0]["graders"] = [{"type": "command", "command": "true"}]
+        with fixtures.quiet() as out:
+            hb.validate_config(cfg)
+        self.assertIn("task fizzbuzz sets 'hidden_tests'", out.getvalue())
+
+    def test_hidden_tests_with_the_grader_or_the_default_graders_does_not_warn(self) -> None:
+        cfg = base_config()
+        with fixtures.quiet() as out:
+            hb.validate_config(cfg)
+            cfg["tasks"][0]["graders"] = [{"type": "hidden_tests"}, {"type": "command", "command": "true"}]
+            hb.validate_config(cfg)
+        self.assertEqual(out.getvalue(), "")
 
     def test_harness_name_with_space_is_rejected(self) -> None:
         cfg = base_config()
@@ -4469,12 +5745,447 @@ class GitBinTests(unittest.TestCase):
         self.assertEqual(cm.exception.code, "git not found on PATH")
 
 
+def baseline_of(test: unittest.TestCase, work: Path) -> hb.Baseline:
+    """Baseline of `work` whose git dir lives outside it, like the engine's."""
+    baseline: hb.Baseline = hb.make_baseline(work, fixtures.tmpdir(test) / "baseline.git")
+    return baseline
+
+
+def sh(cwd: Path, script: str) -> None:
+    """Run what the agent could run inside the workdir (a shell script, as the agent's user)."""
+    subprocess.run(["sh", "-c", script], cwd=cwd, check=True, capture_output=True)
+
+
 class MakeBaselineTests(unittest.TestCase):
-    def test_returns_sha_of_a_single_commit_with_current_files(self) -> None:
+    def test_returns_a_single_commit_with_current_files_and_leaves_no_git_in_the_workdir(self) -> None:
         work = fixtures.tmpdir(self)
         (work / "a.txt").write_text("a")
-        sha = hb.make_baseline(work)
-        self.assertEqual((sha, run_git(work, "rev-list", "--count", "HEAD")), (run_git(work, "rev-parse", "HEAD"), "1"))
+        baseline = baseline_of(self, work)
+        count = subprocess.run(
+            ["git", f"--git-dir={baseline.git_dir}", "rev-list", "--count", baseline.sha],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        self.assertEqual((count, len(baseline.sha), (work / ".git").exists()), ("1", 40, False))
+
+    def test_files_listed_in_gitignore_are_part_of_the_baseline(self) -> None:
+        work = fixtures.tmpdir(self)
+        (work / ".gitignore").write_text("secret.txt\n")
+        (work / "secret.txt").write_text("s\n")
+        baseline = baseline_of(self, work)
+        (work / "secret.txt").write_text("changed\n")
+        self.assertEqual([c.path for c in hb.collect_changes(baseline)], ["secret.txt"])
+
+
+class RunStepTests(unittest.TestCase):
+    def test_stdout_and_stderr_come_back_apart_and_redacted_and_the_log_has_both(self) -> None:
+        work, log = fixtures.tmpdir(self), fixtures.tmpdir(self) / "step.log"
+        script = "echo out-supersecret1; echo err-supersecret1 >&2; exit 3"
+        step = hb.run_step({}, script, dict(os.environ), 30, log, work, work.parent / "env", ["supersecret1"])
+        self.assertEqual(step, (3, False, "out-***REDACTED***\n", "err-***REDACTED***\n"))
+        self.assertEqual(log.read_text(), "out-***REDACTED***\n\n--- stderr ---\nerr-***REDACTED***\n")
+
+
+class HardenedGitTests(unittest.TestCase):
+    def test_no_inherited_git_variable_reaches_git(self) -> None:
+        with mock.patch.dict(os.environ, {"GIT_DIR": "/nonexistent", "GIT_CONFIG_COUNT": "1"}):
+            env = hb.git_env()
+        self.assertEqual(
+            (sorted(k for k in env if k.startswith("GIT_")), env["GIT_CONFIG_GLOBAL"], env["GIT_CONFIG_NOSYSTEM"]),
+            (["GIT_ATTR_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"], "/dev/null", "1"),
+        )
+
+    def test_a_replace_ref_in_the_git_dir_does_not_change_the_diff(self) -> None:
+        work = fixtures.tmpdir(self)
+        (work / "a.txt").write_text("a\n")
+        baseline = baseline_of(self, work)
+        (work / "a.txt").write_text("b\n")
+        (work / "b.txt").write_text("c\n")
+        hb.staged_diff(baseline)  # stage the edits, then make the baseline commit "contain" them
+        tree = hb.hardened_git(baseline.git_dir, work, "write-tree", check=True).stdout.strip()
+        other = hb.hardened_git(baseline.git_dir, work, *GIT_ID, "commit-tree", "-m", "x", tree, check=True)
+        subprocess.run(
+            [
+                "git",
+                f"--git-dir={baseline.git_dir}",
+                "update-ref",
+                f"refs/replace/{baseline.sha}",
+                other.stdout.strip(),
+            ],
+            check=True,
+        )
+        self.assertEqual(sorted(c.path for c in hb.collect_changes(baseline)), ["a.txt", "b.txt"])
+
+    def test_the_users_global_config_and_excludes_cannot_hide_a_file(self) -> None:
+        home = fixtures.tmpdir(self)
+        (home / "ignore").write_text("conftest.py\n")
+        (home / ".gitconfig").write_text(f"[core]\n\texcludesFile = {home / 'ignore'}\n")
+        work = fixtures.tmpdir(self)
+        (work / "a.txt").write_text("a\n")
+        baseline = baseline_of(self, work)
+        (work / "conftest.py").write_text("evil\n")
+        with mock.patch.dict(os.environ, {"HOME": str(home), "XDG_CONFIG_HOME": str(home)}):
+            self.assertEqual([c.path for c in hb.collect_changes(baseline)], ["conftest.py"])
+
+
+class SaveDiffTests(unittest.TestCase):
+    def test_diff_contains_new_and_changed_files(self) -> None:
+        work, out = fixtures.tmpdir(self), fixtures.tmpdir(self) / "d.diff"
+        (work / "a.txt").write_text("a")
+        baseline = baseline_of(self, work)
+        (work / "a.txt").write_text("changed")
+        (work / "new.txt").write_text("n")
+        hb.save_diff(baseline, out)
+        text = out.read_text()
+        self.assertIn("a.txt", text)
+        self.assertIn("new.txt", text)
+
+    def test_unknown_baseline_is_reported_in_the_diff_file(self) -> None:
+        work, out = fixtures.tmpdir(self), fixtures.tmpdir(self) / "d.diff"
+        (work / "a.txt").write_text("a")
+        hb.save_diff(dataclasses.replace(baseline_of(self, work), sha="0" * 40), out)
+        self.assertIn("git diff failed", out.read_text())
+
+    def test_a_git_that_cannot_run_is_reported_in_the_diff_file(self) -> None:
+        work, out = fixtures.tmpdir(self), fixtures.tmpdir(self) / "d.diff"
+        (work / "a.txt").write_text("a")
+        baseline = baseline_of(self, work)
+        for error in (OSError("no git"), subprocess.TimeoutExpired("git", 1)):
+            with mock.patch.object(hb, "staged_diff", side_effect=error):
+                hb.save_diff(baseline, out)
+            self.assertIn("git diff failed", out.read_text())
+
+    def test_directory_that_is_not_a_repo_is_reported_in_the_diff_file(self) -> None:
+        out = fixtures.tmpdir(self) / "d.diff"
+        hb.save_diff(hb.Baseline(fixtures.tmpdir(self) / "none.git", fixtures.tmpdir(self), "abc"), out)
+        self.assertIn("git diff failed", out.read_text())
+
+    def test_long_diff_is_truncated(self) -> None:
+        work, out = fixtures.tmpdir(self), fixtures.tmpdir(self) / "d.diff"
+        (work / "a.txt").write_text("a")
+        baseline = baseline_of(self, work)
+        (work / "a.txt").write_text("b" * 1000)
+        hb.save_diff(baseline, out, limit=50)
+        self.assertTrue(out.read_text().endswith("[truncated]"))
+
+    def test_a_non_utf8_patch_is_saved_not_raised(self) -> None:
+        work, out = fixtures.tmpdir(self), fixtures.tmpdir(self) / "d.diff"
+        (work / "a.txt").write_text("a")
+        baseline = baseline_of(self, work)
+        (work / "a.txt").write_bytes(b"caf\xe9\n")
+        hb.save_diff(baseline, out)
+        self.assertIn("a.txt", out.read_text())
+
+    def test_a_nested_git_directory_is_noted_in_the_audit_diff(self) -> None:
+        work, out = fixtures.tmpdir(self), fixtures.tmpdir(self) / "d.diff"
+        (work / "a.txt").write_text("a")
+        baseline = baseline_of(self, work)
+        sh(work, "mkdir sub && cd sub && git init -q && echo x > f.txt")
+        hb.save_diff(baseline, out)
+        self.assertIn("nested .git: sub/.git", out.read_text())
+
+
+class CollectChangesTests(unittest.TestCase):
+    def repo(self) -> tuple[Path, hb.Baseline]:
+        work = fixtures.tmpdir(self)
+        (work / "a.txt").write_text("1\n2\n")
+        (work / "gone.txt").write_text("x\n")
+        return work, baseline_of(self, work)
+
+    def test_added_and_deleted_lines_are_counted_per_file_including_new_files(self) -> None:
+        work, baseline = self.repo()
+        (work / "a.txt").write_text("1\nchanged\nmore\n")
+        (work / "sub").mkdir()
+        (work / "sub" / "new.txt").write_text("n\n")
+        got = {c.path: (c.added, c.deleted) for c in hb.collect_changes(baseline)}
+        self.assertEqual(got, {"a.txt": (2, 1), "sub/new.txt": (1, 0)})
+
+    def test_a_rename_is_reported_as_a_delete_and_an_add(self) -> None:
+        work, baseline = self.repo()
+        (work / "gone.txt").rename(work / "moved.txt")
+        got = {c.path: (c.added, c.deleted) for c in hb.collect_changes(baseline)}
+        self.assertEqual(got, {"gone.txt": (0, 1), "moved.txt": (1, 0)})
+
+    def test_a_binary_file_counts_as_more_than_any_line_limit(self) -> None:
+        work, baseline = self.repo()
+        (work / "blob.bin").write_bytes(b"\x00\x01\x02")
+        self.assertEqual(
+            [(c.path, c.added, c.deleted) for c in hb.collect_changes(baseline)], [("blob.bin", hb.BINARY_LINES, 0)]
+        )
+        self.assertTrue(DiffConstraintsGrader({"max_changed_lines": 10**6}).violations(hb.collect_changes(baseline)))
+
+    def test_a_path_with_a_newline_stays_one_path(self) -> None:
+        work, baseline = self.repo()
+        (work / "a\nb.txt").write_text("x\n")
+        self.assertEqual([c.path for c in hb.collect_changes(baseline)], ["a\nb.txt"])
+
+    def test_a_git_that_cannot_run_fails_closed(self) -> None:
+        _, baseline = self.repo()
+        for error in (OSError("no git"), subprocess.TimeoutExpired("git", 1)):
+            with mock.patch.object(hb, "staged_diff", side_effect=error):
+                self.assertEqual(hb.collect_changes(baseline), hb.UNKNOWN_CHANGES)
+
+    def test_a_path_with_a_tab_stays_one_path(self) -> None:
+        work, baseline = self.repo()
+        (work / "a\tb.txt").write_text("x\n")
+        self.assertEqual([(c.path, c.added) for c in hb.collect_changes(baseline)], [("a\tb.txt", 1)])
+        self.assertEqual(
+            hb.parse_numstat("1\t2\ta\tb\tc.txt\0-\t-\tbin\0"),
+            (hb.Change("a\tb\tc.txt", 1, 2), hb.Change("bin", hb.BINARY_LINES, 0)),
+        )
+
+    def test_no_changes_gives_an_empty_tuple(self) -> None:
+        _, baseline = self.repo()
+        self.assertEqual(hb.collect_changes(baseline), ())
+
+    def test_an_unreadable_diff_fails_closed_with_a_path_outside_the_workdir(self) -> None:
+        work, baseline = self.repo()
+        self.assertEqual(hb.collect_changes(dataclasses.replace(baseline, sha="0" * 40)), hb.UNKNOWN_CHANGES)
+        missing = hb.Baseline(fixtures.tmpdir(self) / "none.git", work, "abc")
+        self.assertEqual(hb.collect_changes(missing), hb.UNKNOWN_CHANGES)
+        self.assertTrue(hb.UNKNOWN_CHANGES[0].path.startswith("../"))
+
+
+class GitBypassTests(unittest.TestCase):
+    """What an agent can do through the git plumbing in its workdir must not hide a change (C1 and C2)."""
+
+    def setUp(self) -> None:
+        self.work = fixtures.tmpdir(self)
+        (self.work / "tests").mkdir()
+        (self.work / "tests" / "test_a.py").write_text("x\n")
+        (self.work / "src.py").write_text("a\n")
+        self.baseline = baseline_of(self, self.work)
+
+    def paths(self) -> list[str]:
+        return sorted(c.path for c in hb.collect_changes(self.baseline))
+
+    def forbidden_hit(self) -> bool:
+        grader = DiffConstraintsGrader({"forbidden": ["tests/*", "conftest.py"]})
+        return bool(grader.violations(hb.collect_changes(self.baseline)))
+
+    def test_hiding_tricks_through_an_agent_repo_still_fail_diff_constraints(self) -> None:
+        # Every script is something the agent can run in its workdir. None touches the baseline git dir.
+        scripts = {
+            "skip-worktree": "git init -q . && git add -A && git update-index --skip-worktree tests/test_a.py",
+            "assume-unchanged": "git init -q . && git add -A && git update-index --assume-unchanged tests/test_a.py",
+            "info/exclude": "git init -q . && echo tests/ >> .git/info/exclude",
+            "core.excludesFile": "git init -q . && echo tests/ > ../ex && git config core.excludesFile ../ex",
+            "git replace": (
+                "git init -q . && git add -A && git -c user.name=a -c user.email=a@b commit -qm x"
+                " && git replace $(git rev-list --max-parents=0 HEAD) HEAD"
+            ),
+        }
+        for name, script in scripts.items():
+            for keep_git in (True, False):
+                with self.subTest(name, keep_git=keep_git):
+                    sh(self.work, script + " && echo y >> tests/test_a.py")
+                    if not keep_git:
+                        shutil.rmtree(self.work / ".git")
+                    self.assertTrue(self.forbidden_hit())
+                    shutil.rmtree(self.work / ".git", ignore_errors=True)
+                    (self.work / "tests" / "test_a.py").write_text("x\n")
+
+    def test_a_deleted_agent_repo_leaves_the_edit_visible_by_path(self) -> None:
+        sh(self.work, "git init -q . && git add -A && git update-index --skip-worktree tests/test_a.py")
+        sh(self.work, "echo y >> tests/test_a.py && rm -rf .git")
+        self.assertEqual(self.paths(), ["tests/test_a.py"])
+
+    def test_a_root_gitignore_does_not_hide_a_new_or_edited_file(self) -> None:
+        sh(self.work, "echo conftest.py > .gitignore && echo evil > conftest.py && echo y >> tests/test_a.py")
+        self.assertEqual(self.paths(), [".gitignore", "conftest.py", "tests/test_a.py"])
+
+    def test_a_nested_gitignore_does_not_hide_a_file_either(self) -> None:
+        sh(self.work, "mkdir tests/sub && echo '*' > tests/sub/.gitignore && echo e > tests/sub/evil.py")
+        self.assertEqual(self.paths(), ["tests/sub/.gitignore", "tests/sub/evil.py"])
+
+    def test_a_nested_git_directory_fails_closed_and_cannot_hide_its_files(self) -> None:
+        sh(self.work, "mkdir tests/vendored && cd tests/vendored && git init -q && echo evil > e.py")
+        self.assertEqual(hb.collect_changes(self.baseline), hb.UNKNOWN_CHANGES)
+
+    def test_a_nested_git_file_fails_closed(self) -> None:
+        sh(self.work, "echo 'gitdir: /somewhere' > .git")
+        self.assertEqual(hb.collect_changes(self.baseline), hb.UNKNOWN_CHANGES)
+
+    def test_a_git_dir_symlink_fails_closed(self) -> None:
+        sh(self.work, "mkdir -p a/b && ln -s /tmp a/b/.git")
+        self.assertEqual(hb.collect_changes(self.baseline), hb.UNKNOWN_CHANGES)
+
+    def test_the_workdir_git_config_is_never_read(self) -> None:
+        marker = self.work.parent / f"{self.work.name}.marker"
+        self.addCleanup(marker.unlink, True)
+        script = (
+            f"git init -q . && git config core.fsmonitor 'touch {marker}; false'"
+            f" && git config filter.x.clean 'touch {marker}; cat' && git config diff.x.textconv 'touch {marker}; cat'"
+            " && echo '* filter=x diff=x' > .gitattributes && echo y >> src.py"
+        )
+        sh(self.work, script)
+        # The low-level calls run git even though the nested repo makes `collect_changes` fail closed.
+        hb.staged_diff(self.baseline, "--numstat")
+        hb.staged_diff(self.baseline, "--stat", "--patch")
+        self.assertFalse(marker.exists())
+
+
+class AttributesAndFailuresTests(unittest.TestCase):
+    """What the agent can do to make `git add` fail or to skew the counts must never end in "no changes"."""
+
+    def setUp(self) -> None:
+        self.work = fixtures.tmpdir(self)
+        (self.work / "tests").mkdir()
+        (self.work / "tests" / "test_a.py").write_text("x\n")
+        (self.work / "src.py").write_text("a\n")
+        self.baseline = baseline_of(self, self.work)
+        self.grader = DiffConstraintsGrader({"forbidden": ["tests/*"], "max_changed_lines": 5})
+
+    def paths(self) -> list[str]:
+        return sorted(c.path for c in hb.collect_changes(self.baseline))
+
+    def test_a_working_tree_encoding_attribute_cannot_make_the_add_fail_open(self) -> None:
+        sh(self.work, "printf '* working-tree-encoding=UTF-16\\n' > .gitattributes && echo y >> tests/test_a.py")
+        self.assertEqual(self.paths(), [".gitattributes", "tests/test_a.py"])
+
+    def test_a_diff_or_binary_attribute_does_not_zero_the_line_count(self) -> None:
+        for attr in ("* -diff", "* binary"):
+            with self.subTest(attr):
+                sh(
+                    self.work,
+                    f"printf '{attr}\\n' > .gitattributes && python3 -c \"open('src.py','w').write('l\\\\n'*100)\"",
+                )
+                changes = hb.collect_changes(self.baseline)
+                self.assertEqual(sum(c.added for c in changes if c.path == "src.py"), 100)
+                self.assertTrue(self.grader.violations(changes))
+
+    def test_a_failing_add_raises_and_collect_changes_fails_closed(self) -> None:
+        sh(
+            self.work, "echo y >> tests/test_a.py && git init -q sub && echo e > sub/e.py"
+        )  # a nested repo without a commit: git add fails
+        with self.assertRaises(hb.GitError) as cm:
+            hb.staged_diff(self.baseline, "--stat")
+        self.assertIn("git add failed", str(cm.exception))
+        self.assertEqual(hb.collect_changes(self.baseline), hb.UNKNOWN_CHANGES)
+
+    def test_a_failing_add_is_written_to_the_audit_diff_with_secrets_redacted(self) -> None:
+        sh(self.work, "git init -q sub && echo e > sub/e.py")
+        out = fixtures.tmpdir(self) / "d.diff"
+        with mock.patch.object(hb, "staged_diff", side_effect=hb.GitError("git add failed: token-0123456789")):
+            hb.save_diff(self.baseline, out, secrets=["token-0123456789"])
+        self.assertIn("git add failed: ***REDACTED***", out.read_text())
+        hb.save_diff(self.baseline, out)
+        self.assertIn("git add failed", out.read_text())
+
+    def test_an_unreadable_file_never_ends_as_no_changes(self) -> None:
+        sh(self.work, "echo y >> tests/test_a.py && echo s > secret && chmod 000 secret")
+        self.addCleanup(os.chmod, self.work / "secret", 0o600)
+        changes = hb.collect_changes(self.baseline)
+        self.assertTrue(changes == hb.UNKNOWN_CHANGES or "tests/test_a.py" in [c.path for c in changes])
+        self.assertTrue(self.grader.violations(changes))
+
+    def test_an_unreadable_tracked_file_never_ends_as_no_changes(self) -> None:
+        sh(self.work, "echo y >> tests/test_a.py && chmod 000 src.py")
+        self.addCleanup(os.chmod, self.work / "src.py", 0o600)
+        self.assertTrue(self.grader.violations(hb.collect_changes(self.baseline)))
+
+    def test_without_the_attributes_file_the_diff_fails_closed_and_says_so(self) -> None:
+        sh(self.work, "echo y >> tests/test_a.py")
+        out = fixtures.tmpdir(self) / "d.diff"
+        (self.baseline.git_dir / "info" / "attributes").unlink()
+        self.assertEqual(hb.collect_changes(self.baseline), hb.UNKNOWN_CHANGES)
+        hb.save_diff(self.baseline, out)
+        self.assertIn("info/attributes", out.read_text())
+
+    def test_a_baseline_that_could_not_write_the_attributes_file_fails_closed(self) -> None:
+        work = fixtures.tmpdir(self)
+        (work / "a.txt").write_text("a\n")
+        with mock.patch.object(hb, "write_info_attributes", side_effect=OSError("read-only")):
+            baseline = baseline_of(self, work)
+        (work / "a.txt").write_text("edited\n")
+        self.assertEqual(hb.collect_changes(baseline), hb.UNKNOWN_CHANGES)
+
+    def test_the_attributes_file_hides_every_attribute_that_changes_how_a_file_is_added(self) -> None:
+        (self.work / ".gitattributes").write_text("* filter=x diff=y text eol=crlf working-tree-encoding=UTF-16\n")
+        names = ["filter", "diff", "text", "eol", "working-tree-encoding", "ident", "merge"]
+        out = subprocess.run(
+            [
+                "git",
+                f"--git-dir={self.baseline.git_dir}",
+                f"--work-tree={self.work}",
+                "check-attr",
+                *names,
+                "--",
+                "src.py",
+            ],
+            cwd=self.work,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        self.assertEqual(out.count("unspecified"), len(names))
+
+
+class AttributesWithoutAttrSourceTests(AttributesAndFailuresTests):
+    """Every attribute test again on a git older than 2.40: `info/attributes` alone must hold."""
+
+    def setUp(self) -> None:
+        patcher = mock.patch.object(hb, "git_version", return_value=(2, 34))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        super().setUp()
+
+    def test_the_attr_source_option_is_not_passed(self) -> None:
+        with mock.patch.object(subprocess, "run") as run:
+            hb.hardened_git(self.work.parent, self.work, "status")
+        self.assertFalse(any(a.startswith("--attr-source") for a in run.call_args.args[0]))
+
+    def test_a_filter_attribute_does_not_run_or_change_a_file(self) -> None:
+        sh(self.work, "printf '* filter=x ident\\n' > .gitattributes && echo y >> src.py")
+        self.assertEqual(self.paths(), [".gitattributes", "src.py"])
+
+
+class GitVersionTests(unittest.TestCase):
+    def test_git_version_is_read_once_from_git_version_output(self) -> None:
+        hb.git_version.cache_clear()
+        self.addCleanup(hb.git_version.cache_clear)
+        fake = subprocess.CompletedProcess([], 0, stdout="git version 2.39.5 (Apple Git-154)\n")
+        with mock.patch.object(subprocess, "run", return_value=fake) as run:
+            self.assertEqual((hb.git_version(), hb.git_version()), ((2, 39), (2, 39)))
+        self.assertEqual(run.call_count, 1)
+        hb.git_version.cache_clear()
+        with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout="weird")):
+            self.assertEqual(hb.git_version(), (0, 0))
+
+
+class FreshIndexAndEnvTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.work = fixtures.tmpdir(self)
+        (self.work / "a.txt").write_text("a\n")
+        (self.work / "ignored.txt").write_text("i\n")
+        (self.work / ".gitignore").write_text("ignored.txt\n")
+        self.baseline = baseline_of(self, self.work)
+
+    def test_skip_worktree_in_the_stored_index_does_not_hide_an_edit(self) -> None:
+        git = [f"--git-dir={self.baseline.git_dir}", f"--work-tree={self.work}"]
+        subprocess.run(["git", *git, "update-index", "--skip-worktree", "a.txt"], check=True, cwd=self.work)
+        subprocess.run(["git", *git, "update-index", "--assume-unchanged", "ignored.txt"], check=True, cwd=self.work)
+        (self.work / "a.txt").write_text("edited\n")
+        (self.work / "ignored.txt").write_text("edited\n")
+        self.assertEqual(sorted(c.path for c in hb.collect_changes(self.baseline)), ["a.txt", "ignored.txt"])
+
+    def test_a_diff_leaves_the_stored_index_untouched(self) -> None:
+        stored = self.baseline.git_dir / "index"
+        before = stored.read_bytes()
+        (self.work / "a.txt").write_text("edited\n")
+        hb.collect_changes(self.baseline)
+        hb.save_diff(self.baseline, fixtures.tmpdir(self) / "d.diff")
+        self.assertEqual(stored.read_bytes(), before)
+
+    def test_inherited_git_variables_do_not_change_the_result(self) -> None:
+        (self.work / "a.txt").write_text("edited\n")
+        env = {"GIT_DIR": "/nonexistent", "GIT_INDEX_FILE": "/nonexistent/index", "GIT_WORK_TREE": "/nonexistent"}
+        with mock.patch.dict(os.environ, env):
+            self.assertEqual([c.path for c in hb.collect_changes(self.baseline)], ["a.txt"])
+
+    def test_a_file_a_gitignore_listed_before_the_baseline_is_not_a_change(self) -> None:
+        self.assertEqual(hb.collect_changes(self.baseline), ())
 
 
 class ProtectedPathTests(unittest.TestCase):
@@ -4501,6 +6212,13 @@ class ProtectedPathTests(unittest.TestCase):
             ("orig", False, "orig"),
         )
 
+    def test_bytecode_the_agent_leaves_in_a_protected_directory_is_removed_on_restore(self) -> None:
+        hb.snapshot_protected(self.TASK, self.work, self.snap)
+        (self.work / "tests_dir" / "__pycache__").mkdir()
+        (self.work / "tests_dir" / "__pycache__" / "t.cpython-312.pyc").write_bytes(b"poison")
+        hb.restore_protected(self.TASK, self.work, self.snap)
+        self.assertEqual(sorted(p.name for p in (self.work / "tests_dir").iterdir()), ["t.py"])
+
     def test_path_replaced_by_a_symlink_is_restored_as_a_real_file(self) -> None:
         hb.snapshot_protected(self.TASK, self.work, self.snap)
         (self.work / "runner.py").unlink()
@@ -4520,39 +6238,6 @@ class ProtectedPathTests(unittest.TestCase):
         (self.work / "runner.py").symlink_to("target")
         hb.snapshot_protected(self.TASK, self.work, self.snap)
         self.assertTrue((self.snap / "runner.py").is_symlink())
-
-
-class SaveDiffTests(unittest.TestCase):
-    def test_diff_contains_new_and_changed_files(self) -> None:
-        work, out = fixtures.tmpdir(self), fixtures.tmpdir(self) / "d.diff"
-        (work / "a.txt").write_text("a")
-        baseline = hb.make_baseline(work)
-        (work / "a.txt").write_text("changed")
-        (work / "new.txt").write_text("n")
-        hb.save_diff(work, baseline, out)
-        text = out.read_text()
-        self.assertIn("a.txt", text)
-        self.assertIn("new.txt", text)
-
-    def test_unknown_baseline_is_reported_in_the_diff_file(self) -> None:
-        work, out = fixtures.tmpdir(self), fixtures.tmpdir(self) / "d.diff"
-        (work / "a.txt").write_text("a")
-        hb.make_baseline(work)
-        hb.save_diff(work, "0" * 40, out)
-        self.assertIn("git diff failed", out.read_text())
-
-    def test_directory_that_is_not_a_repo_is_reported_in_the_diff_file(self) -> None:
-        out = fixtures.tmpdir(self) / "d.diff"
-        hb.save_diff(fixtures.tmpdir(self), "abc", out)
-        self.assertIn("git diff failed", out.read_text())
-
-    def test_long_diff_is_truncated(self) -> None:
-        work, out = fixtures.tmpdir(self), fixtures.tmpdir(self) / "d.diff"
-        (work / "a.txt").write_text("a")
-        baseline = hb.make_baseline(work)
-        (work / "a.txt").write_text("b" * 1000)
-        hb.save_diff(work, baseline, out, limit=50)
-        self.assertTrue(out.read_text().endswith("[truncated]"))
 
 
 class CheckLitellmUrlTests(unittest.TestCase):
@@ -4579,6 +6264,7 @@ import shutil
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import fixtures
 import harness_bench as hb
@@ -4615,6 +6301,11 @@ class CmdRunTests(RunTestCase):
         with self.assertRaises(SystemExit) as cm:
             fixtures.call_quiet(hb.cmd_run, args(allow_unsandboxed=False), self.cfg, self.base)
         self.assertIn("No sandbox configured", str(cm.exception.code))
+
+    def test_a_git_older_than_2_40_still_runs_with_the_attributes_file_alone(self) -> None:
+        with mock.patch.object(hb, "git_version", return_value=(2, 34)):
+            fixtures.call_quiet(hb.cmd_run, args(only=["claude"]), self.cfg, self.base)
+        self.assertEqual([r["passed"] for r in rows_of(self.base)], [True])
 
     def test_dry_run_prints_commands_and_writes_no_results(self) -> None:
         out = fixtures.call_quiet(hb.cmd_run, args(dry_run=True, allow_unsandboxed=False), self.cfg, self.base)
@@ -4681,6 +6372,15 @@ class CmdRunTests(RunTestCase):
         fixtures.call_quiet(hb.cmd_run, args(only=["claude"], keep=True), self.cfg, self.base)
         self.assertEqual((work / tag / "stale.txt").exists(), False)
 
+    def test_the_baseline_git_dir_is_outside_the_workdir_and_removed_after_the_trial(self) -> None:
+        work = fixtures.tmpdir(self) / "work"
+        self.cfg["work_dir"] = str(work)
+        fixtures.call_quiet(hb.cmd_run, args(only=["claude"], keep=True), self.cfg, self.base)
+        kept = sorted(p.name for p in work.iterdir())
+        self.assertEqual(
+            (kept, (work / "fizzbuzz__claude__fix__r1" / ".git").exists()), (["fizzbuzz__claude__fix__r1"], False)
+        )
+
     def test_report_is_written_unless_suppressed(self) -> None:
         fixtures.call_quiet(hb.cmd_run, args(only=["claude"], no_report=False), self.cfg, self.base)
         self.assertTrue((self.base / "results" / "summary.md").exists())
@@ -4705,6 +6405,139 @@ class CmdRunTests(RunTestCase):
         self.cfg["tasks"][0]["protected_paths"] = ["fizzbuzz.py"]
         fixtures.call_quiet(hb.cmd_run, args(only=["claude"]), self.cfg, self.base)
         self.assertFalse(rows_of(self.base)[0]["passed"])  # the "fix" was reverted by the restore
+
+
+def trials_of(base: Path) -> list[dict[str, Any]]:
+    (trials,) = (base / "results").glob("*/trials.jsonl")
+    return fixtures.read_rows(trials)
+
+
+def log_names(base: Path) -> set[str]:
+    return {p.name.split("__r1.", 1)[1] for p in (base / "results" / "logs").iterdir() if "__r1." in p.name}
+
+
+class GraderRunTests(RunTestCase):
+    """`cmd_run` with the `graders` and `grade` task keys."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.task = self.cfg["tasks"][0]
+        self.cfg["matrix"] = [{"harness": "claude", "model": "fix"}]
+
+    def run_one(self, **overrides: Any) -> dict[str, Any]:
+        self.task.update(overrides)
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        return rows_of(self.base)[-1]
+
+    def test_every_grader_result_is_written_to_the_trial(self) -> None:
+        self.run_one(graders=[{"type": "hidden_tests"}, {"type": "command", "command": "true"}])
+        (trial,) = trials_of(self.base)
+        self.assertEqual(
+            [(g["grader"], g["passed"], g["score"]) for g in trial["graders"]],
+            [("hidden_tests", True, 1.0), ("command", True, 1.0)],
+        )
+
+    def test_logs_are_named_test_for_hidden_tests_and_by_index_and_type_for_the_rest(self) -> None:
+        self.run_one(graders=[{"type": "hidden_tests"}, {"type": "command", "command": "echo graded"}])
+        names = log_names(self.base)
+        self.assertTrue({"test.log", "grader-1-command.log"} <= names, names)
+        log = next((self.base / "results" / "logs").glob("*grader-1-command.log")).read_text()
+        self.assertIn("graded", log)
+
+    def test_mode_all_fails_when_one_grader_fails(self) -> None:
+        row = self.run_one(graders=[{"type": "hidden_tests"}, {"type": "command", "command": "false"}])
+        self.assertEqual(row["passed"], False)
+        self.assertEqual(trials_of(self.base)[0]["status"], "failed")
+
+    def test_mode_any_passes_when_one_grader_passes(self) -> None:
+        self.cfg["matrix"] = [{"harness": "pi", "model": "p/nofix"}]  # the hidden tests fail
+        row = self.run_one(
+            graders=[{"type": "hidden_tests"}, {"type": "command", "command": "true"}], grade={"mode": "any"}
+        )
+        self.assertEqual(row["passed"], True)
+
+    def test_weighted_mode_uses_the_threshold(self) -> None:
+        self.cfg["matrix"] = [{"harness": "pi", "model": "p/nofix"}]
+        graders = [{"type": "hidden_tests", "weight": 1}, {"type": "command", "command": "true", "weight": 3}]
+        row = self.run_one(graders=graders, grade={"mode": "weighted", "threshold": 0.7})
+        self.assertEqual(row["passed"], True)
+
+    def test_a_grader_timeout_marks_the_trial_as_timed_out(self) -> None:
+        sleeper = f"{fixtures.PY} -c 'import time; time.sleep(60)'"
+        self.run_one(graders=[{"type": "command", "command": sleeper, "timeout": 1}])
+        self.assertEqual(trials_of(self.base)[0]["status"], "timeout")
+
+    def test_a_task_without_graders_writes_the_legacy_row_and_grader(self) -> None:
+        row = self.run_one()
+        (trial,) = trials_of(self.base)
+        self.assertEqual(("graders" in row, "score" in row), (False, False))
+        self.assertEqual([(g["grader"], g["score"]) for g in trial["graders"]], [("test", None)])
+
+    def test_changes_are_captured_before_protected_paths_are_restored(self) -> None:
+        graders = [{"type": "diff_constraints", "forbidden": ["fizzbuzz.py"]}]
+        row = self.run_one(graders=graders, protected_paths=["fizzbuzz.py"])  # the agent edits a protected file
+        self.assertEqual(row["passed"], False)
+
+    def test_diff_constraints_pass_when_the_agent_stays_inside_the_limits(self) -> None:
+        row = self.run_one(graders=[{"type": "diff_constraints", "allowed": ["fizzbuzz.py"], "max_changed_lines": 50}])
+        self.assertEqual(row["passed"], True)
+
+    def test_diff_constraints_fail_closed_when_the_agent_leaves_a_git_dir_behind(self) -> None:
+        self.cfg["harnesses"]["claude"]["command"] = [fixtures.PY, "-c", "import os; os.mkdir('.git')"]
+        row = self.run_one(graders=[{"type": "diff_constraints", "max_changed_lines": 1000}])
+        self.assertEqual(row["passed"], False)
+
+    def agent_writing_a_pyc(self) -> None:
+        code = (
+            "import os; os.makedirs('tests/__pycache__');"
+            " open('tests/__pycache__/t.cpython-312.pyc', 'wb').write(b'\\0' * 9)"
+        )
+        self.cfg["harnesses"]["claude"]["command"] = [fixtures.PY, "-c", code]
+
+    def test_bytecode_left_under_tests_passes_only_with_ignore_lines_and_the_source_glob(self) -> None:
+        self.agent_writing_a_pyc()
+        limits = {"type": "diff_constraints", "forbidden": ["tests/*.py"], "max_changed_lines": 50}
+        ignored = self.run_one(graders=[{**limits, "ignore_lines": ["*/__pycache__/*"]}])
+        plain = self.run_one(id="plain", graders=[limits])
+        self.assertEqual((ignored["passed"], plain["passed"]), (True, False))
+
+    def test_a_pyc_is_still_a_forbidden_path_when_the_glob_covers_it(self) -> None:
+        self.agent_writing_a_pyc()
+        row = self.run_one(graders=[{"type": "diff_constraints", "forbidden": ["tests/*"], "ignore_lines": ["*.pyc"]}])
+        self.assertEqual(row["passed"], False)
+
+    def test_a_secret_the_agent_writes_to_a_file_is_redacted_in_the_audit_diff(self) -> None:
+        secret = "-".join(["abcdef", "fake", "12345"])  # built at runtime so secret scanners skip it
+        self.cfg["harnesses"]["claude"]["env"]["MY_SECRET"] = secret
+        code = "import os; open('leak.txt', 'w').write(os.environ['MY_SECRET'])"
+        self.cfg["harnesses"]["claude"]["command"] = [fixtures.PY, "-c", code]
+        self.run_one()
+        diff = next((self.base / "results" / "logs").glob("*.diff")).read_text()
+        self.assertEqual((secret in diff, "leak.txt" in diff, "***REDACTED***" in diff), (False, True, True))
+
+    def test_an_exception_in_a_grader_fails_that_grader_and_the_matrix_goes_on(self) -> None:
+        class Broken:
+            name = "broken"
+            version = "1"
+
+            def __init__(self, cfg: Any) -> None:
+                pass
+
+            def grade(self, ctx: Any) -> Any:
+                raise RuntimeError("boom")
+
+        self.task["graders"] = [{"type": "broken"}]
+        with mock.patch.dict(hb.GRADERS, {"broken": Broken}):
+            out = fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        (trial,) = trials_of(self.base)
+        self.assertEqual((trial["graders"][0]["passed"], "RuntimeError" in out, "boom" in out), (False, True, False))
+
+    def test_bad_grader_config_exits_naming_the_task_before_any_agent_runs(self) -> None:
+        self.task["graders"] = [{"type": "command"}]
+        with self.assertRaises(SystemExit) as cm:
+            fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        self.assertIn("task fizzbuzz", str(cm.exception.code))
+        self.assertFalse((self.base / "results" / "results.jsonl").exists())
 
 
 class AggregateTests(unittest.TestCase):
@@ -5377,6 +7210,28 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(trial().schema_version, SCHEMA_VERSION)
 
 
+class ToolCallsTests(unittest.TestCase):
+    def test_tool_calls_default_to_unknown_and_round_trip(self) -> None:
+        self.assertIsNone(usage().tool_calls)
+        for calls in (None, 0, 7):
+            self.assertEqual(Usage.from_dict(usage(tool_calls=calls).to_dict()).tool_calls, calls)
+
+    def test_a_1_0_0_trial_without_tool_calls_still_loads(self) -> None:
+        d = trial().to_dict()
+        del d["usage"]["tool_calls"]
+        d["schema_version"] = "1.0.0"
+        loaded = TrialResult.from_dict(d)
+        self.assertEqual((loaded.usage.tool_calls, loaded.schema_version), (None, "1.0.0"))
+
+    def test_the_current_contract_version_is_1_1_0(self) -> None:
+        self.assertEqual((SCHEMA_VERSION, trial().schema_version), ("1.1.0", "1.1.0"))
+
+    def test_tool_calls_must_be_a_whole_number_of_at_least_zero(self) -> None:
+        for bad in (-1, 1.5, True, "3"):
+            with self.assertRaises(ContractError, msg=repr(bad)):
+                usage(tool_calls=bad)
+
+
 if __name__ == "__main__":
     unittest.main()
 ```
@@ -5457,6 +7312,16 @@ class ValidateContractTests(unittest.TestCase):
         d["graders"] = {}
         self.assertEqual(validate(d, TRIAL_SCHEMA), ["$.graders: expected array"])
 
+    def test_tool_calls_may_be_missing_null_or_a_count(self) -> None:
+        d = trial().to_dict()
+        for ok in (None, 0, 5):
+            d["usage"]["tool_calls"] = ok
+            self.assertEqual(validate(d, TRIAL_SCHEMA), [], repr(ok))
+        del d["usage"]["tool_calls"]
+        self.assertEqual(validate(d, TRIAL_SCHEMA), [])
+        d["usage"]["tool_calls"] = -1
+        self.assertEqual(validate(d, TRIAL_SCHEMA), ["$.usage.tool_calls: must be >= 0"])
+
     def test_params_accept_free_keys(self) -> None:
         d = trial().to_dict()
         d["target"]["params"] = {"anything": 1}
@@ -5465,8 +7330,8 @@ class ValidateContractTests(unittest.TestCase):
     def test_schema_document_holds_both_schemas_with_ids(self) -> None:
         doc = schema_document()
         self.assertEqual((doc["trial"], doc["run"]), (TRIAL_SCHEMA, RUN_SCHEMA))
-        self.assertTrue(TRIAL_SCHEMA["$id"].endswith("/trial/1.0.0"))
-        self.assertTrue(RUN_SCHEMA["$id"].endswith("/run/1.0.0"))
+        self.assertTrue(TRIAL_SCHEMA["$id"].endswith("/trial/1.1.0"))
+        self.assertTrue(RUN_SCHEMA["$id"].endswith("/run/1.1.0"))
 
 
 class ValidatorKeywordTests(unittest.TestCase):
@@ -5652,6 +7517,28 @@ class TrialFromRowTests(unittest.TestCase):
         )
         self.assertTrue(all("t1" in w for w in warnings))
         self.assertTrue(any("input" in w for w in warnings) and any("cost_reported" in w for w in warnings))
+
+    def test_tool_calls_come_from_the_row_and_default_to_unknown(self) -> None:
+        self.assertEqual(
+            [
+                convert(dict(MINIMAL_ROW, **extra)).usage.tool_calls
+                for extra in ({}, {"tool_calls": None}, {"tool_calls": 3})
+            ],
+            [None, None, 3],
+        )
+
+    def test_a_bad_tool_call_count_becomes_unknown_and_keeps_everything_else(self) -> None:
+        for bad in (-1, True, 1.5, "2", float("nan")):
+            warnings: list[str] = []
+            t = trial_from_row_lenient(
+                dict(MINIMAL_ROW, tool_calls=bad), run_id="r" * 32, suite_version="s1", warn=warnings.append
+            )
+            self.assertEqual((t.usage.tool_calls, t.usage.parsed, t.usage.total_tokens), (None, True, 117), repr(bad))
+            self.assertTrue(len(warnings) == 1 and "tool_calls" in warnings[0], repr(bad))
+
+    def test_a_bad_tool_call_count_is_dropped_silently_without_a_warn_callback(self) -> None:
+        t = trial_from_row_lenient(dict(MINIMAL_ROW, tool_calls=-1), run_id="r" * 32, suite_version="s1")
+        self.assertIsNone(t.usage.tool_calls)
 
     def test_a_valid_gateway_cost_survives_a_bad_harness_cost(self) -> None:
         warnings: list[str] = []
@@ -5925,7 +7812,8 @@ class RunOutputTests(RunTestCase):
             sorted(row),
             sorted(
                 "ts task harness model rep passed agent_rc agent_timed_out wall_s parse_ok run_tag t_start t_end "
-                "sandboxed input output reasoning cache_read cache_write cost_reported turns cost_computed".split()
+                "sandboxed input output reasoning cache_read cache_write cost_reported turns tool_calls "
+                "cost_computed".split()
             ),
         )
 
@@ -6231,7 +8119,7 @@ from typing import Any
 
 import fixtures
 from hbench.core.convert import trials_from_rows
-from hbench.report import aggregate, fmt_int, fmt_money, render_markdown, write_csv
+from hbench.report import aggregate, fmt_int, fmt_money, fmt_tool_calls, render_markdown, write_csv
 from hbench.stats import pass_at_k, pass_hat_k, reps_for_ci_width, wilson_interval
 from test_golden import GOLDEN, mask_summary
 
@@ -6515,6 +8403,51 @@ class FormatTests(unittest.TestCase):
         self.assertEqual([fmt_int(v) for v in (None, math.inf, 1234567.4)], ["n/a", "n/a", "1,234,567"])
 
 
+class ToolCallStatisticsTests(unittest.TestCase):
+    @staticmethod
+    def trials(*calls: int | None, passed: tuple[bool, ...] | None = None) -> list[Any]:
+        outcomes = passed if passed is not None else (True,) * len(calls)
+        rows = [
+            fixtures.run_row(rep=i, passed=ok, tool_calls=c)
+            for i, (c, ok) in enumerate(zip(calls, outcomes, strict=True), 1)
+        ]
+        return trials_from_rows(rows)
+
+    def test_averages_per_run_and_per_solved_task(self) -> None:
+        (entry,) = aggregate(self.trials(4, 6, 8, passed=(True, False, True)), "auto")
+        self.assertEqual((entry["tool_calls_per_run"], entry["tool_calls_per_solved"]), (6.0, 9.0))
+
+    def test_one_unknown_trial_makes_the_pair_unknown_not_zero(self) -> None:
+        (entry,) = aggregate(self.trials(4, None), "auto")
+        self.assertEqual((entry["tool_calls_per_run"], entry["tool_calls_per_solved"]), (None, None))
+
+    def test_a_known_zero_stays_zero(self) -> None:
+        (entry,) = aggregate(self.trials(0, 0), "auto")
+        self.assertEqual((entry["tool_calls_per_run"], entry["tool_calls_per_solved"]), (0.0, 0.0))
+
+    def test_nothing_solved_gives_infinite_per_solved(self) -> None:
+        (entry,) = aggregate(self.trials(3, passed=(False,)), "auto")
+        self.assertEqual((entry["tool_calls_per_run"], entry["tool_calls_per_solved"]), (3.0, math.inf))
+
+    def test_the_new_keys_come_last(self) -> None:
+        (entry,) = aggregate(self.trials(1), "auto")
+        self.assertEqual(list(entry)[-2:], ["tool_calls_per_run", "tool_calls_per_solved"])
+
+    def test_the_table_has_two_new_columns_with_n_a_when_unknown(self) -> None:
+        known = render(self.trials(2, 4))
+        unknown = render(self.trials(None))
+        self.assertIn("| Pareto | Tool calls/run | Tool calls/solved |", known)
+        self.assertRegex(known, r"\| 3\.0 \| 3\.0 \|\n")
+        self.assertRegex(unknown, r"\| n/a \| n/a \|\n\n")
+
+    def test_nothing_solved_renders_inf_and_not_n_a_in_the_table(self) -> None:
+        table = render(self.trials(3, passed=(False,)))
+        self.assertRegex(table, r"\| 3\.0 \| inf \|\n")
+
+    def test_formatting(self) -> None:
+        self.assertEqual([fmt_tool_calls(v) for v in (None, math.inf, 0.0, 2.55)], ["n/a", "inf", "0.0", "2.5"])
+
+
 class WriteCsvTests(unittest.TestCase):
     def test_writes_header_and_one_line_per_pair(self) -> None:
         path: Path = fixtures.tmpdir(self) / "s.csv"
@@ -6683,9 +8616,11 @@ class CliDispatchTests(unittest.TestCase):
         return fixtures.read_rows(self.base / out_dir / "results.jsonl")
 
     def test_run_with_litellm_profile_drops_cursor_and_forces_gateway_cost(self) -> None:
-        with mock.patch("time.sleep") as sleep:
+        # Patch the CLI's own `time` name: a global `time.sleep` patch also catches the polling sleeps that
+        # `subprocess.run(timeout=...)` makes while the fake agents run, which makes the call count load-dependent.
+        with mock.patch("hbench.cli.time") as clock:
             out = self.cli("run", "--litellm", "--settle", "0", "--allow-unsandboxed")
-        sleep.assert_called_once_with(0)
+        clock.sleep.assert_called_once_with(0)
         self.assertEqual(out.count("# Harness x model"), 1)  # one report, printed by reconcile after the wait
         self.assertGreater(out.index("# Harness x model"), out.index("waiting"))
         harnesses = {r["harness"] for r in self.rows("results-litellm")}
@@ -6795,6 +8730,742 @@ class ShimMainTests(unittest.TestCase):
         with mock.patch.object(cli, "main") as cli_main, mock.patch.object(sys, "argv", ["x", "--help"]):
             hbl.main()
         cli_main.assert_called_once_with(["--help"], epilog=mock.ANY)
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+`tests/test_runners.py`:
+
+```python
+"""Unit tests for the runner protocol, the template adapter and the runner registry."""
+
+import unittest
+
+import fixtures  # noqa: F401  (puts the repo root on sys.path)
+import harness_bench as hb
+from hbench.runners import PARSERS, runner_for
+from hbench.runners.base import HarnessRunner, TemplateRunner, build_argv
+
+
+def cfg_for(parser: str, **extra: object) -> dict[str, object]:
+    return {"command": ["agent", "--model", "{model}", "{prompt}"], "parser": parser, **extra}
+
+
+class TemplateRunnerTests(unittest.TestCase):
+    def test_command_matches_the_engine_build_cmd_for_provider_and_plain_models(self) -> None:
+        template = ["{provider}", "{model_name}", "{model}", "{prompt}"]
+        runner = TemplateRunner({"command": template, "parser": "claude"}, PARSERS["claude"])
+        for model in ("p/m", "m"):
+            self.assertEqual(runner.command(model, "go"), hb.build_cmd(template, model, "go"))
+
+    def test_build_argv_leaves_unknown_braces_to_the_template_fields(self) -> None:
+        self.assertEqual(build_argv(["[{provider}]", "{model_name}"], "m", "go"), ["[]", "m"])
+
+    def test_version_defaults_to_unknown_and_reads_the_config(self) -> None:
+        plain = TemplateRunner(cfg_for("claude"), PARSERS["claude"])
+        pinned = TemplateRunner(cfg_for("claude", version="2.1"), PARSERS["claude"])
+        self.assertEqual((plain.version(), pinned.version()), ("unknown", "2.1"))
+
+    def test_name_is_the_parser_name_and_prepare_is_a_no_op(self) -> None:
+        runner = TemplateRunner(cfg_for("pi"), PARSERS["pi"])
+        runner.prepare(fixtures.ROOT)  # returns nothing and touches nothing
+        self.assertEqual(runner.name, "pi")
+
+    def test_parse_usage_delegates_to_the_parser(self) -> None:
+        runner = TemplateRunner(cfg_for("null"), PARSERS["null"])
+        usage = runner.parse_usage("anything")
+        self.assertEqual(usage and usage["cost_reported"], 0.0)
+
+
+class RunnerForTests(unittest.TestCase):
+    def test_every_built_in_parser_has_a_runner(self) -> None:
+        for name in ("claude", "opencode", "pi", "cursor", "codex", "null"):
+            runner = runner_for(cfg_for(name))
+            self.assertIsInstance(runner, HarnessRunner)
+            self.assertEqual(runner.name, name)
+
+    def test_parsers_registry_lists_the_built_ins(self) -> None:
+        self.assertEqual(set(PARSERS), {"claude", "opencode", "pi", "cursor", "codex", "null"})
+
+    def test_unknown_parser_raises_a_value_error(self) -> None:
+        with self.assertRaises(ValueError):
+            runner_for(cfg_for("nope"))
+
+    def test_engine_reexports_the_parsers_under_the_same_names(self) -> None:
+        self.assertIs(hb.parse_claude, PARSERS["claude"])
+        self.assertIs(hb.PARSERS, PARSERS)
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+`tests/test_graders.py`:
+
+```python
+"""Unit tests for the grader protocol helpers: score parsing and verdict composition."""
+
+import unittest
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
+import fixtures
+from hbench.core.models import GraderResult
+from hbench.graders.base import Change, GradeContext, Grader, parse_score
+from hbench.graders.command import CommandGrader
+from hbench.graders.compose import compose
+from hbench.graders.diff_constraints import DiffConstraintsGrader
+from hbench.graders.hidden_tests import HiddenTestsGrader
+from hbench.graders.registry import GRADER_GROUP, grade_plan, grader_for
+
+
+def result(passed: bool, score: float | None) -> GraderResult:
+    return GraderResult(grader="g", grader_version="1", passed=passed, score=score)
+
+
+class ParseScoreTests(unittest.TestCase):
+    def test_the_last_score_line_wins(self) -> None:
+        self.assertEqual(parse_score("SCORE: 1.0\nnoise\nSCORE: 0.25\n"), 0.25)
+
+    def test_no_score_line_gives_none(self) -> None:
+        self.assertIsNone(parse_score("all tests passed\n"))
+
+    def test_out_of_range_and_malformed_values_give_none_with_a_warning(self) -> None:
+        for text in ("SCORE: 1.5", "SCORE: 1.2.3", "SCORE: .", "SCORE: 99"):
+            warnings: list[str] = []
+            self.assertIsNone(parse_score(text, warnings.append), text)
+            self.assertEqual(len(warnings), 1, text)
+
+    def test_a_bad_value_without_a_warn_callback_is_just_ignored(self) -> None:
+        self.assertIsNone(parse_score("SCORE: 1.5"))
+
+    def test_text_that_is_not_a_score_line_is_ignored_without_a_warning(self) -> None:
+        for text in ("SCORE: abc", "SCORE: -0.1", "SCORE:"):
+            warnings: list[str] = []
+            self.assertIsNone(parse_score(text, warnings.append), text)
+            self.assertEqual(warnings, [], text)
+
+    def test_a_bad_last_line_does_not_fall_back_to_an_earlier_one(self) -> None:
+        self.assertIsNone(parse_score("SCORE: 0.9\nSCORE: 1.5"))
+
+    def test_surrounding_whitespace_is_allowed_after_the_prefix(self) -> None:
+        self.assertEqual(parse_score("SCORE:   0.5   "), 0.5)
+
+    def test_a_line_that_only_contains_score_text_is_ignored(self) -> None:
+        self.assertIsNone(parse_score("my SCORE: 1.0 is great"))
+
+
+class ComposeTests(unittest.TestCase):
+    MIXED = [result(True, 1.0), result(False, 0.0)]
+
+    def test_all_requires_every_grader_and_averages(self) -> None:
+        self.assertEqual(compose(self.MIXED, "all", [1, 1], None), (False, 0.5))
+
+    def test_any_needs_one_pass_and_takes_the_best_score(self) -> None:
+        self.assertEqual(compose(self.MIXED, "any", [1, 1], None), (True, 1.0))
+
+    def test_weighted_compares_the_weighted_mean_with_the_threshold(self) -> None:
+        self.assertEqual(compose(self.MIXED, "weighted", [3, 1], 0.7), (True, 0.75))
+        self.assertEqual(compose(self.MIXED, "weighted", [1, 3], 0.7), (False, 0.25))
+
+    def test_a_missing_score_counts_as_one_on_pass_and_zero_otherwise(self) -> None:
+        self.assertEqual(compose([result(True, None), result(False, None)], "all", [1, 1], None), (False, 0.5))
+
+    def test_weighted_score_at_the_threshold_passes(self) -> None:
+        self.assertEqual(compose([result(True, 0.7)], "weighted", [1], 0.7), (True, 0.7))
+
+    def test_a_failed_grader_keeps_its_partial_score(self) -> None:
+        self.assertEqual(compose([result(False, 0.4)], "any", [1], None), (False, 0.4))
+        self.assertEqual(compose([result(False, 0.8), result(True, 0.6)], "weighted", [1, 1], 0.7), (True, 0.7))
+
+    def test_weighted_without_a_valid_threshold_raises(self) -> None:
+        for threshold in (None, 0.0, 1.5):
+            with self.assertRaises(ValueError):
+                compose(self.MIXED, "weighted", [1, 1], threshold)
+
+    def test_empty_results_raise(self) -> None:
+        with self.assertRaises(ValueError):
+            compose([], "all", [], None)
+
+    def test_unknown_mode_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            compose(self.MIXED, "median", [1, 1], None)
+
+    def test_weights_must_match_the_results_and_be_positive(self) -> None:
+        for weights in ([1], [1, 0], [1, -1]):
+            with self.assertRaises(ValueError):
+                compose(self.MIXED, "weighted", weights, 0.5)
+
+
+class ProtocolShapeTests(unittest.TestCase):
+    def test_change_and_context_are_plain_values(self) -> None:
+        change = Change(path="a.py", added=1, deleted=2)
+        self.assertEqual((change.path, change.added, change.deleted), ("a.py", 1, 2))
+        ctx = GradeContext(
+            workdir=fixtures.ROOT,
+            task={},
+            base=fixtures.ROOT,
+            changes=(change,),
+            run=lambda c, t, n: (0, False, "", ""),
+        )
+        self.assertEqual(ctx.run("x", 1, "n"), (0, False, "", ""))
+
+    def test_a_class_with_name_version_and_grade_is_a_grader(self) -> None:
+        class Always:
+            name = "always"
+            version = "1"
+
+            def grade(self, ctx: GradeContext) -> GraderResult:
+                return result(True, 1.0)
+
+        self.assertIsInstance(Always(), Grader)
+        self.assertNotIsInstance(object(), Grader)
+
+
+class FakeRun:
+    """Stands in for the engine's `run`: records the calls and answers with a fixed outcome."""
+
+    def __init__(self, rc: int | None = 0, timed_out: bool = False, output: str = "", stderr: str = "") -> None:
+        self.outcome = (rc, timed_out, output, stderr)
+        self.calls: list[tuple[str, int, str]] = []
+
+    def __call__(self, command: str, timeout: int, log_name: str) -> tuple[int | None, bool, str, str]:
+        self.calls.append((command, timeout, log_name))
+        return self.outcome
+
+
+def context(
+    run: FakeRun,
+    task: Mapping[str, Any] | None = None,
+    workdir: Path | None = None,
+    base: Path | None = None,
+    changes: tuple[Change, ...] = (),
+) -> GradeContext:
+    return GradeContext(
+        workdir=workdir or fixtures.ROOT, task=task or {}, base=base or fixtures.ROOT, changes=changes, run=run
+    )
+
+
+class HiddenTestsGraderTests(unittest.TestCase):
+    def test_hidden_tests_are_copied_before_the_test_command_runs(self) -> None:
+        base, workdir = fixtures.tmpdir(self), fixtures.tmpdir(self)
+        (base / "hidden").mkdir()
+        (base / "hidden" / "test_hidden.py").write_text("x")
+        seen: list[bool] = []
+
+        def run(command: str, timeout: int, log_name: str) -> tuple[int | None, bool, str, str]:
+            seen.append((workdir / "test_hidden.py").exists())
+            return 0, False, "", ""
+
+        task = {"test": "pytest", "hidden_tests": "hidden"}
+        result = HiddenTestsGrader({}).grade(GradeContext(workdir=workdir, task=task, base=base, changes=(), run=run))
+        self.assertEqual((seen, result.passed, result.score, result.grader), ([True], True, 1.0, "hidden_tests"))
+
+    def test_without_hidden_tests_only_the_command_runs_with_the_task_timeout(self) -> None:
+        run = FakeRun(rc=1)
+        result = HiddenTestsGrader({}).grade(context(run, {"test": "t", "test_timeout": 5}))
+        self.assertEqual((run.calls, result.passed, result.score), ([("t", 5, "test")], False, 0.0))
+
+    def test_default_timeout_is_900(self) -> None:
+        run = FakeRun()
+        HiddenTestsGrader({}).grade(context(run, {"test": "t"}))
+        self.assertEqual(run.calls[0][1], 900)
+
+    def test_timeout_fails_the_grader_and_is_flagged(self) -> None:
+        result = HiddenTestsGrader({}).grade(context(FakeRun(rc=-1, timed_out=True), {"test": "t"}))
+        self.assertEqual((result.passed, result.timed_out, result.score), (False, True, 0.0))
+
+    def test_a_missing_exit_code_is_not_a_pass(self) -> None:
+        result = HiddenTestsGrader({}).grade(context(FakeRun(rc=None), {"test": "t"}))
+        self.assertFalse(result.passed)
+
+    def test_score_line_gives_partial_credit_only_when_the_grader_opts_in(self) -> None:
+        run = FakeRun(rc=1, output="3 of 4\nSCORE: 0.75\n")
+        opted = HiddenTestsGrader({"score": True}).grade(context(run, {"test": "t"}))
+        plain = HiddenTestsGrader({}).grade(context(run, {"test": "t"}))
+        self.assertEqual(((opted.passed, opted.score), (plain.passed, plain.score)), ((False, 0.75), (False, 0.0)))
+
+    def test_without_the_opt_in_a_stdout_score_is_ignored_on_a_pass_too(self) -> None:
+        result = HiddenTestsGrader({}).grade(context(FakeRun(rc=0, output="SCORE: 0.2\n"), {"test": "t"}))
+        self.assertEqual((result.passed, result.score), (True, 1.0))
+
+    def test_an_earlier_score_line_from_agent_code_loses_to_the_last_one(self) -> None:
+        out = "SCORE: 1.0\nreal run\nSCORE: 0.5\n"
+        result = HiddenTestsGrader({"score": True}).grade(context(FakeRun(rc=1, output=out), {"test": "t"}))
+        self.assertEqual(result.score, 0.5)
+
+    def test_a_score_printed_to_stderr_is_never_read(self) -> None:
+        run = FakeRun(rc=1, output="SCORE: 0.1\n", stderr="SCORE: 1.0\n")
+        result = HiddenTestsGrader({"score": True}).grade(context(run, {"test": "t"}))
+        self.assertEqual((result.passed, result.score), (False, 0.1))
+
+    def test_an_out_of_range_score_falls_back_to_pass_fail(self) -> None:
+        with fixtures.quiet() as out:
+            run = FakeRun(output="SCORE: 7")
+            result = HiddenTestsGrader({"score": True}).grade(context(run, {"test": "t"}))
+        self.assertEqual((result.passed, result.score, "ignored SCORE" in out.getvalue()), (True, 1.0, True))
+
+    def test_a_timeout_fails_even_when_the_exit_code_is_zero(self) -> None:
+        result = HiddenTestsGrader({}).grade(context(FakeRun(rc=0, timed_out=True), {"test": "t"}))
+        self.assertEqual((result.passed, result.timed_out), (False, True))
+
+    def test_a_score_option_that_is_not_a_boolean_is_rejected(self) -> None:
+        for bad in ("yes", 1, None):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                HiddenTestsGrader({"score": bad})
+
+
+class CommandGraderTests(unittest.TestCase):
+    def test_runs_the_command_with_its_timeout_and_log_name(self) -> None:
+        run = FakeRun()
+        result = CommandGrader({"command": "make lint", "timeout": 30}).grade(context(run))
+        self.assertEqual((run.calls, result.passed, result.grader), ([("make lint", 30, "command")], True, "command"))
+
+    def test_default_timeout_is_900_and_failure_scores_zero(self) -> None:
+        run = FakeRun(rc=2)
+        result = CommandGrader({"command": "x"}).grade(context(run))
+        self.assertEqual((run.calls[0][1], result.passed, result.score), (900, False, 0.0))
+
+    def test_timeout_and_score_follow_the_same_rules_as_hidden_tests(self) -> None:
+        run = FakeRun(rc=-1, timed_out=True, output="SCORE: 0.2")
+        result = CommandGrader({"command": "x", "score": True}).grade(context(run))
+        self.assertEqual((result.passed, result.timed_out, result.score), (False, True, 0.2))
+
+    def test_stderr_score_with_a_failing_exit_code_does_not_pass_under_weighted(self) -> None:
+        run = FakeRun(rc=1, output="1 failed\n", stderr="SCORE: 1.0\n")
+        for cfg in ({"command": "x"}, {"command": "x", "score": True}):
+            graded = CommandGrader(cfg).grade(context(run))
+            self.assertEqual(compose([graded], "weighted", [1], 0.5)[0], False, msg=str(cfg))
+
+    def test_a_stdout_score_without_the_opt_in_cannot_lift_a_failing_grader(self) -> None:
+        graded = CommandGrader({"command": "x"}).grade(context(FakeRun(rc=1, output="SCORE: 1.0\n")))
+        self.assertEqual((compose([graded], "weighted", [1], 0.5), graded.score), ((False, 0.0), 0.0))
+
+    def test_bad_config_is_rejected(self) -> None:
+        for cfg in (
+            {},
+            {"command": ""},
+            {"command": 3},
+            {"command": "x", "timeout": 0},
+            {"command": "x", "timeout": "5"},
+            {"command": "x", "score": "yes"},
+        ):
+            with self.assertRaises(ValueError, msg=str(cfg)):
+                CommandGrader(cfg)
+
+
+def changes_of(*paths: str, lines: int = 1) -> tuple[Change, ...]:
+    return tuple(Change(path=p, added=lines, deleted=0) for p in paths)
+
+
+class DiffConstraintsGraderTests(unittest.TestCase):
+    def grade(self, cfg: Mapping[str, Any], changes: tuple[Change, ...]) -> GraderResult:
+        run = FakeRun()
+        result = DiffConstraintsGrader(cfg).grade(context(run, changes=changes))
+        self.assertEqual(run.calls, [])  # it runs no command
+        return result
+
+    def test_no_constraints_pass_everything(self) -> None:
+        self.assertEqual(self.grade({}, changes_of("a.py", "b/c.py")).passed, True)
+
+    def test_a_change_to_a_forbidden_path_fails(self) -> None:
+        result = self.grade({"forbidden": ["run_tests.py", "tests/*"]}, changes_of("src/a.py", "tests/x.py"))
+        self.assertEqual((result.passed, result.score), (False, 0.0))
+
+    def test_only_allowed_paths_may_change(self) -> None:
+        cfg = {"allowed": ["src/*.py"]}
+        self.assertTrue(self.grade(cfg, changes_of("src/a.py")).passed)
+        self.assertFalse(self.grade(cfg, changes_of("src/a.py", "README.md")).passed)
+
+    def test_forbidden_wins_over_allowed(self) -> None:
+        cfg = {"allowed": ["src/*"], "forbidden": ["src/secret.py"]}
+        self.assertFalse(self.grade(cfg, changes_of("src/secret.py")).passed)
+
+    def test_max_changed_lines_counts_added_and_deleted(self) -> None:
+        cfg = {"max_changed_lines": 10}
+        self.assertTrue(self.grade(cfg, (Change("a", 6, 4),)).passed)
+        self.assertFalse(self.grade(cfg, (Change("a", 6, 5),)).passed)
+        self.assertFalse(self.grade(cfg, (Change("a", 6, 0), Change("b", 5, 0))).passed)
+
+    def test_paths_outside_the_workdir_count_as_forbidden_even_without_a_forbidden_list(self) -> None:
+        for path in ("../x", "/etc/passwd", "a/../../x", ".."):
+            self.assertFalse(self.grade({}, changes_of(path)).passed, path)
+
+    def test_paths_are_normalized_before_matching(self) -> None:
+        cfg = {"forbidden": ["run_tests.py"]}
+        for path in ("./run_tests.py", "src/../run_tests.py"):
+            self.assertFalse(self.grade(cfg, changes_of(path)).passed, path)
+
+    def test_a_rename_is_seen_as_both_sides(self) -> None:
+        cfg = {"forbidden": ["run_tests.py"]}
+        self.assertFalse(self.grade(cfg, changes_of("run_tests.py", "renamed.py")).passed)
+
+    def test_violations_are_listed_for_the_log(self) -> None:
+        grader = DiffConstraintsGrader({"forbidden": ["a"], "max_changed_lines": 0})
+        found = grader.violations(changes_of("a"))
+        self.assertEqual(len(found), 2)
+
+    def test_ignore_lines_drops_matching_paths_from_the_count_only(self) -> None:
+        pyc = Change("tests/__pycache__/t.pyc", 10**9, 0)
+        cfg = {"max_changed_lines": 50, "ignore_lines": ["*/__pycache__/*"]}
+        self.assertTrue(self.grade(cfg, (pyc, Change("src/a.py", 5, 5))).passed)
+        self.assertFalse(self.grade({"max_changed_lines": 50}, (pyc,)).passed)
+        self.assertFalse(self.grade({**cfg, "forbidden": ["tests/*"]}, (pyc,)).passed)
+        self.assertFalse(self.grade({**cfg, "allowed": ["src/*"]}, (pyc,)).passed)
+        self.assertFalse(self.grade(cfg, (pyc, Change("src/a.py", 30, 30))).passed)
+
+    def test_bad_config_is_rejected(self) -> None:
+        for cfg in (
+            {"ignore_lines": "*.pyc"},
+            {"ignore_lines": [1]},
+            {"allowed": "src/*"},
+            {"forbidden": [1]},
+            {"max_changed_lines": -1},
+            {"max_changed_lines": True},
+            {"max_changed_lines": "5"},
+        ):
+            with self.assertRaises(ValueError, msg=str(cfg)):
+                DiffConstraintsGrader(cfg)
+
+
+class GradePlanTests(unittest.TestCase):
+    TASK = {"id": "t", "test": "true"}
+
+    def test_a_task_without_graders_gets_the_hidden_tests_grader_and_mode_all(self) -> None:
+        plan = grade_plan(self.TASK)
+        self.assertEqual(
+            ([g.name for g in plan.graders], plan.mode, plan.weights, plan.threshold),
+            (["hidden_tests"], "all", (1,), None),
+        )
+
+    def test_graders_weights_and_grade_block_are_read(self) -> None:
+        task = {
+            **self.TASK,
+            "graders": [{"type": "hidden_tests", "weight": 3}, {"type": "command", "command": "x"}],
+            "grade": {"mode": "weighted", "threshold": 0.6},
+        }
+        plan = grade_plan(task)
+        self.assertEqual(
+            ([g.name for g in plan.graders], plan.weights, plan.mode, plan.threshold),
+            (["hidden_tests", "command"], (3, 1), "weighted", 0.6),
+        )
+
+    def test_unknown_type_names_the_type_and_the_built_ins(self) -> None:
+        with self.assertRaises(ValueError) as cm:
+            grader_for({"type": "nope"})
+        self.assertIn("'nope'", str(cm.exception))
+        self.assertIn("hidden_tests", str(cm.exception))
+        self.assertEqual(GRADER_GROUP, "harness_bench.graders")
+
+    def test_bad_plans_are_rejected(self) -> None:
+        bad: list[dict[str, Any]] = [
+            {"graders": []},
+            {"graders": "hidden_tests"},
+            {"graders": ["hidden_tests"]},
+            {"graders": [{"kind": "command"}]},
+            {"graders": [{"type": "command"}]},
+            {"graders": [{"type": "hidden_tests", "weight": 0}]},
+            {"graders": [{"type": "hidden_tests", "weight": "2"}]},
+            {"grade": "all"},
+            {"grade": {"mode": "median"}},
+            {"grade": {"mode": "weighted"}},
+            {"grade": {"mode": "weighted", "threshold": 2}},
+            {"grade": {"mode": "weighted", "threshold": True}},
+        ]
+        for extra in bad:
+            with self.assertRaises(ValueError, msg=str(extra)):
+                grade_plan({**self.TASK, **extra})
+
+    def test_hidden_tests_without_a_test_command_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            grade_plan({"id": "t"})
+        grade_plan({"id": "t", "graders": [{"type": "command", "command": "x"}]})
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+`tests/test_plugins.py`:
+
+```python
+"""Entry-point plugins: loading, error reporting and an end-to-end run with a plugin grader and runner."""
+
+import contextlib
+import importlib
+import sys
+import textwrap
+import unittest
+from collections.abc import Iterator
+from pathlib import Path
+from typing import TypeGuard
+from unittest import mock
+
+import fixtures
+import harness_bench as hb
+from hbench import plugins
+from hbench.graders import Grader, grader_for
+from hbench.plugins import GRADER_GROUP, RUNNER_GROUP, PluginError, create_plugin, load_plugin
+from hbench.runners import runner_for
+from test_run import RunTestCase, args, rows_of
+
+DEMO_MODULE = """
+from hbench.core.models import GraderResult
+
+
+class DemoGrader:
+    name = "demo"
+    version = "9"
+
+    def __init__(self, cfg):
+        self.passes = cfg.get("passes", True)
+
+    def grade(self, ctx):
+        return GraderResult(grader=self.name, grader_version=self.version, passed=self.passes, score=0.5)
+
+
+class LogNameGrader:
+    name = "logname"
+    version = "1"
+
+    def __init__(self, cfg):
+        pass
+
+    def grade(self, ctx):
+        rc, timed_out, stdout, stderr = ctx.run("true", 30, "../../escape/..//x")
+        return GraderResult(grader=self.name, grader_version=self.version, passed=rc == 0, score=1.0)
+
+
+class DemoRunner:
+    name = "demo-runner"
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+    def prepare(self, workdir):
+        (workdir / "prepared.txt").write_text("hello")
+
+    def command(self, model, prompt):
+        return [part.format(model=model, model_name=model, provider="", prompt=prompt) for part in self.cfg["command"]]
+
+    def parse_usage(self, stdout):
+        return None
+
+    def version(self):
+        return "7.7"
+
+
+def grader_factory(cfg):
+    return DemoGrader(cfg)
+
+
+def logname_factory(cfg):
+    return LogNameGrader(cfg)
+
+
+def runner_factory(cfg):
+    return DemoRunner(cfg)
+
+
+def not_a_grader(cfg):
+    return object()
+
+
+def raising_factory(cfg):
+    raise RuntimeError("bad config")
+"""
+
+
+@contextlib.contextmanager
+def installed(
+    test: unittest.TestCase, entry_points: str, module: str = DEMO_MODULE, dist: str = "demo_plugin"
+) -> Iterator[Path]:
+    """A throwaway distribution on sys.path: metadata with `entry_points` and a `demo_plugin` module."""
+    root = fixtures.tmpdir(test)
+    info = root / f"{dist}-0.1.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {dist}\nVersion: 0.1\n")
+    (info / "entry_points.txt").write_text(textwrap.dedent(entry_points))
+    (root / "demo_plugin.py").write_text(module)
+    sys.path.insert(0, str(root))
+    importlib.invalidate_caches()
+    plugins.reset_announced()
+    try:
+        yield root
+    finally:
+        sys.path.remove(str(root))
+        sys.modules.pop("demo_plugin", None)
+        importlib.invalidate_caches()
+
+
+def is_grader(obj: object) -> TypeGuard[Grader]:
+    return isinstance(obj, Grader)
+
+
+GRADER_EP = f"[{GRADER_GROUP}]\ndemo = demo_plugin:grader_factory\n"
+
+
+class LoadPluginTests(unittest.TestCase):
+    def test_a_registered_factory_is_loaded_and_announced_once(self) -> None:
+        with installed(self, GRADER_EP):
+            with fixtures.quiet() as out:
+                factory = load_plugin(GRADER_GROUP, "demo", ("command",))
+                load_plugin(GRADER_GROUP, "demo", ("command",))
+            self.assertTrue(callable(factory))
+            self.assertEqual(out.getvalue(), f"plugin {GRADER_GROUP}:demo from demo_plugin 0.1\n")
+
+    def test_an_unknown_type_names_the_type_the_group_and_the_built_ins(self) -> None:
+        with self.assertRaises(PluginError) as cm:
+            load_plugin(GRADER_GROUP, "nope", ("command", "hidden_tests"))
+        message = str(cm.exception)
+        self.assertTrue(
+            all(part in message for part in ("grader", "'nope'", GRADER_GROUP, "command, hidden_tests")), message
+        )
+
+    def test_a_plugin_with_a_built_in_name_is_an_error(self) -> None:
+        with installed(self, f"[{GRADER_GROUP}]\ncommand = demo_plugin:grader_factory\n"):
+            with self.assertRaises(PluginError) as cm:
+                load_plugin(GRADER_GROUP, "other", ("command",))
+        self.assertIn("built-in name", str(cm.exception))
+        self.assertIn("demo_plugin", str(cm.exception))
+
+    def test_two_plugins_with_the_same_name_are_ambiguous(self) -> None:
+        with installed(self, GRADER_EP), installed(self, GRADER_EP, dist="demo_other"):
+            with self.assertRaises(PluginError) as cm:
+                load_plugin(GRADER_GROUP, "demo", ())
+        self.assertIn("more than one", str(cm.exception))
+
+    def test_an_import_error_is_wrapped_with_the_plugin_name(self) -> None:
+        with installed(self, GRADER_EP, module="raise RuntimeError('broken import')\n"):
+            with self.assertRaises(PluginError) as cm:
+                load_plugin(GRADER_GROUP, "demo", ())
+        self.assertTrue(all(p in str(cm.exception) for p in (f"{GRADER_GROUP}:demo", "RuntimeError", "broken import")))
+
+    def test_an_entry_point_that_is_not_callable_is_an_error(self) -> None:
+        with installed(self, f"[{GRADER_GROUP}]\ndemo = demo_plugin:DEMO\n", module="DEMO = 3\n"):
+            with self.assertRaises(PluginError) as cm:
+                load_plugin(GRADER_GROUP, "demo", ())
+        self.assertIn("not callable", str(cm.exception))
+
+    def test_a_factory_that_raises_is_wrapped(self) -> None:
+        with installed(self, f"[{GRADER_GROUP}]\ndemo = demo_plugin:raising_factory\n"):
+            with self.assertRaises(PluginError) as cm, fixtures.quiet():
+                grader_for({"type": "demo"})
+        self.assertTrue(all(p in str(cm.exception) for p in ("demo", "RuntimeError", "bad config")))
+
+    def test_a_result_of_the_wrong_type_is_an_error_naming_the_plugin(self) -> None:
+        with installed(self, f"[{GRADER_GROUP}]\ndemo = demo_plugin:not_a_grader\n"):
+            with self.assertRaises(PluginError) as cm, fixtures.quiet():
+                grader_for({"type": "demo"})
+        self.assertTrue(all(p in str(cm.exception) for p in (f"{GRADER_GROUP}:demo", "object", "Grader")))
+
+    def test_create_plugin_checks_the_result_with_the_given_guard(self) -> None:
+        with installed(self, GRADER_EP), fixtures.quiet():
+            built = create_plugin(GRADER_GROUP, "demo", (), {}, is_grader, "Grader")
+        self.assertEqual(built.name, "demo")
+
+
+class RegistryFallbackTests(unittest.TestCase):
+    def test_a_grader_type_that_is_not_built_in_comes_from_a_plugin(self) -> None:
+        with installed(self, GRADER_EP), fixtures.quiet():
+            grader = grader_for({"type": "demo", "passes": False})
+        self.assertEqual((grader.name, grader.version), ("demo", "9"))
+
+    def test_a_runner_parser_that_is_not_built_in_comes_from_a_plugin(self) -> None:
+        with installed(self, f"[{RUNNER_GROUP}]\ndemo-runner = demo_plugin:runner_factory\n"), fixtures.quiet():
+            runner = runner_for({"parser": "demo-runner", "command": ["x"]})
+        self.assertEqual((runner.name, runner.version()), ("demo-runner", "7.7"))
+
+    def test_unknown_runner_or_grader_gives_a_plugin_error_naming_the_group(self) -> None:
+        with self.assertRaises(PluginError) as cm:
+            runner_for({"parser": "nope", "command": ["x"]})
+        self.assertIn(RUNNER_GROUP, str(cm.exception))
+
+    def test_a_harness_without_a_parser_or_a_valid_command_is_rejected(self) -> None:
+        for cfg in (
+            {"command": ["x"]},
+            {"parser": 3, "command": ["x"]},
+            {"parser": "pi"},
+            {"parser": "pi", "command": "x"},
+        ):
+            with self.assertRaises(ValueError, msg=str(cfg)):
+                runner_for(cfg)
+
+
+class EndToEndTests(RunTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.cfg["matrix"] = [{"harness": "claude", "model": "fix"}]
+
+    def test_a_plugin_grader_grades_a_task_through_cmd_run_without_core_changes(self) -> None:
+        self.cfg["tasks"][0]["graders"] = [{"type": "demo"}]
+        with installed(self, GRADER_EP):
+            out = fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        (row,) = rows_of(self.base)
+        trial = fixtures.read_rows(next((self.base / "results").glob("*/trials.jsonl")))[0]
+        self.assertEqual(
+            (row["passed"], trial["graders"][0]["grader"], trial["graders"][0]["score"]), (True, "demo", 0.5)
+        )
+        self.assertIn("plugin harness_bench.graders:demo from demo_plugin 0.1", out)
+
+    def test_a_plugin_runner_builds_the_command_prepares_the_workdir_and_names_the_version(self) -> None:
+        script = self.base / "agent.py"
+        script.write_text("import os, sys\nsys.exit(0 if os.path.exists('prepared.txt') else 3)\n")
+        self.cfg["harnesses"]["claude"] = {"parser": "demo-runner", "command": [fixtures.PY, str(script)]}
+        self.cfg["tasks"][0]["graders"] = [
+            {"type": "command", "command": "test -f prepared.txt"},
+            {"type": "diff_constraints", "forbidden": ["prepared.txt"]},
+        ]
+        with installed(self, f"[{RUNNER_GROUP}]\ndemo-runner = demo_plugin:runner_factory\n"):
+            fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        (row,) = rows_of(self.base)
+        run_json = next((self.base / "results").glob("*/run.json")).read_text()
+        diff = next((self.base / "results" / "logs").glob("*.diff")).read_text()
+        self.assertEqual(
+            (row["passed"], row["agent_rc"], row["parse_ok"], '"harness_version": "7.7"' in run_json),
+            (True, 0, False, True),
+        )
+        # `prepare` runs before the baseline, so its file is part of the starting state, not an agent change.
+        self.assertNotIn("prepared.txt", diff)
+
+    def test_a_plugin_grader_cannot_write_its_log_outside_the_logs_dir(self) -> None:
+        self.cfg["tasks"][0]["graders"] = [{"type": "logname"}]
+        with installed(self, f"[{GRADER_GROUP}]\nlogname = demo_plugin:logname_factory\n"):
+            fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        logs = self.base / "results" / "logs"
+        written = sorted(p.name for p in logs.glob("*grader-0-*"))
+        outside = [p for p in self.base.rglob("*escape*") if not p.is_relative_to(logs)]
+        self.assertEqual((len(written), "/" in written[0], outside), (1, False, []))
+
+    def test_an_unknown_grader_type_exits_before_any_agent_runs(self) -> None:
+        self.cfg["tasks"][0]["graders"] = [{"type": "nope"}]
+        with self.assertRaises(SystemExit) as cm:
+            fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        message = str(cm.exception.code)
+        self.assertTrue(all(p in message for p in ("task fizzbuzz", "'nope'", GRADER_GROUP)), message)
+        self.assertFalse((self.base / "results" / "results.jsonl").exists())
+
+    def test_an_unknown_runner_exits_before_any_agent_runs(self) -> None:
+        self.cfg["harnesses"]["claude"]["parser"] = "nope"
+        with self.assertRaises(SystemExit) as cm:
+            fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        self.assertTrue(all(p in str(cm.exception.code) for p in ("harness claude", "'nope'", RUNNER_GROUP)))
+        self.assertFalse((self.base / "results" / "results.jsonl").exists())
+
+    def test_a_plugin_that_fails_to_load_exits_with_a_message_not_a_traceback(self) -> None:
+        self.cfg["tasks"][0]["graders"] = [{"type": "demo"}]
+        with installed(self, GRADER_EP, module="raise RuntimeError('broken import')\n"):
+            with self.assertRaises(SystemExit) as cm:
+                fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        self.assertIn("broken import", str(cm.exception.code))
+
+    def test_a_plain_config_never_looks_for_plugins(self) -> None:
+        with mock.patch.object(plugins, "entry_points") as entry_points:
+            fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        entry_points.assert_not_called()
 
 
 if __name__ == "__main__":

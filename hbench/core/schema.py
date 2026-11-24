@@ -58,6 +58,7 @@ _USAGE = _object(
         "cache_read_tokens": _COUNT,
         "cache_write_tokens": _COUNT,
         "turns": _COUNT,
+        "tool_calls": {"type": ["integer", "null"], "minimum": 0},
         "parsed": _BOOLEAN,
         "costs": {"$ref": "#/$defs/costs"},
         "cost_usd": _COST,

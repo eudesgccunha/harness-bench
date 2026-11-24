@@ -45,6 +45,13 @@ def fmt_int(v: float | None) -> str:
     return "n/a" if v is None or math.isinf(v) else f"{v:,.0f}"
 
 
+def fmt_tool_calls(v: float | None) -> str:
+    """`n/a` when unknown, `inf` when nothing was solved (like cost per solved task)."""
+    if v is None:
+        return "n/a"
+    return "inf" if math.isinf(v) else f"{v:.1f}"
+
+
 def _task_counts(trials: Sequence[TrialResult]) -> list[tuple[int, int]]:
     """`(runs, passes)` per task."""
     per_task: dict[str, list[bool]] = {}
@@ -81,6 +88,8 @@ def _pair_entry(
     costs = [c for c, _ in picked]
     cost = None if any(c is None for c in costs) else sum(c for c in costs if c is not None)
     names = sorted({_NAME_BY_SOURCE[s] for c, s in picked if c is not None})
+    calls = [t.usage.tool_calls for t in trials]
+    tool_calls = None if any(c is None for c in calls) else sum(c for c in calls if c is not None)
     counts = _task_counts(trials)
     k = min(runs for runs, _ in counts)
     pass_low, pass_high = wilson_interval(solved, n)
@@ -114,6 +123,8 @@ def _pair_entry(
         "pareto": False,
         "reps_needed": reps_for_ci_width(solved / n, target_ci_width, len(counts)),
         "null_control": null,
+        "tool_calls_per_run": tool_calls / n if tool_calls is not None else None,
+        "tool_calls_per_solved": (tool_calls / solved if solved else math.inf) if tool_calls is not None else None,
     }
 
 
@@ -175,9 +186,10 @@ def write_csv(table: Sequence[Mapping[str, Any]], path: Path) -> None:
 _HEAD = (
     "| # | Harness | Model | Solved | Pass rate | Cost/solved | Cost/run "
     "| Cost/1M tokens | Tokens/solved | Tokens/run | Cache hit | Turns | Time (s) "
-    "| Cost source | Pass 95% CI | pass@k | pass^k | Cost/solved 95% CI | Tie | Pareto |"
+    "| Cost source | Pass 95% CI | pass@k | pass^k | Cost/solved 95% CI | Tie | Pareto "
+    "| Tool calls/run | Tool calls/solved |"
 )
-_COLUMNS = 20
+_COLUMNS = 22
 
 
 def _range(low: float | None, high: float | None, fmt: Callable[[float], str], unit: str = "") -> str:
@@ -194,7 +206,8 @@ def _table_line(i: int, t: Mapping[str, Any]) -> str:
         f"| {_range(t['pass_ci_low'], t['pass_ci_high'], lambda v: f'{v * 100:.0f}', '%')} "
         f"| {t['pass_at_k']:.0%} (k={t['k']}) | {t['pass_hat_k']:.0%} (k={t['k']}) "
         f"| {_range(t['cost_per_solved_ci_low'], t['cost_per_solved_ci_high'], fmt_money)} "
-        f"| {'' if t['tie_with'] is None else f'={t["tie_with"]}'} | {'yes' if t['pareto'] else ''} |"
+        f"| {'' if t['tie_with'] is None else f'={t["tie_with"]}'} | {'yes' if t['pareto'] else ''} "
+        f"| {fmt_tool_calls(t['tool_calls_per_run'])} | {fmt_tool_calls(t['tool_calls_per_solved'])} |"
     )
 
 

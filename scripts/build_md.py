@@ -44,6 +44,24 @@ HBENCH_SOURCES = [
     "hbench/core/models.py",
     "hbench/core/schema.py",
     "hbench/core/convert.py",
+    "hbench/runners/__init__.py",
+    "hbench/runners/base.py",
+    "hbench/runners/_usage.py",
+    "hbench/runners/claude.py",
+    "hbench/runners/opencode.py",
+    "hbench/runners/pi.py",
+    "hbench/runners/cursor.py",
+    "hbench/runners/codex.py",
+    "hbench/runners/null.py",
+    "hbench/graders/__init__.py",
+    "hbench/graders/base.py",
+    "hbench/graders/compose.py",
+    "hbench/graders/_command.py",
+    "hbench/graders/hidden_tests.py",
+    "hbench/graders/command.py",
+    "hbench/graders/diff_constraints.py",
+    "hbench/graders/registry.py",
+    "hbench/plugins.py",
     "hbench/results.py",
     "hbench/stats.py",
     "hbench/report.py",
@@ -58,6 +76,9 @@ HBENCH_TESTS = [
     "tests/test_stats.py",
     "tests/test_report.py",
     "tests/test_cli.py",
+    "tests/test_runners.py",
+    "tests/test_graders.py",
+    "tests/test_plugins.py",
 ]
 
 
@@ -269,6 +290,10 @@ Parser: the `usage` in the `turn.completed` event is the cumulative thread total
 - If a `null` pair solves a task, the hidden tests are too lenient: the report prints a warning. Null pairs are left out of the recommendation and of the discrimination lists.
 - It has no LiteLLM spend, so under `--litellm` (cost source `litellm`) its cost is unknown, which is expected.
 
+### Tool calls
+
+Each parser also counts tool calls (`tool_calls`, shown as `Tool calls/run` and `Tool calls/solved`) where the output exposes them, and reports unknown (never `0`) elsewhere: Claude counts unique `tool_use` blocks in `stream-json` `assistant` events (the single JSON result has none); OpenCode counts `tool_use` events (unknown until the first one is seen, so a CLI version that emits none is not reported as 0; an OpenCode run with genuinely zero tool calls is therefore also unknown); Pi counts `toolCall` blocks of assistant `message_end` events; Codex counts completed `command_execution`, `file_change`, `mcp_tool_call` and `web_search` items (unknown until an `item.completed` event is seen); Cursor has no count; `null` is a real 0. One unknown trial makes the pair unknown.
+
 ## LiteLLM: what to check
 
 - `reconcile` first tries `GET /spend/logs/v2` (paginated, dates as `YYYY-MM-DD HH:MM:SS`). If that fails, it falls back to the legacy `GET /spend/logs?summarize=false`. Logs are matched to runs by the `request_tags` field, inside the script.
@@ -291,7 +316,7 @@ The agents run **without asking for approval**, and the `test` command executes 
 What the script does on every run:
 
 1. **Workdir outside the benchmark repository**: a new temporary directory, or an absolute `work_dir` outside the repository (the script rejects a path inside it). So the agent does not work next to hidden tests, config and results.
-2. **No git history**: the task repository is copied without `.git` and gets a single `baseline` commit. A clone at the commit before the fix would still contain the fix commit, and the remote would point back to the benchmark.
+2. **No git history**: the task repository is copied without `.git`. A clone at the commit before the fix would still contain the fix commit, and the remote would point back to the benchmark. The single `baseline` commit lives in a private temporary git directory outside the workdir and `work_dir` (deleted after the trial). Every git call on the workdir ignores its `.git`, `.gitignore`, `.gitattributes`, replace refs and git config, and every diff starts from a fresh index, so the agent cannot hide a change or run a command on the host through git. If the agent leaves a `.git` anywhere in the workdir, or `git add` fails (for example on an unreadable file), its changes count as unknown and `diff_constraints` fails; a binary file counts as more than any `max_changed_lines`. This works on any git version (an `info/attributes` file in the baseline git directory does the work; git 2.40 or newer adds `--attr-source` as a second layer). The guarantee holds for sandboxed runs: an unsandboxed agent runs as your user and could find and edit the temporary git directory.
 3. **Minimal environment**: the agent gets only `PATH`, `HOME`, `USER`, locale, `TERM`, `TMPDIR`, the variables in `env_passthrough` and those in the harness `env` block. `setup` and `test` get the same, without the harness `env`. The LiteLLM spend-read key (`litellm.api_key`) **never** reaches the agent: the script rejects a config that tries to pass it through.
 4. **Protected files**: before the agent runs, each path in `protected_paths` is copied outside the workdir. Before the test, that content is restored and anything the agent created there is deleted. Use it for the test runner and configs (`tests/`, `package.json`, `pytest.ini`, `conftest.py`, `vitest.config.ts`). Without it, an agent can "solve" the task by making the test always pass.
 5. **Audit**: `logs/<run>.diff` keeps everything the agent changed relative to the baseline.
@@ -352,6 +377,31 @@ Integrating it would need a dedicated backend: create the sandbox, upload the wo
 - Use the tests from the fix commit as hidden tests.
 - `setup` (e.g. `npm ci`) runs before the agent and does not count toward cost.
 - List the repository's tests and test configs in `protected_paths`.
+
+## Graders
+
+A task passes when its graders say so. Without a `graders` key, the single `hidden_tests` grader runs the task's `hidden_tests` copy and `test` command, as before. With one, each entry is an object with a `type` (and an optional `weight`), run in order after the agent finishes:
+
+```json
+"graders": [
+  {{"type": "hidden_tests"}},
+  {{"type": "command", "command": "ruff check .", "timeout": 120}},
+  {{"type": "diff_constraints", "forbidden": ["run_tests.py", "tests/*"], "max_changed_lines": 200}}
+],
+"grade": {{"mode": "all"}}
+```
+
+- `hidden_tests`: copies `hidden_tests` into the workdir, then runs `test` (`test_timeout`, default 900 s).
+- `command`: runs `command` (`timeout`, default 900 s). Passes on exit code 0.
+- `diff_constraints`: runs nothing. It checks what the agent changed, captured right after the agent finishes and before `protected_paths` are restored: every changed path must match `allowed` (empty means any) and none may match `forbidden` (`fnmatch` globs on paths relative to the workdir; `*` also matches `/`), and the added plus deleted lines must not exceed `max_changed_lines`. A path outside the workdir is always forbidden, and so is an unreadable diff. Renames count as a delete and an add. A binary file counts as more than any `max_changed_lines`. Interpreters leave bytecode (`__pycache__/*.pyc`) in the workdir, and a `.pyc` is binary: list `ignore_lines` globs (for example `["*/__pycache__/*"]`) to leave those paths out of the **line count** only (the `allowed` and `forbidden` checks still apply). Do not ignore bytecode in `forbidden` or `allowed`: a crafted `.pyc` can poison the tests. Instead list the test directories in `protected_paths`, because the restore before the tests deletes everything the agent added there (bytecode included), and write `forbidden` with source globs (`tests/*.py`) so harmless bytecode does not trip it. Keep `ignore_lines` to generated artifacts only: a broad glob such as `*.py` turns `max_changed_lines` off.
+- `grade`: `mode` is `all` (default: every grader passes, score is the mean), `any` (one passes, score is the best) or `weighted` (score is the weighted mean using each grader's `weight`, default 1; it passes at `threshold`, required, above 0 and up to 1).
+- Partial credit is opt-in: set `"score": true` on a `hidden_tests` or `command` grader and it reads the **last** line `SCORE: <0 to 1>` of the command's **stdout** (stderr is never read). Passing is still exit code 0 without a timeout. Without the option, or without a valid `SCORE` line, the score is 1.0 on pass and 0.0 otherwise (an out-of-range value is ignored with a warning). The test command runs code the agent wrote, which can print a `SCORE` line after the real one, so a score is only as trustworthy as the test output (including a later stdout `SCORE:` line printed by agent code, for example from `atexit`), and a `weighted` verdict with `score: true` inherits exactly that trust. Use `all` or `any` (exit codes only) when the agent can influence the scorer.
+- Logs: `<tag>.test.log` for `hidden_tests`, `<tag>.grader-<index>-<type>.log` for the others. Only the engine starts processes, through the same env allowlist, sandbox wrapper and log redaction as the test command.
+- `trials.jsonl` lists every grader result. Rows of tasks without `graders` keep the single `test` grader.
+
+### Plugins
+
+Another package can add runners and graders without touching this repository. It registers a factory `(config) -> HarnessRunner | Grader` under the entry-point group `harness_bench.runners` (the harness `parser` name) or `harness_bench.graders` (the grader `type`). Built-in names always win and a plugin that reuses one is an error. Plugins are loaded only when the config names a type that is not built in, and the config is validated before any agent runs. The plugin's package name and version are printed once. A runner builds the argv and parses the output; a grader asks the engine to run commands through `ctx.run`. Neither starts processes.
 
 ## `command` placeholders
 

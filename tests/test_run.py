@@ -5,6 +5,7 @@ import shutil
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import fixtures
 import harness_bench as hb
@@ -41,6 +42,11 @@ class CmdRunTests(RunTestCase):
         with self.assertRaises(SystemExit) as cm:
             fixtures.call_quiet(hb.cmd_run, args(allow_unsandboxed=False), self.cfg, self.base)
         self.assertIn("No sandbox configured", str(cm.exception.code))
+
+    def test_a_git_older_than_2_40_still_runs_with_the_attributes_file_alone(self) -> None:
+        with mock.patch.object(hb, "git_version", return_value=(2, 34)):
+            fixtures.call_quiet(hb.cmd_run, args(only=["claude"]), self.cfg, self.base)
+        self.assertEqual([r["passed"] for r in rows_of(self.base)], [True])
 
     def test_dry_run_prints_commands_and_writes_no_results(self) -> None:
         out = fixtures.call_quiet(hb.cmd_run, args(dry_run=True, allow_unsandboxed=False), self.cfg, self.base)
@@ -107,6 +113,15 @@ class CmdRunTests(RunTestCase):
         fixtures.call_quiet(hb.cmd_run, args(only=["claude"], keep=True), self.cfg, self.base)
         self.assertEqual((work / tag / "stale.txt").exists(), False)
 
+    def test_the_baseline_git_dir_is_outside_the_workdir_and_removed_after_the_trial(self) -> None:
+        work = fixtures.tmpdir(self) / "work"
+        self.cfg["work_dir"] = str(work)
+        fixtures.call_quiet(hb.cmd_run, args(only=["claude"], keep=True), self.cfg, self.base)
+        kept = sorted(p.name for p in work.iterdir())
+        self.assertEqual(
+            (kept, (work / "fizzbuzz__claude__fix__r1" / ".git").exists()), (["fizzbuzz__claude__fix__r1"], False)
+        )
+
     def test_report_is_written_unless_suppressed(self) -> None:
         fixtures.call_quiet(hb.cmd_run, args(only=["claude"], no_report=False), self.cfg, self.base)
         self.assertTrue((self.base / "results" / "summary.md").exists())
@@ -131,6 +146,139 @@ class CmdRunTests(RunTestCase):
         self.cfg["tasks"][0]["protected_paths"] = ["fizzbuzz.py"]
         fixtures.call_quiet(hb.cmd_run, args(only=["claude"]), self.cfg, self.base)
         self.assertFalse(rows_of(self.base)[0]["passed"])  # the "fix" was reverted by the restore
+
+
+def trials_of(base: Path) -> list[dict[str, Any]]:
+    (trials,) = (base / "results").glob("*/trials.jsonl")
+    return fixtures.read_rows(trials)
+
+
+def log_names(base: Path) -> set[str]:
+    return {p.name.split("__r1.", 1)[1] for p in (base / "results" / "logs").iterdir() if "__r1." in p.name}
+
+
+class GraderRunTests(RunTestCase):
+    """`cmd_run` with the `graders` and `grade` task keys."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.task = self.cfg["tasks"][0]
+        self.cfg["matrix"] = [{"harness": "claude", "model": "fix"}]
+
+    def run_one(self, **overrides: Any) -> dict[str, Any]:
+        self.task.update(overrides)
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        return rows_of(self.base)[-1]
+
+    def test_every_grader_result_is_written_to_the_trial(self) -> None:
+        self.run_one(graders=[{"type": "hidden_tests"}, {"type": "command", "command": "true"}])
+        (trial,) = trials_of(self.base)
+        self.assertEqual(
+            [(g["grader"], g["passed"], g["score"]) for g in trial["graders"]],
+            [("hidden_tests", True, 1.0), ("command", True, 1.0)],
+        )
+
+    def test_logs_are_named_test_for_hidden_tests_and_by_index_and_type_for_the_rest(self) -> None:
+        self.run_one(graders=[{"type": "hidden_tests"}, {"type": "command", "command": "echo graded"}])
+        names = log_names(self.base)
+        self.assertTrue({"test.log", "grader-1-command.log"} <= names, names)
+        log = next((self.base / "results" / "logs").glob("*grader-1-command.log")).read_text()
+        self.assertIn("graded", log)
+
+    def test_mode_all_fails_when_one_grader_fails(self) -> None:
+        row = self.run_one(graders=[{"type": "hidden_tests"}, {"type": "command", "command": "false"}])
+        self.assertEqual(row["passed"], False)
+        self.assertEqual(trials_of(self.base)[0]["status"], "failed")
+
+    def test_mode_any_passes_when_one_grader_passes(self) -> None:
+        self.cfg["matrix"] = [{"harness": "pi", "model": "p/nofix"}]  # the hidden tests fail
+        row = self.run_one(
+            graders=[{"type": "hidden_tests"}, {"type": "command", "command": "true"}], grade={"mode": "any"}
+        )
+        self.assertEqual(row["passed"], True)
+
+    def test_weighted_mode_uses_the_threshold(self) -> None:
+        self.cfg["matrix"] = [{"harness": "pi", "model": "p/nofix"}]
+        graders = [{"type": "hidden_tests", "weight": 1}, {"type": "command", "command": "true", "weight": 3}]
+        row = self.run_one(graders=graders, grade={"mode": "weighted", "threshold": 0.7})
+        self.assertEqual(row["passed"], True)
+
+    def test_a_grader_timeout_marks_the_trial_as_timed_out(self) -> None:
+        sleeper = f"{fixtures.PY} -c 'import time; time.sleep(60)'"
+        self.run_one(graders=[{"type": "command", "command": sleeper, "timeout": 1}])
+        self.assertEqual(trials_of(self.base)[0]["status"], "timeout")
+
+    def test_a_task_without_graders_writes_the_legacy_row_and_grader(self) -> None:
+        row = self.run_one()
+        (trial,) = trials_of(self.base)
+        self.assertEqual(("graders" in row, "score" in row), (False, False))
+        self.assertEqual([(g["grader"], g["score"]) for g in trial["graders"]], [("test", None)])
+
+    def test_changes_are_captured_before_protected_paths_are_restored(self) -> None:
+        graders = [{"type": "diff_constraints", "forbidden": ["fizzbuzz.py"]}]
+        row = self.run_one(graders=graders, protected_paths=["fizzbuzz.py"])  # the agent edits a protected file
+        self.assertEqual(row["passed"], False)
+
+    def test_diff_constraints_pass_when_the_agent_stays_inside_the_limits(self) -> None:
+        row = self.run_one(graders=[{"type": "diff_constraints", "allowed": ["fizzbuzz.py"], "max_changed_lines": 50}])
+        self.assertEqual(row["passed"], True)
+
+    def test_diff_constraints_fail_closed_when_the_agent_leaves_a_git_dir_behind(self) -> None:
+        self.cfg["harnesses"]["claude"]["command"] = [fixtures.PY, "-c", "import os; os.mkdir('.git')"]
+        row = self.run_one(graders=[{"type": "diff_constraints", "max_changed_lines": 1000}])
+        self.assertEqual(row["passed"], False)
+
+    def agent_writing_a_pyc(self) -> None:
+        code = (
+            "import os; os.makedirs('tests/__pycache__');"
+            " open('tests/__pycache__/t.cpython-312.pyc', 'wb').write(b'\\0' * 9)"
+        )
+        self.cfg["harnesses"]["claude"]["command"] = [fixtures.PY, "-c", code]
+
+    def test_bytecode_left_under_tests_passes_only_with_ignore_lines_and_the_source_glob(self) -> None:
+        self.agent_writing_a_pyc()
+        limits = {"type": "diff_constraints", "forbidden": ["tests/*.py"], "max_changed_lines": 50}
+        ignored = self.run_one(graders=[{**limits, "ignore_lines": ["*/__pycache__/*"]}])
+        plain = self.run_one(id="plain", graders=[limits])
+        self.assertEqual((ignored["passed"], plain["passed"]), (True, False))
+
+    def test_a_pyc_is_still_a_forbidden_path_when_the_glob_covers_it(self) -> None:
+        self.agent_writing_a_pyc()
+        row = self.run_one(graders=[{"type": "diff_constraints", "forbidden": ["tests/*"], "ignore_lines": ["*.pyc"]}])
+        self.assertEqual(row["passed"], False)
+
+    def test_a_secret_the_agent_writes_to_a_file_is_redacted_in_the_audit_diff(self) -> None:
+        secret = "-".join(["abcdef", "fake", "12345"])  # built at runtime so secret scanners skip it
+        self.cfg["harnesses"]["claude"]["env"]["MY_SECRET"] = secret
+        code = "import os; open('leak.txt', 'w').write(os.environ['MY_SECRET'])"
+        self.cfg["harnesses"]["claude"]["command"] = [fixtures.PY, "-c", code]
+        self.run_one()
+        diff = next((self.base / "results" / "logs").glob("*.diff")).read_text()
+        self.assertEqual((secret in diff, "leak.txt" in diff, "***REDACTED***" in diff), (False, True, True))
+
+    def test_an_exception_in_a_grader_fails_that_grader_and_the_matrix_goes_on(self) -> None:
+        class Broken:
+            name = "broken"
+            version = "1"
+
+            def __init__(self, cfg: Any) -> None:
+                pass
+
+            def grade(self, ctx: Any) -> Any:
+                raise RuntimeError("boom")
+
+        self.task["graders"] = [{"type": "broken"}]
+        with mock.patch.dict(hb.GRADERS, {"broken": Broken}):
+            out = fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        (trial,) = trials_of(self.base)
+        self.assertEqual((trial["graders"][0]["passed"], "RuntimeError" in out, "boom" in out), (False, True, False))
+
+    def test_bad_grader_config_exits_naming_the_task_before_any_agent_runs(self) -> None:
+        self.task["graders"] = [{"type": "command"}]
+        with self.assertRaises(SystemExit) as cm:
+            fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        self.assertIn("task fizzbuzz", str(cm.exception.code))
+        self.assertFalse((self.base / "results" / "results.jsonl").exists())
 
 
 class AggregateTests(unittest.TestCase):

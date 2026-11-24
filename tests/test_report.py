@@ -9,7 +9,7 @@ from typing import Any
 
 import fixtures
 from hbench.core.convert import trials_from_rows
-from hbench.report import aggregate, fmt_int, fmt_money, render_markdown, write_csv
+from hbench.report import aggregate, fmt_int, fmt_money, fmt_tool_calls, render_markdown, write_csv
 from hbench.stats import pass_at_k, pass_hat_k, reps_for_ci_width, wilson_interval
 from test_golden import GOLDEN, mask_summary
 
@@ -291,6 +291,51 @@ class FormatTests(unittest.TestCase):
 
     def test_int_none_inf_and_grouping(self) -> None:
         self.assertEqual([fmt_int(v) for v in (None, math.inf, 1234567.4)], ["n/a", "n/a", "1,234,567"])
+
+
+class ToolCallStatisticsTests(unittest.TestCase):
+    @staticmethod
+    def trials(*calls: int | None, passed: tuple[bool, ...] | None = None) -> list[Any]:
+        outcomes = passed if passed is not None else (True,) * len(calls)
+        rows = [
+            fixtures.run_row(rep=i, passed=ok, tool_calls=c)
+            for i, (c, ok) in enumerate(zip(calls, outcomes, strict=True), 1)
+        ]
+        return trials_from_rows(rows)
+
+    def test_averages_per_run_and_per_solved_task(self) -> None:
+        (entry,) = aggregate(self.trials(4, 6, 8, passed=(True, False, True)), "auto")
+        self.assertEqual((entry["tool_calls_per_run"], entry["tool_calls_per_solved"]), (6.0, 9.0))
+
+    def test_one_unknown_trial_makes_the_pair_unknown_not_zero(self) -> None:
+        (entry,) = aggregate(self.trials(4, None), "auto")
+        self.assertEqual((entry["tool_calls_per_run"], entry["tool_calls_per_solved"]), (None, None))
+
+    def test_a_known_zero_stays_zero(self) -> None:
+        (entry,) = aggregate(self.trials(0, 0), "auto")
+        self.assertEqual((entry["tool_calls_per_run"], entry["tool_calls_per_solved"]), (0.0, 0.0))
+
+    def test_nothing_solved_gives_infinite_per_solved(self) -> None:
+        (entry,) = aggregate(self.trials(3, passed=(False,)), "auto")
+        self.assertEqual((entry["tool_calls_per_run"], entry["tool_calls_per_solved"]), (3.0, math.inf))
+
+    def test_the_new_keys_come_last(self) -> None:
+        (entry,) = aggregate(self.trials(1), "auto")
+        self.assertEqual(list(entry)[-2:], ["tool_calls_per_run", "tool_calls_per_solved"])
+
+    def test_the_table_has_two_new_columns_with_n_a_when_unknown(self) -> None:
+        known = render(self.trials(2, 4))
+        unknown = render(self.trials(None))
+        self.assertIn("| Pareto | Tool calls/run | Tool calls/solved |", known)
+        self.assertRegex(known, r"\| 3\.0 \| 3\.0 \|\n")
+        self.assertRegex(unknown, r"\| n/a \| n/a \|\n\n")
+
+    def test_nothing_solved_renders_inf_and_not_n_a_in_the_table(self) -> None:
+        table = render(self.trials(3, passed=(False,)))
+        self.assertRegex(table, r"\| 3\.0 \| inf \|\n")
+
+    def test_formatting(self) -> None:
+        self.assertEqual([fmt_tool_calls(v) for v in (None, math.inf, 0.0, 2.55)], ["n/a", "inf", "0.0", "2.5"])
 
 
 class WriteCsvTests(unittest.TestCase):

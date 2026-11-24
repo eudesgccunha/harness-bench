@@ -71,6 +71,16 @@ class ValidateContractTests(unittest.TestCase):
         d["graders"] = {}
         self.assertEqual(validate(d, TRIAL_SCHEMA), ["$.graders: expected array"])
 
+    def test_tool_calls_may_be_missing_null_or_a_count(self) -> None:
+        d = trial().to_dict()
+        for ok in (None, 0, 5):
+            d["usage"]["tool_calls"] = ok
+            self.assertEqual(validate(d, TRIAL_SCHEMA), [], repr(ok))
+        del d["usage"]["tool_calls"]
+        self.assertEqual(validate(d, TRIAL_SCHEMA), [])
+        d["usage"]["tool_calls"] = -1
+        self.assertEqual(validate(d, TRIAL_SCHEMA), ["$.usage.tool_calls: must be >= 0"])
+
     def test_params_accept_free_keys(self) -> None:
         d = trial().to_dict()
         d["target"]["params"] = {"anything": 1}
@@ -79,8 +89,8 @@ class ValidateContractTests(unittest.TestCase):
     def test_schema_document_holds_both_schemas_with_ids(self) -> None:
         doc = schema_document()
         self.assertEqual((doc["trial"], doc["run"]), (TRIAL_SCHEMA, RUN_SCHEMA))
-        self.assertTrue(TRIAL_SCHEMA["$id"].endswith("/trial/1.0.0"))
-        self.assertTrue(RUN_SCHEMA["$id"].endswith("/run/1.0.0"))
+        self.assertTrue(TRIAL_SCHEMA["$id"].endswith("/trial/1.1.0"))
+        self.assertTrue(RUN_SCHEMA["$id"].endswith("/run/1.1.0"))
 
 
 class ValidatorKeywordTests(unittest.TestCase):

@@ -2,11 +2,11 @@
 
 Cost source: `auto` (auto = litellm > computed > reported). Sorted by cost per solved task.
 
-| # | Harness | Model | Solved | Pass rate | Cost/solved | Cost/run | Cost/1M tokens | Tokens/solved | Tokens/run | Cache hit | Turns | Time (s) | Cost source | Pass 95% CI | pass@k | pass^k | Cost/solved 95% CI | Tie | Pareto |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| 1 | claude | sonnet | 2/2 | 100% | $0.0645 | $0.0645 | $1.19 | 54,430 | 54,430 | 99% | 5.0 | 40 | litellm | 34–100% | 100% (k=1) | 100% (k=1) | $0.0587–$0.0704 |  | yes |
-| 2 | opencode | glm | 0/2 | 0% | inf | $0.0101 | $0.3904 | n/a | 26,000 | 78% | 8.0 | 56 | computed | 0–66% | 0% (k=1) | 0% (k=1) | n/a |  |  |
-| 3 | cursor | auto | 1/2 | 50% | n/a | n/a | n/a | 0 | 0 | 0% | 0.0 | 24 | n/a | 9–91% | 50% (k=1) | 50% (k=1) | n/a |  |  |
+| # | Harness | Model | Solved | Pass rate | Cost/solved | Cost/run | Cost/1M tokens | Tokens/solved | Tokens/run | Cache hit | Turns | Time (s) | Cost source | Pass 95% CI | pass@k | pass^k | Cost/solved 95% CI | Tie | Pareto | Tool calls/run | Tool calls/solved |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | claude | sonnet | 2/2 | 100% | $0.0645 | $0.0645 | $1.19 | 54,430 | 54,430 | 99% | 5.0 | 40 | litellm | 34–100% | 100% (k=1) | 100% (k=1) | $0.0587–$0.0704 |  | yes | n/a | n/a |
+| 2 | opencode | glm | 0/2 | 0% | inf | $0.0101 | $0.3904 | n/a | 26,000 | 78% | 8.0 | 56 | computed | 0–66% | 0% (k=1) | 0% (k=1) | n/a |  |  | n/a | n/a |
+| 3 | cursor | auto | 1/2 | 50% | n/a | n/a | n/a | 0 | 0 | 0% | 0.0 | 24 | n/a | 9–91% | 50% (k=1) | 50% (k=1) | n/a |  |  | n/a | n/a |
 
 **Warning:** no token data from the harness for: cursor/auto (2). See `results/logs/*.agent.jsonl`.
 

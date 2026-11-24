@@ -152,9 +152,11 @@ class CliDispatchTests(unittest.TestCase):
         return fixtures.read_rows(self.base / out_dir / "results.jsonl")
 
     def test_run_with_litellm_profile_drops_cursor_and_forces_gateway_cost(self) -> None:
-        with mock.patch("time.sleep") as sleep:
+        # Patch the CLI's own `time` name: a global `time.sleep` patch also catches the polling sleeps that
+        # `subprocess.run(timeout=...)` makes while the fake agents run, which makes the call count load-dependent.
+        with mock.patch("hbench.cli.time") as clock:
             out = self.cli("run", "--litellm", "--settle", "0", "--allow-unsandboxed")
-        sleep.assert_called_once_with(0)
+        clock.sleep.assert_called_once_with(0)
         self.assertEqual(out.count("# Harness x model"), 1)  # one report, printed by reconcile after the wait
         self.assertGreater(out.index("# Harness x model"), out.index("waiting"))
         harnesses = {r["harness"] for r in self.rows("results-litellm")}

@@ -110,7 +110,7 @@ class PiParserTests(unittest.TestCase):
 
 class NullParserTests(unittest.TestCase):
     def test_usage_is_zero_and_the_cost_is_a_real_zero(self) -> None:
-        self.assertEqual(hb.parse_null("anything"), {**hb.empty_usage(), "cost_reported": 0.0})
+        self.assertEqual(hb.parse_null("anything"), {**hb.empty_usage(), "cost_reported": 0.0, "tool_calls": 0})
 
 
 class CursorParserTests(unittest.TestCase):
@@ -186,6 +186,96 @@ class RowTagsTests(unittest.TestCase):
 
     def test_missing_or_non_list_gives_empty(self) -> None:
         self.assertEqual((hb.row_tags({}), hb.row_tags({"request_tags": "7"})), ([], []))
+
+
+class ToolCallTests(unittest.TestCase):
+    """Tool calls are counted where the format exposes them and are None (never 0) elsewhere."""
+
+    def test_empty_usage_has_unknown_tool_calls(self) -> None:
+        self.assertIsNone(hb.empty_usage()["tool_calls"])
+
+    def test_claude_stream_json_counts_unique_tool_use_blocks(self) -> None:
+        use = {"type": "tool_use", "id": "a", "name": "Bash"}
+        out = jl(
+            {"type": "assistant", "message": {"id": "m1", "content": [{"type": "text", "text": "x"}, use]}},
+            {"type": "assistant", "message": {"id": "m1", "content": [use]}},  # the same block seen again
+            {"type": "assistant", "message": {"id": "m2", "content": [{"type": "tool_use", "id": "b"}]}},
+            {"type": "assistant", "message": {"id": "m3", "content": "plain text"}},
+            {"type": "result", "usage": {"input_tokens": 1}},
+        )
+        self.assertEqual(hb.parse_claude(out)["tool_calls"], 2)
+
+    def test_claude_stream_json_without_tool_use_is_a_known_zero(self) -> None:
+        out = jl({"type": "assistant", "message": {"content": [{"type": "text"}]}}, {"type": "result", "usage": {}})
+        self.assertEqual(hb.parse_claude(out)["tool_calls"], 0)
+
+    def test_claude_tool_use_blocks_without_an_id_are_all_counted(self) -> None:
+        block = {"type": "tool_use"}
+        out = jl({"type": "assistant", "message": {"content": [block, block]}}, {"type": "result", "usage": {}})
+        self.assertEqual(hb.parse_claude(out)["tool_calls"], 2)
+
+    def test_claude_single_result_object_does_not_expose_tool_calls(self) -> None:
+        self.assertIsNone(hb.parse_claude(jl({"type": "result", "usage": {"input_tokens": 1}}))["tool_calls"])
+
+    def test_opencode_counts_tool_use_events(self) -> None:
+        out = jl({"type": "tool_use"}, {"type": "tool-use"}, {"type": "text"}, {"type": "step_finish", "part": {}})
+        self.assertEqual(hb.parse_opencode(out)["tool_calls"], 2)
+
+    def test_opencode_without_tool_events_leaves_tool_calls_unknown(self) -> None:
+        self.assertIsNone(hb.parse_opencode(jl({"type": "step_finish", "part": {}}))["tool_calls"])
+
+    def test_pi_counts_tool_call_blocks_on_assistant_message_end_only(self) -> None:
+        call = {"type": "toolCall", "id": "1", "name": "bash"}
+        msg = {"role": "assistant", "content": [{"type": "text"}, call, call], "usage": {"input": 1}}
+        out = jl(
+            {"type": "message_update", "message": msg},
+            {"type": "message_end", "message": msg},
+            {"type": "turn_end", "message": msg},
+            {"type": "message_end", "message": {**msg, "role": "user"}},
+        )
+        self.assertEqual(hb.parse_pi(out)["tool_calls"], 2)
+
+    def test_pi_messages_without_a_content_list_leave_tool_calls_unknown(self) -> None:
+        out = jl({"type": "message_end", "message": {"role": "assistant", "usage": {"input": 1}}})
+        self.assertIsNone(hb.parse_pi(out)["tool_calls"])
+
+    def test_pi_tool_calls_are_known_once_any_message_has_content(self) -> None:
+        out = jl(
+            {"type": "message_end", "message": {"role": "assistant", "content": [{"type": "toolCall"}]}},
+            {"type": "message_end", "message": {"role": "assistant"}},
+        )
+        self.assertEqual(hb.parse_pi(out)["tool_calls"], 1)
+
+    def test_codex_counts_completed_tool_items(self) -> None:
+        done = {"type": "item.completed"}
+        out = jl(
+            {**done, "item": {"type": "command_execution"}},
+            {**done, "item": {"type": "file_change"}},
+            {**done, "item": {"type": "mcp_tool_call"}},
+            {**done, "item": {"type": "web_search"}},
+            {**done, "item": {"type": "agent_message"}},
+            {"type": "item.started", "item": {"type": "command_execution"}},
+            {"type": "turn.completed", "usage": {"input_tokens": 1}},
+        )
+        self.assertEqual(hb.parse_codex(out)["tool_calls"], 4)
+
+    def test_codex_without_item_events_leaves_tool_calls_unknown(self) -> None:
+        out = jl({"type": "turn.completed", "usage": {"input_tokens": 1}})
+        self.assertIsNone(hb.parse_codex(out)["tool_calls"])
+
+    def test_codex_with_only_message_items_is_a_known_zero(self) -> None:
+        out = jl(
+            {"type": "item.completed", "item": {"type": "agent_message"}},
+            {"type": "turn.completed", "usage": {"input_tokens": 1}},
+        )
+        self.assertEqual(hb.parse_codex(out)["tool_calls"], 0)
+
+    def test_cursor_json_has_no_tool_calls(self) -> None:
+        out = jl({"type": "result", "usage": {"inputTokens": 2}})
+        self.assertIsNone(hb.parse_cursor(out)["tool_calls"])
+
+    def test_null_harness_made_no_tool_calls(self) -> None:
+        self.assertEqual(hb.parse_null("")["tool_calls"], 0)
 
 
 if __name__ == "__main__":

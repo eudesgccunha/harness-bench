@@ -21,13 +21,13 @@ This table maps the code as it was at `e44c25c`. The test suite and tooling adde
 
 | Concern (plan module) | Current code |
 |---|---|
-| Parsers (`runners/`) | `parse_claude`, `parse_opencode`, `parse_pi`, `parse_cursor`, `parse_codex`, `PARSERS` (70–199) |
+| Parsers (`runners/`) | moved to `hbench/runners/` in Phase 3 (re-exported here) |
 | Cost (`cost/`) | `computed_cost` (204–212), cost pick in `aggregate.run_cost` (672–679) |
 | Safety (`sandbox/`) | `BASE_ENV`, `base_env`, `redact`, `validate_config`, `rmtree_inside`, `wrap`, `write_env_file` (220–303) |
-| Workdir (`sandbox/`) | `prepare_workdir`, `make_baseline`, `snapshot_protected`, `restore_protected`, `save_diff` (329–402) |
-| Runner (`runners/`) | `run_proc` (308), `build_cmd` (405) |
+| Workdir (`sandbox/`) | `prepare_workdir`, `hardened_git`, `make_baseline` (git dir outside the workdir), `snapshot_protected`, `restore_protected`, `save_diff`, `nested_git_entries` |
+| Runner (`runners/`) | `run_proc` (308); `build_cmd` delegates to `hbench.runners.base.build_argv` |
 | Planner and resume | loop in `cmd_run` (453–546), `done_keys` (412) |
-| Grader (`graders/`) | test `step` inside `cmd_run` (525); `passed = test_rc == 0 and not test_to` (531) |
+| Grader (`graders/`) | `grade_trial` runs the task's graders (Phase 3); `collect_changes` feeds `diff_constraints` |
 | Result writing (`sinks/`) | row dict appended to `results.jsonl` (528–540) |
 | Gateway (`cost/`) | `check_litellm_url`, `litellm_get`, `litellm_rows`, `row_tags`, `cmd_reconcile` (555–642) |
 | Stats (`stats/`) | `aggregate` (659–706) |
@@ -86,3 +86,24 @@ folders depend on it), and each invocation also writes `<run_id>/run.json` and
 Couplings 2 (implicit row schema), 3 (status, partly: `timeout` exists, `error` has no
 producer yet), 5 (report mixed with stats) and 6 (wrapper depends on internals) are addressed.
 `cmd_run` still does everything else; it is split in later phases.
+
+## Phase 3: runners, graders and plugins
+
+Decisions: [ADR 0007](adr/0007-runner-and-grader-protocols.md). The engine still owns every process and every
+defense; runners and graders are pure adapters that the engine calls.
+
+| Module | Role |
+|---|---|
+| `hbench/runners/base.py` | `HarnessRunner` protocol and `TemplateRunner` (argv from the harness `command` template, usage from the parser). |
+| `hbench/runners/<name>.py`, `_usage.py` | One parser module per harness (`parse_<name>`) and the shared helpers `num`, `json_lines`, `empty_usage`. |
+| `hbench/runners/__init__.py` | `PARSERS` (built-ins) and `runner_for` (built-in parser, else a plugin). |
+| `hbench/graders/base.py` | `Grader` protocol, `GradeContext` (with the injected `run`), `Change`, `parse_score`. |
+| `hbench/graders/{hidden_tests,command,diff_constraints}.py` | The bundled graders. |
+| `hbench/graders/compose.py`, `registry.py` | `compose` (`all`, `any`, `weighted`), `GRADERS`, `grader_for`, `grade_plan` (the graders of a task). |
+| `hbench/plugins.py` | Entry-point loading with clear `PluginError`s. Only reached for a type that is not built in. |
+
+In `cmd_run`: the runner builds the agent argv and parses usage; `collect_changes` captures the diff right
+after the agent (before `protected_paths` are restored); `grade_trial` runs the graders with a `run` bound to
+`run_step`, so each grader command gets the env allowlist, `wrap()` and a redacted log. `validate_config`
+resolves every runner and grader type before any agent runs. Coupling 1 (`cmd_run` does everything) is
+reduced: runner and grader are now behind protocols.

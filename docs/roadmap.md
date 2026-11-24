@@ -8,13 +8,13 @@ Each item is scheduled in a phase of the [evolution plan](evolution-plan.md):
 |---|---|
 | M1 Wilson CI, M4 discrimination, M5 recommendation (text), M11 paired comparison | 2 (done, [ADR 0006](adr/0006-report-statistics.md)) |
 | M5 chart (`summary.html`) | 7 (sinks) |
-| M10 efficiency (tool calls) | 3 (needs parser changes, runner protocol) |
+| M10 efficiency (tool calls) | 3 (done, [ADR 0007](adr/0007-runner-and-grader-protocols.md)) |
 | M2 `validate`, M12 task packs | 4 |
 | M3 `null` harness | 2 (done: negative control) |
 | M6 failure breakdown, M14 transcript hygiene | 1 |
 | M7 provenance | 1 (versions in the contract), 6 (image digest) |
 | M8 `doctor`, M15 egress restriction | 6 |
-| M9 partial credit | 3 (grader `score`) |
+| M9 partial credit | 3 (done, grader `score`) |
 | M13 trace export | 7 |
 | M16 skills axis | after 2 (needs M1, M3, M11) |
 
@@ -73,11 +73,11 @@ A check that spends no tokens, or one minimal call:
 
 ## M9. Partial credit (O)
 
-Accept a `SCORE: <0.0–1.0>` line in the `test` output. Exit code 0 still counts as 1.0. Useful for large tasks with many tests.
+Done in Phase 3: a `hidden_tests` or `command` grader with `"score": true` reads the last `SCORE: <0.0–1.0>` line of the command's stdout as the grader score. Exit code 0 still decides pass or fail, and without the option or a score line the score is 1.0 on pass and 0.0 otherwise. Useful for large tasks with many tests. A score is only as trustworthy as the test output, which agent-written code can influence.
 
 ## M10. Efficiency metrics (HF)
 
-Report tool calls per run and per solved task, next to tokens and turns. In the HF study, efficiency gains explained much of the accuracy gain.
+Done in Phase 3: the report has `Tool calls/run` and `Tool calls/solved` next to tokens and turns (unknown when a format does not expose them). In the HF study, efficiency gains explained much of the accuracy gain.
 
 ## M11. Paired comparison between pairs
 
