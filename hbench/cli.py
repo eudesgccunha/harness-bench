@@ -21,7 +21,7 @@ _DESCRIPTION = (
     "harness-bench: compare coding-agent harness x model pairs. Main metric: cost per solved task.\n\n"
     "  python3 -m hbench run       --config config.json [--reps 3] [--only HARNESS] [--keep] [--dry-run]\n"
     "  python3 -m hbench reconcile --config config.json   # pull real spend from LiteLLM\n"
-    "  python3 -m hbench report    --config config.json\n"
+    "  python3 -m hbench report    --config config.json [--drop-saturated]\n"
     "  python3 -m hbench schema export [--out PATH]       # JSON Schema of trials.jsonl and run.json\n\n"
     "Add --litellm to run, report or reconcile for the LiteLLM-only benchmark."
 )
@@ -33,6 +33,14 @@ def _add_config(p: argparse.ArgumentParser) -> None:
         "--litellm",
         action="store_true",
         help="LiteLLM-only profile: drop harnesses without LiteLLM spend, cost always from LiteLLM",
+    )
+
+
+def _add_drop_saturated(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--drop-saturated",
+        action="store_true",
+        help="leave out tasks every non-null run solved before building the report",
     )
 
 
@@ -52,6 +60,7 @@ def build_parser(epilog: str | None = None) -> argparse.ArgumentParser:
     sub = ap.add_subparsers(dest="cmd", required=True)
     run = sub.add_parser("run", help="run the matrix and write results")
     _add_config(run)
+    _add_drop_saturated(run)
     run.add_argument("--reps", type=int)
     run.add_argument("--only", nargs="*", help="only these harness names")
     run.add_argument("--keep", action="store_true", help="keep work directories")
@@ -67,9 +76,11 @@ def build_parser(epilog: str | None = None) -> argparse.ArgumentParser:
     )
     report = sub.add_parser("report", help="write summary.md and summary.csv from the results")
     _add_config(report)
+    _add_drop_saturated(report)
     report.add_argument("--cost-source", choices=["auto", "litellm", "computed", "reported"])
     reconcile = sub.add_parser("reconcile", help="fetch real spend per run from LiteLLM")
     _add_config(reconcile)
+    _add_drop_saturated(reconcile)
     schema = sub.add_parser("schema", help="JSON Schema of the data contract")
     schema_sub = schema.add_subparsers(dest="schema_cmd", required=True)
     export = schema_sub.add_parser("export", help="print the schema document, or write it with --out")

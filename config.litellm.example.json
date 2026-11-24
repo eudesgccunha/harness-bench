@@ -102,6 +102,13 @@
       "env": {
         "LITELLM_API_KEY": "${LITELLM_API_KEY}"
       }
+    },
+    "null": {
+      "_comment": "Negative control: runs nothing. If it solves a task, the hidden tests are too lenient. It has no LiteLLM spend, so its cost is unknown in this profile.",
+      "parser": "null",
+      "command": [
+        "true"
+      ]
     }
   },
   "matrix": [
@@ -144,6 +151,10 @@
       "harness": "opencode",
       "model": "litellm/GEMINI_MODEL",
       "price": "gemini"
+    },
+    {
+      "harness": "null",
+      "model": "none"
     }
   ],
   "tasks": [

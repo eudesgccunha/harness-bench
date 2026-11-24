@@ -102,7 +102,10 @@ python3 harness_bench_litellm.py reconcile --config config.litellm.json
 `results-litellm/summary.md` has the ranking by cost per solved task and the per-task pass matrix.
 
 - "Unmatched runs" or a cost of `n/a` means the tag did not reach LiteLLM. See "LiteLLM: what to check" in `HARNESS_BENCH.md`.
-- With 3 repetitions, pass rates are noisy. Treat a gap as real only when the confidence intervals do not overlap (see [roadmap](roadmap.md), M1).
+- With 3 repetitions, pass rates are noisy. The table shows a Wilson interval for the pass rate and a bootstrap interval for cost per solved task. Treat a gap as real only when the intervals do not overlap: pairs marked `=N` in the `Tie` column cannot be told apart.
+- `pass@k` is the capability of a pair (at least one of k runs passes) and `pass^k` its consistency (all k runs pass). A large gap between them means the pair is unreliable.
+- The `Recommendation` line names the cheapest pair among those close to the best pass rate. The `Paired comparison` section tells whether the best pair really beats each other pair (small `p`). The `Repetitions` section says how many reps per task would narrow the pass-rate interval to `target_ci_width`.
+- Add the `null` harness (see `config.example.json`) as a negative control: if it solves any task, the hidden tests are too lenient. The `Discrimination` section lists tasks every pair solves or none solves; `report --drop-saturated` leaves the saturated ones out.
 - Investigate failures through the `.diff` files and logs in `logs/`, and through Lens traces if you use Lens.
 
 ## Checklist

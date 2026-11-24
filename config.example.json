@@ -119,6 +119,13 @@
       "env": {
         "LITELLM_API_KEY": "${LITELLM_API_KEY}"
       }
+    },
+    "null": {
+      "_comment": "Negative control: runs nothing. If it solves a task, the hidden tests are too lenient.",
+      "parser": "null",
+      "command": [
+        "true"
+      ]
     }
   },
   "matrix": [
@@ -181,6 +188,10 @@
       "harness": "cursor",
       "model": "CURSOR_GROK_MODEL",
       "price": "grok"
+    },
+    {
+      "harness": "null",
+      "model": "none"
     }
   ],
   "prices": {

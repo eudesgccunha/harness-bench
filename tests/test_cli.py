@@ -189,6 +189,60 @@ class CliDispatchTests(unittest.TestCase):
         self.assertIn("Cost source: `litellm`", self.cli("report", "--litellm"))
 
 
+class ReportOptionsTests(unittest.TestCase):
+    """`report` over hand-written rows: `--drop-saturated` and the knobs read from the config."""
+
+    def setUp(self) -> None:
+        self.base = fixtures.tmpdir(self)
+        (self.base / "results").mkdir()
+        self.cfg: dict[str, Any] = {
+            "output_dir": "results",
+            "harnesses": {"null": {"parser": "null", "command": ["true"]}},
+        }
+
+    def report(self, *argv: str) -> str:
+        cfg_path = self.base / "config.json"
+        cfg_path.write_text(json.dumps(self.cfg))
+        with fixtures.quiet() as out:
+            cli.main(["report", "--config", str(cfg_path), *argv])
+        return out.getvalue()
+
+    def write_rows(self, *rows: dict[str, Any]) -> None:
+        fixtures.write_rows(self.base / "results" / "results.jsonl", *rows)
+
+    def row(self, task: str, harness: str, passed: bool, rep: int = 1) -> dict[str, Any]:
+        return fixtures.run_row(task=task, harness=harness, model="m", passed=passed, rep=rep, cost_computed=0.1)
+
+    def test_drop_saturated_removes_the_task_from_the_matrix_and_the_pass_rates(self) -> None:
+        self.write_rows(
+            self.row("easy", "a", True),
+            self.row("hard", "a", True),
+            self.row("easy", "b", True),
+            self.row("hard", "b", False),
+            self.row("easy", "null", False),  # a failing null pair does not keep `easy` from being saturated
+        )
+        kept = self.report()
+        dropped = self.report("--drop-saturated")
+        self.assertIn("| easy |", kept)
+        self.assertNotIn("| easy |", dropped)
+        self.assertIn("| hard |", dropped)
+        self.assertIn("| 1 | a | m | 1/1 | 100% |", dropped)
+        self.assertIn("| 1 | a | m | 2/2 | 100% |", kept)
+
+    def test_dropping_every_task_says_so_and_exits_cleanly(self) -> None:
+        self.write_rows(self.row("easy", "a", True), self.row("easy", "b", True))
+        out = self.report("--drop-saturated")
+        self.assertIn("no tasks left after --drop-saturated", out)
+        self.assertNotIn("| # |", out)
+
+    def test_config_knobs_reach_the_report(self) -> None:
+        self.cfg.update(recommend_within_pp=60, target_ci_width=0.4)
+        self.write_rows(self.row("t", "a", True), self.row("t", "a", False, rep=2))
+        out = self.report()
+        self.assertIn("within 60 pp", out)
+        self.assertIn("CI width of 0.40", out)
+
+
 class ShimMainTests(unittest.TestCase):
     def test_engine_main_delegates_to_the_cli(self) -> None:
         import harness_bench as hb

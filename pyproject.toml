@@ -39,7 +39,7 @@ ignore = ["UP036"]
 
 [tool.mypy]
 python_version = "3.12"
-files = ["harness_bench.py", "harness_bench_litellm.py", "tests/fixtures.py", "tests/test_golden.py", "tests/test_parsers.py", "tests/test_workspace.py", "tests/test_run.py", "tests/test_litellm.py", "scripts/docs_check.py", "hbench", "tests/test_core_models.py", "tests/test_core_schema.py", "tests/test_contract_output.py", "tests/test_report.py", "tests/test_cli.py"]
+files = ["harness_bench.py", "harness_bench_litellm.py", "tests/fixtures.py", "tests/test_golden.py", "tests/test_parsers.py", "tests/test_workspace.py", "tests/test_run.py", "tests/test_litellm.py", "scripts/docs_check.py", "hbench", "tests/test_core_models.py", "tests/test_core_schema.py", "tests/test_contract_output.py", "tests/test_report.py", "tests/test_cli.py", "tests/test_stats.py"]
 # Non-strict for the legacy engine. New modules are strict and listed below.
 
 [[tool.mypy.overrides]]
@@ -59,7 +59,7 @@ strict_equality = true
 
 [[tool.mypy.overrides]]
 # Same strict flags, except these tests call the untyped legacy engine (disallow_untyped_calls off).
-module = ["test_parsers", "test_workspace", "test_run", "test_litellm", "test_contract_output", "test_report", "test_cli"]
+module = ["test_parsers", "test_workspace", "test_run", "test_litellm", "test_contract_output", "test_report", "test_cli", "test_stats"]
 disallow_any_generics = true
 disallow_subclassing_any = true
 disallow_untyped_defs = true

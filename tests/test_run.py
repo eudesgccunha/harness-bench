@@ -61,6 +61,13 @@ class CmdRunTests(RunTestCase):
             (rows["claude"]["passed"], rows["pi"]["passed"], rows["pi"]["cost_computed"]), (True, False, None)
         )
 
+    def test_null_harness_fails_the_task_at_zero_reported_cost(self) -> None:
+        self.cfg["harnesses"]["null"] = {"command": ["true"], "parser": "null"}
+        self.cfg["matrix"] = [{"harness": "null", "model": "none"}]
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        (row,) = rows_of(self.base)
+        self.assertEqual((row["passed"], row["cost_reported"], row["parse_ok"]), (False, 0.0, True))
+
     def test_finished_runs_are_skipped_on_resume(self) -> None:
         fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
         out = fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)

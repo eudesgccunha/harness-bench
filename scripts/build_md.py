@@ -45,6 +45,7 @@ HBENCH_SOURCES = [
     "hbench/core/schema.py",
     "hbench/core/convert.py",
     "hbench/results.py",
+    "hbench/stats.py",
     "hbench/report.py",
     "hbench/profiles.py",
     "hbench/cli.py",
@@ -54,6 +55,7 @@ HBENCH_TESTS = [
     "tests/test_core_models.py",
     "tests/test_core_schema.py",
     "tests/test_contract_output.py",
+    "tests/test_stats.py",
     "tests/test_report.py",
     "tests/test_cli.py",
 ]
@@ -178,10 +180,30 @@ python3 harness_bench.py report --config config.json --cost-source litellm
 Outputs in `results/`:
 
 - `results.jsonl`: one line per run, with raw data;
-- `summary.md` and `summary.csv`: table sorted by cost per solved task, plus the per-task pass matrix;
+- `summary.md` and `summary.csv`: table sorted by cost per solved task, the statistics sections described in [Reading the report](#reading-the-report) and the per-task pass matrix;
 - `logs/`: each agent's JSON output, stderr, setup, tests, and the `.diff` of everything the agent changed. Known secrets show as `***REDACTED***`.
 
 `run` only starts with `sandbox.prefix` set (see [Security](#security)). Inside a disposable VM, add `--allow-unsandboxed`.
+
+## Reading the report
+
+Besides the cost and token columns, the main table of `summary.md` shows how sure the numbers are. All intervals are 95% and the report is deterministic (the bootstrap is seeded with the pair name).
+
+| Column or section | Meaning |
+|---|---|
+| `Pass 95% CI` | Wilson score interval of the pass rate. |
+| `pass@k` | Chance that at least one of k runs of a task passes (capability), averaged over tasks. k is the smallest number of runs any task has for the pair, shown as `(k=3)`. With k = 1 it equals the pass rate. |
+| `pass^k` | Chance that all k runs pass (consistency), averaged over tasks. |
+| `Cost/solved 95% CI` | Percentile bootstrap (2000 resamples) of cost per solved task. `n/a` when any cost is unknown or nothing passed: no interval is ever built from unknown costs. |
+| `Tie` | `=N` marks pairs whose cost interval overlaps the interval of the group leader (rank N): the ranking cannot tell them apart. |
+| `Pareto` | `yes` when no other pair is at least as cheap per run and at least as good, and strictly better in one. Pairs with unknown cost or no pass are never on the frontier. |
+| Recommendation | The cheapest pair per solved task among pairs within `recommend_within_pp` points (config, default 5) of the best pass rate, with at least one pass. |
+| Negative control | Pairs whose harness uses `parser: null`. Any pass prints a warning: the tests are too lenient. Null pairs are left out of the recommendation, ties, frontier and discrimination, and sort last. |
+| Discrimination | Tasks every non-null run solved (saturated) and tasks no run solved. They do not separate the pairs. `report --drop-saturated` removes the saturated ones before aggregating (also accepted by `run` and `reconcile`, which print the report). |
+| Paired comparison | Exact two-sided McNemar test between the best-ranked pair and every other pair, pairing runs by task and rep. `b` counts runs only the best pair solved, `c` runs only the other pair solved. |
+| Repetitions | Reps per task needed for a pass-rate interval at most `target_ci_width` wide (config, default 0.20), at the observed pass rate; `more than N` when 10,000 total runs are not enough. |
+
+Both config keys are optional: `recommend_within_pp` is a number from 0 to 100, `target_ci_width` a number above 0 and up to 1.
 
 ## Cost sources
 
@@ -240,6 +262,12 @@ Parser: the `usage` in the `turn.completed` event is the cumulative thread total
 - **Grok is only available in Cursor**, so the harness effect cannot be isolated for Grok.
 - Binary: the docs use `agent`. Older installs may use `cursor-agent`. Adjust `command`.
 - Flags used: `-p`, `--output-format json`, `--force` (approves commands) and `--trust` (trusts the workspace in headless mode).
+
+### `null` (negative control)
+
+- The `null` harness (`"parser": "null"`, `"command": ["true"]`) calls no model and changes nothing. Usage is zero and the harness cost is a real `0.0`.
+- If a `null` pair solves a task, the hidden tests are too lenient: the report prints a warning. Null pairs are left out of the recommendation and of the discrimination lists.
+- It has no LiteLLM spend, so under `--litellm` (cost source `litellm`) its cost is unknown, which is expected.
 
 ## LiteLLM: what to check
 

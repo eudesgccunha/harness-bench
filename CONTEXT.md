@@ -20,3 +20,8 @@ current name in the existing config and results format until Phase 1 migrates it
 | Bench tag | `run_tag`, `BENCH_TAG` | Per-trial tag sent as `x-litellm-tags`; `reconcile` matches spend logs by it. |
 | Sandbox | `sandbox.prefix` | Command prefix (for example `docker run ...`) that isolates the agent and the test command. |
 | Cost per solved task | `cost_per_solved` | Main ranking metric: total cost of a target divided by its solved trials. |
+| pass@k | `pass_at_k` (report) | Chance that at least one of k runs of a task passes (capability). Unbiased estimator averaged over tasks; k is the smallest run count of any task for the target. |
+| pass^k | `pass_hat_k` (report) | Chance that all k runs of a task pass (consistency). |
+| Tie | `tie_with` (report), `Tie` column | A target whose cost per solved task interval overlaps the interval of its group leader; the ranking cannot separate them. |
+| Pareto frontier | `pareto` (report) | Targets no other target beats on both cost per run and pass rate. |
+| Negative control | `null` harness (`parser: null`) | A harness that calls no model. If it solves a task, the hidden tests are too lenient. |

@@ -61,6 +61,27 @@ class ValidateConfigTests(unittest.TestCase):
     def test_unknown_cost_source_is_rejected_with_the_valid_names(self) -> None:
         self.assert_rejected(base_config(cost_source="bogus"), "auto, litellm, computed, reported")
 
+    def test_report_knobs_in_range_are_accepted(self) -> None:
+        for key, value in (("recommend_within_pp", 0), ("recommend_within_pp", 100), ("target_ci_width", 0.5)):
+            with self.subTest(key=key, value=value):
+                hb.validate_config(base_config(**{key: value}))
+        hb.validate_config(base_config(target_ci_width=1))
+
+    def test_report_knobs_out_of_range_or_not_numbers_are_rejected(self) -> None:
+        bad = (
+            ("recommend_within_pp", -1),
+            ("recommend_within_pp", 101),
+            ("recommend_within_pp", "5"),
+            ("recommend_within_pp", True),
+            ("target_ci_width", 0),
+            ("target_ci_width", 1.5),
+            ("target_ci_width", "0.2"),
+            ("target_ci_width", True),
+        )
+        for key, value in bad:
+            with self.subTest(key=key, value=value):
+                self.assert_rejected(base_config(**{key: value}), key)
+
     def test_spend_key_in_env_passthrough_is_rejected(self) -> None:
         cfg = base_config(litellm={"base_url": "https://x", "api_key": "${SPEND}"}, env_passthrough=["SPEND"])
         self.assert_rejected(cfg, "spend key")

@@ -110,10 +110,30 @@ python3 harness_bench.py report --config config.json --cost-source litellm
 Outputs in `results/`:
 
 - `results.jsonl`: one line per run, with raw data;
-- `summary.md` and `summary.csv`: table sorted by cost per solved task, plus the per-task pass matrix;
+- `summary.md` and `summary.csv`: table sorted by cost per solved task, the statistics sections described in [Reading the report](#reading-the-report) and the per-task pass matrix;
 - `logs/`: each agent's JSON output, stderr, setup, tests, and the `.diff` of everything the agent changed. Known secrets show as `***REDACTED***`.
 
 `run` only starts with `sandbox.prefix` set (see [Security](#security)). Inside a disposable VM, add `--allow-unsandboxed`.
+
+## Reading the report
+
+Besides the cost and token columns, the main table of `summary.md` shows how sure the numbers are. All intervals are 95% and the report is deterministic (the bootstrap is seeded with the pair name).
+
+| Column or section | Meaning |
+|---|---|
+| `Pass 95% CI` | Wilson score interval of the pass rate. |
+| `pass@k` | Chance that at least one of k runs of a task passes (capability), averaged over tasks. k is the smallest number of runs any task has for the pair, shown as `(k=3)`. With k = 1 it equals the pass rate. |
+| `pass^k` | Chance that all k runs pass (consistency), averaged over tasks. |
+| `Cost/solved 95% CI` | Percentile bootstrap (2000 resamples) of cost per solved task. `n/a` when any cost is unknown or nothing passed: no interval is ever built from unknown costs. |
+| `Tie` | `=N` marks pairs whose cost interval overlaps the interval of the group leader (rank N): the ranking cannot tell them apart. |
+| `Pareto` | `yes` when no other pair is at least as cheap per run and at least as good, and strictly better in one. Pairs with unknown cost or no pass are never on the frontier. |
+| Recommendation | The cheapest pair per solved task among pairs within `recommend_within_pp` points (config, default 5) of the best pass rate, with at least one pass. |
+| Negative control | Pairs whose harness uses `parser: null`. Any pass prints a warning: the tests are too lenient. Null pairs are left out of the recommendation, ties, frontier and discrimination, and sort last. |
+| Discrimination | Tasks every non-null run solved (saturated) and tasks no run solved. They do not separate the pairs. `report --drop-saturated` removes the saturated ones before aggregating (also accepted by `run` and `reconcile`, which print the report). |
+| Paired comparison | Exact two-sided McNemar test between the best-ranked pair and every other pair, pairing runs by task and rep. `b` counts runs only the best pair solved, `c` runs only the other pair solved. |
+| Repetitions | Reps per task needed for a pass-rate interval at most `target_ci_width` wide (config, default 0.20), at the observed pass rate; `more than N` when 10,000 total runs are not enough. |
+
+Both config keys are optional: `recommend_within_pp` is a number from 0 to 100, `target_ci_width` a number above 0 and up to 1.
 
 ## Cost sources
 
@@ -221,6 +241,12 @@ Parser: the `usage` in the `turn.completed` event is the cumulative thread total
 - **Grok is only available in Cursor**, so the harness effect cannot be isolated for Grok.
 - Binary: the docs use `agent`. Older installs may use `cursor-agent`. Adjust `command`.
 - Flags used: `-p`, `--output-format json`, `--force` (approves commands) and `--trust` (trusts the workspace in headless mode).
+
+### `null` (negative control)
+
+- The `null` harness (`"parser": "null"`, `"command": ["true"]`) calls no model and changes nothing. Usage is zero and the harness cost is a real `0.0`.
+- If a `null` pair solves a task, the hidden tests are too lenient: the report prints a warning. Null pairs are left out of the recommendation and of the discrimination lists.
+- It has no LiteLLM spend, so under `--litellm` (cost source `litellm`) its cost is unknown, which is expected.
 
 ## LiteLLM: what to check
 
@@ -530,12 +556,21 @@ def parse_codex(stdout):
     return u
 
 
+def parse_null(stdout):
+    """Negative control: no model is called, so usage is zero and the cost is a real 0.0.
+    A `null` pair that solves a task means the hidden tests are too lenient."""
+    u = empty_usage()
+    u["cost_reported"] = 0.0
+    return u
+
+
 PARSERS = {
     "claude": parse_claude,
     "opencode": parse_opencode,
     "pi": parse_pi,
     "cursor": parse_cursor,
     "codex": parse_codex,
+    "null": parse_null,
 }
 
 
@@ -600,8 +635,20 @@ def check_cost_source(name):
         sys.exit(f"invalid cost_source {name!r}: use one of {', '.join(report.COST_SOURCES)}")
 
 
+def report_options(cfg):
+    """`(recommend_within_pp, target_ci_width)` from the config, validated; exits with a message naming the key."""
+    pp = cfg.get("recommend_within_pp", 5)
+    width = cfg.get("target_ci_width", 0.2)
+    if isinstance(pp, bool) or not isinstance(pp, int | float) or not 0 <= pp <= 100:
+        sys.exit(f"invalid recommend_within_pp {pp!r}: use a number from 0 to 100")
+    if isinstance(width, bool) or not isinstance(width, int | float) or not 0 < width <= 1:
+        sys.exit(f"invalid target_ci_width {width!r}: use a number above 0 and up to 1")
+    return pp, width
+
+
 def validate_config(cfg):
     check_cost_source(cfg.get("cost_source", "auto"))
+    report_options(cfg)
     for task in cfg["tasks"]:
         if SAFE_NAME.search(task["id"]) or task["id"].startswith("."):
             sys.exit(f"invalid task id {task['id']!r}: use only letters, digits, _ . - (no leading dot)")
@@ -1101,10 +1148,19 @@ def cmd_report(args, cfg, base):
         sys.exit(f"no results in {results_path}")
     cost_source = getattr(args, "cost_source", None) or cfg.get("cost_source", "auto")
     check_cost_source(cost_source)
+    within_pp, target_width = report_options(cfg)
+    null_harnesses = {name for name, h in cfg.get("harnesses", {}).items() if h.get("parser") == "null"}
     trials = trials_from_rows(rows, warn=print)
-    table = report.aggregate(trials, cost_source)
+    if getattr(args, "drop_saturated", False):
+        trials = report.drop_saturated(trials, null_harnesses)
+        if not trials:
+            print("no tasks left after --drop-saturated")
+            return
+    table = report.aggregate(trials, cost_source, null_harnesses=null_harnesses, target_ci_width=target_width)
     report.write_csv(table, out_dir / "summary.csv")
-    md = report.render_markdown(table, trials, cost_source, datetime.now())
+    md = report.render_markdown(
+        table, trials, cost_source, datetime.now(), recommend_within_pp=within_pp, target_ci_width=target_width
+    )
     (out_dir / "summary.md").write_text(md)
     print("\n" + md)
     print(f"saved {out_dir / 'summary.md'} and {out_dir / 'summary.csv'}")
@@ -2151,6 +2207,146 @@ def apply_gateway_costs(out_dir: Path, costs_by_tag: Mapping[str, float]) -> int
     return updated
 ```
 
+`hbench/stats.py`:
+
+```python
+"""Pure statistics for the report (ADR 0006): intervals, pass@k, bootstrap, McNemar, Pareto, ties, repetitions."""
+
+import hashlib
+import math
+from collections.abc import Callable, Iterator, Sequence
+
+Interval = tuple[float, float]
+
+# Upper limit of total runs the repetitions recommendation searches.
+MAX_RUNS = 10_000
+
+
+def _wilson(p: float, n: float, z: float) -> Interval:
+    """Wilson score interval for the observed proportion `p` over `n` runs."""
+    z2 = z * z
+    denom = 1 + z2 / n
+    centre = (p + z2 / (2 * n)) / denom
+    margin = z * math.sqrt(p * (1 - p) / n + z2 / (4 * n * n)) / denom
+    return max(0.0, centre - margin), min(1.0, centre + margin)
+
+
+def wilson_interval(successes: int, n: int, z: float = 1.96) -> Interval:
+    """Wilson score interval of a pass rate; no data gives the whole range."""
+    if n == 0:
+        return 0.0, 1.0
+    return _wilson(successes / n, n, z)
+
+
+def _check_counts(n: int, c: int, k: int) -> None:
+    if k < 1 or k > n or c > n:
+        raise ValueError(f"need 1 <= k <= n and c <= n, got n={n}, c={c}, k={k}")
+
+
+def pass_at_k(n: int, c: int, k: int) -> float:
+    """Unbiased chance that at least one of k runs passes, given c passes in n runs."""
+    _check_counts(n, c, k)
+    return 1 - math.comb(n - c, k) / math.comb(n, k)
+
+
+def pass_hat_k(n: int, c: int, k: int) -> float:
+    """Unbiased chance that all k runs pass, given c passes in n runs."""
+    _check_counts(n, c, k)
+    return math.comb(c, k) / math.comb(n, k)
+
+
+def mean_over_tasks(counts: Sequence[tuple[int, int]], k: int, estimator: Callable[[int, int, int], float]) -> float:
+    """Average of `estimator(n, c, k)` over tasks; `counts` holds `(n, c)` per task."""
+    if not counts:
+        return 0.0
+    return sum(estimator(n, c, k) for n, c in counts) / len(counts)
+
+
+def _splitmix64(seed: int) -> Iterator[int]:
+    """Deterministic 64-bit generator (SplitMix64): the bootstrap needs reproducible draws, not secrecy."""
+    mask = (1 << 64) - 1
+    state = seed & mask
+    while True:
+        state = (state + 0x9E3779B97F4A7C15) & mask
+        z = ((state ^ (state >> 30)) * 0xBF58476D1CE4E5B9) & mask
+        z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & mask
+        yield z ^ (z >> 31)
+
+
+def _ratio(costs: Sequence[float], passed: Sequence[bool]) -> float:
+    solved = sum(passed)
+    return sum(costs) / solved if solved else math.inf
+
+
+def bootstrap_ratio_ci(
+    costs: Sequence[float], passed: Sequence[bool], seed: str, n_boot: int = 2000, level: float = 0.95
+) -> Interval:
+    """Percentile bootstrap interval of cost per solved task. A resample with no pass counts as inf."""
+    if not costs or len(costs) != len(passed):
+        raise ValueError("costs and passed must be non-empty and of the same length")
+    draws = _splitmix64(int(hashlib.sha256(seed.encode()).hexdigest()[:16], 16))
+    n = len(costs)
+    stats = []
+    for _ in range(n_boot):
+        idx = [next(draws) % n for _ in range(n)]
+        stats.append(_ratio([costs[i] for i in idx], [passed[i] for i in idx]))
+    stats.sort()
+    tail = (1 - level) / 2
+    return stats[int(tail * n_boot)], stats[min(n_boot - 1, int((1 - tail) * n_boot))]
+
+
+def mcnemar_exact(b: int, c: int) -> float:
+    """Two-sided exact McNemar p-value for `b` and `c` discordant pairs."""
+    n = b + c
+    if n == 0:
+        return 1.0
+    tail = sum(math.comb(n, i) for i in range(min(b, c) + 1)) / (1 << n)
+    return min(1.0, 2 * tail)
+
+
+def pareto_front(points: Sequence[tuple[float, float]]) -> list[bool]:
+    """Whether each `(cost, quality)` point is on the frontier: lower cost and higher quality are better."""
+
+    def dominates(a: tuple[float, float], b: tuple[float, float]) -> bool:
+        return a[0] <= b[0] and a[1] >= b[1] and a != b
+
+    return [not any(dominates(other, p) for other in points) for p in points]
+
+
+def tie_leaders(intervals: Sequence[Interval | None]) -> list[int | None]:
+    """Group pairs sorted by rank: one ties the group leader when its low bound is <= the leader's high bound.
+
+    Returns the 1-based rank of each pair's group leader, `None` for a pair without interval or alone in its group.
+    """
+    leaders: list[int | None] = []
+    leader: int | None = None
+    for i, interval in enumerate(intervals):
+        if interval is None:
+            leader = None
+            leaders.append(None)
+            continue
+        leader_interval = intervals[leader] if leader is not None else None
+        if leader_interval is None or interval[0] > leader_interval[1]:
+            leader = i
+        leaders.append(leader)
+    return [lead + 1 if lead is not None and leaders.count(lead) > 1 else None for lead in leaders]
+
+
+def reps_for_ci_width(
+    p: float | None, width: float, tasks: int, z: float = 1.96, max_runs: int = MAX_RUNS
+) -> int | None:
+    """Reps per task so the Wilson interval of pass rate `p` (0.5 when unknown) is at most `width` wide.
+
+    `None` when even `max_runs` runs in total are not enough.
+    """
+    rate = 0.5 if p is None else p
+    for n in range(1, max_runs + 1):
+        low, high = _wilson(rate, n, z)
+        if high - low <= width:
+            return math.ceil(n / tasks)
+    return None
+```
+
 `hbench/report.py`:
 
 ```python
@@ -2158,12 +2354,25 @@ def apply_gateway_costs(out_dir: Path, costs_by_tag: Mapping[str, float]) -> int
 
 import csv
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from hbench.core.models import CostSource, TrialResult
+from hbench.stats import (
+    MAX_RUNS,
+    Interval,
+    bootstrap_ratio_ci,
+    mcnemar_exact,
+    mean_over_tasks,
+    pareto_front,
+    pass_at_k,
+    pass_hat_k,
+    reps_for_ci_width,
+    tie_leaders,
+    wilson_interval,
+)
 
 # The report keeps the names used by `cost_source` in configs and CLI flags.
 _SOURCE_BY_NAME: Mapping[str, CostSource | None] = {
@@ -2188,7 +2397,33 @@ def fmt_int(v: float | None) -> str:
     return "n/a" if v is None or math.isinf(v) else f"{v:,.0f}"
 
 
-def _pair_entry(harness: str, model: str, trials: Sequence[TrialResult], source: CostSource | None) -> dict[str, Any]:
+def _task_counts(trials: Sequence[TrialResult]) -> list[tuple[int, int]]:
+    """`(runs, passes)` per task."""
+    per_task: dict[str, list[bool]] = {}
+    for t in trials:
+        per_task.setdefault(t.task_id, []).append(t.passed)
+    return [(len(outcomes), sum(outcomes)) for outcomes in per_task.values()]
+
+
+def _cost_interval(
+    harness: str, model: str, trials: Sequence[TrialResult], costs: Sequence[float | None]
+) -> Interval | None:
+    """Bootstrap interval of cost per solved task; none when any cost is unknown or nothing passed."""
+    known = [c for c in costs if c is not None]
+    if len(known) != len(costs) or not any(t.passed for t in trials):
+        return None
+    return bootstrap_ratio_ci(known, [t.passed for t in trials], f"{harness}|{model}")
+
+
+def _pair_entry(
+    harness: str,
+    model: str,
+    trials: Sequence[TrialResult],
+    source: CostSource | None,
+    *,
+    null: bool,
+    target_ci_width: float,
+) -> dict[str, Any]:
     n = len(trials)
     solved = sum(1 for t in trials if t.passed)
     tokens = sum(t.usage.total_tokens for t in trials)
@@ -2198,6 +2433,10 @@ def _pair_entry(harness: str, model: str, trials: Sequence[TrialResult], source:
     costs = [c for c, _ in picked]
     cost = None if any(c is None for c in costs) else sum(c for c in costs if c is not None)
     names = sorted({_NAME_BY_SOURCE[s] for c, s in picked if c is not None})
+    counts = _task_counts(trials)
+    k = min(runs for runs, _ in counts)
+    pass_low, pass_high = wilson_interval(solved, n)
+    cost_ci = _cost_interval(harness, model, trials, costs)
     return {
         "harness": harness,
         "model": model,
@@ -2216,24 +2455,65 @@ def _pair_entry(harness: str, model: str, trials: Sequence[TrialResult], source:
         "avg_turns": sum(t.usage.turns for t in trials) / n,
         "avg_wall_s": sum(t.latency_s for t in trials) / n,
         "parse_failures": sum(1 for t in trials if not t.usage.parsed),
+        "pass_ci_low": pass_low,
+        "pass_ci_high": pass_high,
+        "k": k,
+        "pass_at_k": mean_over_tasks(counts, k, pass_at_k),
+        "pass_hat_k": mean_over_tasks(counts, k, pass_hat_k),
+        "cost_per_solved_ci_low": cost_ci[0] if cost_ci else None,
+        "cost_per_solved_ci_high": cost_ci[1] if cost_ci else None,
+        "tie_with": None,
+        "pareto": False,
+        "reps_needed": reps_for_ci_width(solved / n, target_ci_width, len(counts)),
+        "null_control": null,
     }
 
 
-def aggregate(trials: Sequence[TrialResult], cost_source: str) -> list[dict[str, Any]]:
-    """One entry per harness x model pair, cheapest per solved task first (unknown costs last)."""
+def _mark_ties_and_frontier(table: list[dict[str, Any]]) -> None:
+    """Fill `tie_with` and `pareto` once the table is sorted. Null pairs and unknown costs take part in neither."""
+    intervals: list[Interval | None] = [
+        None
+        if e["null_control"] or e["cost_per_solved_ci_low"] is None
+        else (e["cost_per_solved_ci_low"], e["cost_per_solved_ci_high"])
+        for e in table
+    ]
+    for entry, leader in zip(table, tie_leaders(intervals), strict=True):
+        entry["tie_with"] = leader
+    eligible = [e for e in table if e["cost_per_run"] is not None and e["solved"] and not e["null_control"]]
+    on_front = pareto_front([(e["cost_per_run"], e["pass_rate"]) for e in eligible])
+    for entry, flag in zip(eligible, on_front, strict=True):
+        entry["pareto"] = flag
+
+
+def aggregate(
+    trials: Sequence[TrialResult],
+    cost_source: str,
+    *,
+    null_harnesses: Collection[str] = (),
+    target_ci_width: float = 0.2,
+) -> list[dict[str, Any]]:
+    """One entry per harness x model pair, cheapest per solved task first (unknown costs next, negative controls last).
+
+    Besides the cost and token figures, each entry carries the uncertainty of its pass rate and cost, ties,
+    the Pareto frontier and the repetitions needed for a pass-rate interval of at most `target_ci_width`.
+    """
     if cost_source not in _SOURCE_BY_NAME:
         raise ValueError(f"unknown cost source {cost_source!r}: use one of {', '.join(COST_SOURCES)}")
     source = _SOURCE_BY_NAME[cost_source]
     groups: dict[tuple[str, str], list[TrialResult]] = {}
     for t in trials:
         groups.setdefault((t.target.harness, t.target.model), []).append(t)
-    table = [_pair_entry(h, m, ts, source) for (h, m), ts in groups.items()]
+    table = [
+        _pair_entry(h, m, ts, source, null=h in null_harnesses, target_ci_width=target_ci_width)
+        for (h, m), ts in groups.items()
+    ]
 
-    def sort_key(entry: dict[str, Any]) -> tuple[bool, float, float]:
+    def sort_key(entry: dict[str, Any]) -> tuple[bool, bool, float, float]:
         c = entry["cost_per_solved"]
-        return (c is None, c if c is not None else 0, -entry["pass_rate"])
+        return (entry["null_control"], c is None, c if c is not None else 0, -entry["pass_rate"])
 
     table.sort(key=sort_key)
+    _mark_ties_and_frontier(table)
     return table
 
 
@@ -2247,8 +2527,13 @@ def write_csv(table: Sequence[Mapping[str, Any]], path: Path) -> None:
 _HEAD = (
     "| # | Harness | Model | Solved | Pass rate | Cost/solved | Cost/run "
     "| Cost/1M tokens | Tokens/solved | Tokens/run | Cache hit | Turns | Time (s) "
-    "| Cost source |"
+    "| Cost source | Pass 95% CI | pass@k | pass^k | Cost/solved 95% CI | Tie | Pareto |"
 )
+_COLUMNS = 20
+
+
+def _range(low: float | None, high: float | None, fmt: Callable[[float], str], unit: str = "") -> str:
+    return "n/a" if low is None or high is None else f"{fmt(low)}–{fmt(high)}{unit}"
 
 
 def _table_line(i: int, t: Mapping[str, Any]) -> str:
@@ -2257,8 +2542,136 @@ def _table_line(i: int, t: Mapping[str, Any]) -> str:
         f"| {t['pass_rate']:.0%} | {fmt_money(t['cost_per_solved'])} | {fmt_money(t['cost_per_run'])} "
         f"| {fmt_money(t['cost_per_1m_tokens'])} | {fmt_int(t['tokens_per_solved'])} "
         f"| {fmt_int(t['tokens_per_run'])} | {t['cache_hit']:.0%} | {t['avg_turns']:.1f} "
-        f"| {t['avg_wall_s']:.0f} | {t['cost_source']} |"
+        f"| {t['avg_wall_s']:.0f} | {t['cost_source']} "
+        f"| {_range(t['pass_ci_low'], t['pass_ci_high'], lambda v: f'{v * 100:.0f}', '%')} "
+        f"| {t['pass_at_k']:.0%} (k={t['k']}) | {t['pass_hat_k']:.0%} (k={t['k']}) "
+        f"| {_range(t['cost_per_solved_ci_low'], t['cost_per_solved_ci_high'], fmt_money)} "
+        f"| {'' if t['tie_with'] is None else f'={t["tie_with"]}'} | {'yes' if t['pareto'] else ''} |"
     )
+
+
+def _name(t: Mapping[str, Any]) -> str:
+    return f"{t['harness']}/{t['model']}"
+
+
+def _recommendation_lines(table: Sequence[Mapping[str, Any]], within_pp: float) -> list[str]:
+    """The cheapest pair per solved task among those within `within_pp` points of the best pass rate."""
+    real = [t for t in table if not t["null_control"]]
+    if not real:
+        return []
+    best = max(t["pass_rate"] for t in real)
+    eligible = [
+        t
+        for t in real
+        if t["solved"] and t["cost_per_solved"] is not None and t["pass_rate"] >= best - within_pp / 100 - 1e-9
+    ]
+    if not eligible:
+        return []
+    pick = min(eligible, key=lambda t: t["cost_per_solved"])
+    return [
+        "",
+        f"**Recommendation:** {_name(pick)} — cheapest per solved task within {within_pp:g} pp "
+        f"of the best pass rate ({best:.0%}).",
+    ]
+
+
+def _pareto_lines(table: Sequence[Mapping[str, Any]]) -> list[str]:
+    front = [t for t in table if t["pareto"]]
+    if not front:
+        return []
+    lines = ["", "## Pareto frontier (cost per run × pass rate)", ""]
+    return lines + [f"- {_name(t)}: {fmt_money(t['cost_per_run'])} per run, {t['pass_rate']:.0%}" for t in front]
+
+
+def _null_control_lines(table: Sequence[Mapping[str, Any]]) -> list[str]:
+    nulls = [t for t in table if t["null_control"]]
+    if not nulls:
+        return []
+    passed = [t for t in nulls if t["solved"]]
+    lines = ["", "## Negative control", ""]
+    if not passed:
+        return lines + ["null control solved nothing."]
+    names = ", ".join(f"{_name(t)} ({t['solved']}/{t['runs']})" for t in passed)
+    return lines + [f"**Warning:** null control solved tasks: {names}. The hidden tests are too lenient."]
+
+
+def _real_trials(trials: Sequence[TrialResult], null_harnesses: Collection[str]) -> list[TrialResult]:
+    """Trials of the harnesses that are not a negative control."""
+    return [t for t in trials if t.target.harness not in null_harnesses]
+
+
+def task_discrimination(trials: Sequence[TrialResult]) -> tuple[list[str], list[str]]:
+    """Task ids solved in every run (saturated) and in none (unsolved), over `trials`."""
+    outcomes: dict[str, list[bool]] = {}
+    for t in trials:
+        outcomes.setdefault(t.task_id, []).append(t.passed)
+    saturated = sorted(task for task, o in outcomes.items() if all(o))
+    unsolved = sorted(task for task, o in outcomes.items() if not any(o))
+    return saturated, unsolved
+
+
+def drop_saturated(trials: Sequence[TrialResult], null_harnesses: Collection[str] = ()) -> list[TrialResult]:
+    """`trials` without the tasks every non-null run solved: they cannot tell the pairs apart."""
+    saturated, _ = task_discrimination(_real_trials(trials, null_harnesses))
+    return [t for t in trials if t.task_id not in saturated]
+
+
+def _discrimination_lines(table: Sequence[Mapping[str, Any]], trials: Sequence[TrialResult]) -> list[str]:
+    null = {t["harness"] for t in table if t["null_control"]}
+    saturated, unsolved = task_discrimination(_real_trials(trials, null))
+    lines = []
+    if saturated:
+        lines.append(f"- Saturated (solved in every run): {', '.join(saturated)}")
+    if unsolved:
+        lines.append(f"- Unsolved (never solved): {', '.join(unsolved)}")
+    return ["", "## Discrimination", ""] + lines if lines else []
+
+
+def _outcomes(trials: Sequence[TrialResult], pair: tuple[str, str]) -> dict[tuple[str, int], bool]:
+    return {(t.task_id, t.rep): t.passed for t in trials if (t.target.harness, t.target.model) == pair}
+
+
+def _paired_lines(table: Sequence[Mapping[str, Any]], trials: Sequence[TrialResult]) -> list[str]:
+    """Exact McNemar test between the best-ranked real pair and every other real pair, pairing runs by task and rep."""
+    real = [(rank, t) for rank, t in enumerate(table, 1) if not t["null_control"]]
+    if len(real) < 2:
+        return []
+    (ref_rank, ref), others = real[0], real[1:]
+    ref_out = _outcomes(trials, (ref["harness"], ref["model"]))
+    lines = []
+    for rank, t in others:
+        out = _outcomes(trials, (t["harness"], t["model"]))
+        shared = ref_out.keys() & out.keys()
+        if not shared:
+            continue
+        b = sum(ref_out[k] and not out[k] for k in shared)
+        c = sum(out[k] and not ref_out[k] for k in shared)
+        lines.append(f"- #{rank} {_name(t)}: b={b}, c={c}, p={mcnemar_exact(b, c):.4f}")
+    if not lines:
+        return []
+    note = f"b: only #{ref_rank} solved the run; c: only the other pair did."
+    return ["", f"## Paired comparison vs #{ref_rank} (McNemar, exact)", "", note, ""] + lines
+
+
+def _reps_text(t: Mapping[str, Any], trials: Sequence[TrialResult]) -> str:
+    if t["reps_needed"] is not None:
+        return str(t["reps_needed"])
+    own = [x for x in trials if (x.target.harness, x.target.model) == (t["harness"], t["model"])]
+    return f"more than {MAX_RUNS // len(_task_counts(own))}"
+
+
+def _repetitions_lines(
+    table: Sequence[Mapping[str, Any]], trials: Sequence[TrialResult], target_ci_width: float
+) -> list[str]:
+    real = [t for t in table if not t["null_control"]]
+    if not real:
+        return []
+    lines = [
+        f"- To reach a pass-rate CI width of {target_ci_width:.2f}: "
+        f"{_name(t)} needs {_reps_text(t, trials)} reps per task."
+        for t in real
+    ]
+    return ["", "## Repetitions", ""] + lines
 
 
 def _per_task_lines(table: Sequence[Mapping[str, Any]], trials: Sequence[TrialResult]) -> list[str]:
@@ -2280,7 +2693,13 @@ def _per_task_lines(table: Sequence[Mapping[str, Any]], trials: Sequence[TrialRe
 
 
 def render_markdown(
-    table: Sequence[Mapping[str, Any]], trials: Sequence[TrialResult], cost_source: str, now: datetime
+    table: Sequence[Mapping[str, Any]],
+    trials: Sequence[TrialResult],
+    cost_source: str,
+    now: datetime,
+    *,
+    recommend_within_pp: float = 5.0,
+    target_ci_width: float = 0.2,
 ) -> str:
     lines = [
         f"# Harness x model — {now.strftime('%Y-%m-%d %H:%M')}",
@@ -2288,7 +2707,7 @@ def render_markdown(
         f"Cost source: `{cost_source}` (auto = litellm > computed > reported). Sorted by cost per solved task.",
         "",
         _HEAD,
-        "|" + "---|" * 14,
+        "|" + "---|" * _COLUMNS,
     ]
     lines += [_table_line(i, t) for i, t in enumerate(table, 1)]
     bad = [t for t in table if t["parse_failures"]]
@@ -2299,6 +2718,12 @@ def render_markdown(
             + ", ".join(f"{t['harness']}/{t['model']} ({t['parse_failures']})" for t in bad)
             + ". See `results/logs/*.agent.jsonl`.",
         ]
+    lines += _recommendation_lines(table, recommend_within_pp)
+    lines += _pareto_lines(table)
+    lines += _null_control_lines(table)
+    lines += _discrimination_lines(table, trials)
+    lines += _paired_lines(table, trials)
+    lines += _repetitions_lines(table, trials, target_ci_width)
     lines += _per_task_lines(table, trials)
     return "\n".join(lines) + "\n"
 ```
@@ -2363,7 +2788,7 @@ _DESCRIPTION = (
     "harness-bench: compare coding-agent harness x model pairs. Main metric: cost per solved task.\n\n"
     "  python3 -m hbench run       --config config.json [--reps 3] [--only HARNESS] [--keep] [--dry-run]\n"
     "  python3 -m hbench reconcile --config config.json   # pull real spend from LiteLLM\n"
-    "  python3 -m hbench report    --config config.json\n"
+    "  python3 -m hbench report    --config config.json [--drop-saturated]\n"
     "  python3 -m hbench schema export [--out PATH]       # JSON Schema of trials.jsonl and run.json\n\n"
     "Add --litellm to run, report or reconcile for the LiteLLM-only benchmark."
 )
@@ -2375,6 +2800,14 @@ def _add_config(p: argparse.ArgumentParser) -> None:
         "--litellm",
         action="store_true",
         help="LiteLLM-only profile: drop harnesses without LiteLLM spend, cost always from LiteLLM",
+    )
+
+
+def _add_drop_saturated(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--drop-saturated",
+        action="store_true",
+        help="leave out tasks every non-null run solved before building the report",
     )
 
 
@@ -2394,6 +2827,7 @@ def build_parser(epilog: str | None = None) -> argparse.ArgumentParser:
     sub = ap.add_subparsers(dest="cmd", required=True)
     run = sub.add_parser("run", help="run the matrix and write results")
     _add_config(run)
+    _add_drop_saturated(run)
     run.add_argument("--reps", type=int)
     run.add_argument("--only", nargs="*", help="only these harness names")
     run.add_argument("--keep", action="store_true", help="keep work directories")
@@ -2409,9 +2843,11 @@ def build_parser(epilog: str | None = None) -> argparse.ArgumentParser:
     )
     report = sub.add_parser("report", help="write summary.md and summary.csv from the results")
     _add_config(report)
+    _add_drop_saturated(report)
     report.add_argument("--cost-source", choices=["auto", "litellm", "computed", "reported"])
     reconcile = sub.add_parser("reconcile", help="fetch real spend per run from LiteLLM")
     _add_config(reconcile)
+    _add_drop_saturated(reconcile)
     schema = sub.add_parser("schema", help="JSON Schema of the data contract")
     schema_sub = schema.add_subparsers(dest="schema_cmd", required=True)
     export = schema_sub.add_parser("export", help="print the schema document, or write it with --out")
@@ -2588,6 +3024,13 @@ if __name__ == "__main__":
       "env": {
         "LITELLM_API_KEY": "${LITELLM_API_KEY}"
       }
+    },
+    "null": {
+      "_comment": "Negative control: runs nothing. If it solves a task, the hidden tests are too lenient. It has no LiteLLM spend, so its cost is unknown in this profile.",
+      "parser": "null",
+      "command": [
+        "true"
+      ]
     }
   },
   "matrix": [
@@ -2630,6 +3073,10 @@ if __name__ == "__main__":
       "harness": "opencode",
       "model": "litellm/GEMINI_MODEL",
       "price": "gemini"
+    },
+    {
+      "harness": "null",
+      "model": "none"
     }
   ],
   "tasks": [
@@ -2784,6 +3231,13 @@ if __name__ == "__main__":
       "env": {
         "LITELLM_API_KEY": "${LITELLM_API_KEY}"
       }
+    },
+    "null": {
+      "_comment": "Negative control: runs nothing. If it solves a task, the hidden tests are too lenient.",
+      "parser": "null",
+      "command": [
+        "true"
+      ]
     }
   },
   "matrix": [
@@ -2846,6 +3300,10 @@ if __name__ == "__main__":
       "harness": "cursor",
       "model": "CURSOR_GROK_MODEL",
       "price": "grok"
+    },
+    {
+      "harness": "null",
+      "model": "none"
     }
   ],
   "prices": {
@@ -3662,6 +4120,11 @@ class PiParserTests(unittest.TestCase):
         self.assertIsNone(hb.parse_pi(jl({"type": "session"})))
 
 
+class NullParserTests(unittest.TestCase):
+    def test_usage_is_zero_and_the_cost_is_a_real_zero(self) -> None:
+        self.assertEqual(hb.parse_null("anything"), {**hb.empty_usage(), "cost_reported": 0.0})
+
+
 class CursorParserTests(unittest.TestCase):
     def test_result_without_usage_returns_none(self) -> None:
         self.assertIsNone(hb.parse_cursor(jl({"type": "result", "result": "ok"})))
@@ -3806,6 +4269,27 @@ class ValidateConfigTests(unittest.TestCase):
 
     def test_unknown_cost_source_is_rejected_with_the_valid_names(self) -> None:
         self.assert_rejected(base_config(cost_source="bogus"), "auto, litellm, computed, reported")
+
+    def test_report_knobs_in_range_are_accepted(self) -> None:
+        for key, value in (("recommend_within_pp", 0), ("recommend_within_pp", 100), ("target_ci_width", 0.5)):
+            with self.subTest(key=key, value=value):
+                hb.validate_config(base_config(**{key: value}))
+        hb.validate_config(base_config(target_ci_width=1))
+
+    def test_report_knobs_out_of_range_or_not_numbers_are_rejected(self) -> None:
+        bad = (
+            ("recommend_within_pp", -1),
+            ("recommend_within_pp", 101),
+            ("recommend_within_pp", "5"),
+            ("recommend_within_pp", True),
+            ("target_ci_width", 0),
+            ("target_ci_width", 1.5),
+            ("target_ci_width", "0.2"),
+            ("target_ci_width", True),
+        )
+        for key, value in bad:
+            with self.subTest(key=key, value=value):
+                self.assert_rejected(base_config(**{key: value}), key)
 
     def test_spend_key_in_env_passthrough_is_rejected(self) -> None:
         cfg = base_config(litellm={"base_url": "https://x", "api_key": "${SPEND}"}, env_passthrough=["SPEND"])
@@ -4150,6 +4634,13 @@ class CmdRunTests(RunTestCase):
         self.assertEqual(
             (rows["claude"]["passed"], rows["pi"]["passed"], rows["pi"]["cost_computed"]), (True, False, None)
         )
+
+    def test_null_harness_fails_the_task_at_zero_reported_cost(self) -> None:
+        self.cfg["harnesses"]["null"] = {"command": ["true"], "parser": "null"}
+        self.cfg["matrix"] = [{"harness": "null", "model": "none"}]
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        (row,) = rows_of(self.base)
+        self.assertEqual((row["passed"], row["cost_reported"], row["parse_ok"]), (False, 0.0, True))
 
     def test_finished_runs_are_skipped_on_resume(self) -> None:
         fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
@@ -5573,12 +6064,166 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
+`tests/test_stats.py`:
+
+```python
+"""Tests for the pure statistics functions (`hbench.stats`)."""
+
+import math
+import unittest
+
+from hbench.stats import (
+    _splitmix64,
+    bootstrap_ratio_ci,
+    mcnemar_exact,
+    mean_over_tasks,
+    pareto_front,
+    pass_at_k,
+    pass_hat_k,
+    reps_for_ci_width,
+    tie_leaders,
+    wilson_interval,
+)
+
+
+def rounded(interval: tuple[float, float]) -> tuple[float, float]:
+    return round(interval[0], 4), round(interval[1], 4)
+
+
+class WilsonTests(unittest.TestCase):
+    def test_known_values(self) -> None:
+        self.assertEqual(rounded(wilson_interval(8, 10)), (0.4902, 0.9433))
+        self.assertEqual(rounded(wilson_interval(0, 10)), (0.0, 0.2775))
+
+    def test_no_data_is_the_whole_range(self) -> None:
+        self.assertEqual(wilson_interval(0, 0), (0.0, 1.0))
+
+    def test_bounds_are_clamped_to_the_unit_interval(self) -> None:
+        # Unclamped, the float arithmetic gives -2.8e-17 for (0, 10) and 1.0000000000000002 for (5, 5).
+        self.assertGreaterEqual(wilson_interval(0, 10)[0], 0.0)
+        self.assertLessEqual(wilson_interval(5, 5)[1], 1.0)
+
+
+class PassAtKTests(unittest.TestCase):
+    def test_pass_at_k(self) -> None:
+        self.assertAlmostEqual(pass_at_k(5, 2, 1), 0.4)
+        self.assertAlmostEqual(pass_at_k(5, 2, 2), 0.7)
+        self.assertEqual(pass_at_k(5, 0, 3), 0.0)
+
+    def test_pass_hat_k(self) -> None:
+        self.assertAlmostEqual(pass_hat_k(5, 2, 2), 0.1)
+        self.assertEqual(pass_hat_k(5, 5, 3), 1.0)
+
+    def test_bad_arguments_raise(self) -> None:
+        for fn in (pass_at_k, pass_hat_k):
+            for n, c, k in ((5, 2, 0), (5, 2, 6), (5, 6, 1)):
+                with self.subTest(fn=fn.__name__, n=n, c=c, k=k), self.assertRaises(ValueError):
+                    fn(n, c, k)
+
+    def test_mean_over_tasks_averages_the_estimator(self) -> None:
+        self.assertAlmostEqual(mean_over_tasks([(5, 5), (5, 0)], 1, pass_at_k), 0.5)
+
+    def test_mean_over_no_tasks_is_zero(self) -> None:
+        self.assertEqual(mean_over_tasks([], 1, pass_at_k), 0.0)
+
+
+class BootstrapTests(unittest.TestCase):
+    COSTS = [1.0, 1.0, 1.0, 1.0]
+    PASSED = [True, True, True, False]
+
+    def test_same_seed_gives_the_same_interval(self) -> None:
+        a = bootstrap_ratio_ci(self.COSTS, self.PASSED, "h|m")
+        self.assertEqual(a, bootstrap_ratio_ci(self.COSTS, self.PASSED, "h|m"))
+
+    def test_other_seed_gives_another_interval(self) -> None:
+        costs = [0.5, 1.0, 2.0, 1.5, 0.7, 3.0]
+        passed = [True, False, True, True, False, True]
+        self.assertNotEqual(bootstrap_ratio_ci(costs, passed, "a"), bootstrap_ratio_ci(costs, passed, "b"))
+
+    def test_known_interval_for_fixed_input(self) -> None:
+        # Expected values come from a separate throwaway script (own SplitMix64 and percentile bootstrap, same
+        # sha256 seeding): sorted resample ratios [49..51] are 1.9, 1.9111.., 1.925 and [1949..1951] are
+        # 8.475, 8.6667.., 8.7, so moving either percentile index by one changes the result.
+        costs = [0.3, 1.7, 2.2, 4.1, 5.9, 0.8, 3.3, 2.9, 1.1]
+        passed = [True, False, True, True, False, True, True, True, False]
+        self.assertEqual(bootstrap_ratio_ci(costs, passed, "b"), (1.911111111111111, 8.666666666666666))
+
+    def test_splitmix64_matches_the_reference_vector(self) -> None:
+        draws = _splitmix64(1234567)
+        self.assertEqual(
+            [next(draws) for _ in range(3)], [6457827717110365317, 3203168211198807973, 9817491932198370423]
+        )
+
+    def test_no_pass_gives_infinite_interval(self) -> None:
+        self.assertEqual(bootstrap_ratio_ci([1.0, 2.0], [False, False], "s"), (math.inf, math.inf))
+
+    def test_interval_contains_the_point_estimate(self) -> None:
+        low, high = bootstrap_ratio_ci(self.COSTS, self.PASSED, "s")
+        self.assertLessEqual(low, 4 / 3)
+        self.assertGreaterEqual(high, 4 / 3)
+
+    def test_mismatched_or_empty_input_raises(self) -> None:
+        for costs, passed in (([], []), ([1.0], [True, False])):
+            with self.subTest(costs=costs), self.assertRaises(ValueError):
+                bootstrap_ratio_ci(costs, passed, "s")
+
+
+class McNemarTests(unittest.TestCase):
+    def test_known_values(self) -> None:
+        self.assertEqual(mcnemar_exact(0, 6), 0.03125)
+        self.assertEqual(mcnemar_exact(3, 3), 1.0)
+        self.assertEqual(mcnemar_exact(0, 0), 1.0)
+
+
+class ParetoTests(unittest.TestCase):
+    def test_dominated_points_are_off_the_front(self) -> None:
+        self.assertEqual(pareto_front([(1, 0.5), (2, 0.9), (3, 0.8), (1, 0.4)]), [True, True, False, False])
+
+    def test_identical_points_both_stay(self) -> None:
+        self.assertEqual(pareto_front([(1, 0.5), (1, 0.5)]), [True, True])
+
+
+class TieTests(unittest.TestCase):
+    def test_groups_by_overlap_with_the_leader(self) -> None:
+        self.assertEqual(tie_leaders([(1, 2), (1.5, 3), (4, 5), None]), [1, 1, None, None])
+
+    def test_a_low_bound_equal_to_the_leader_high_bound_is_a_tie(self) -> None:
+        self.assertEqual(tie_leaders([(1, 2), (2, 3)]), [1, 1])
+
+    def test_a_later_group_can_tie_too(self) -> None:
+        self.assertEqual(tie_leaders([(1, 2), (5, 6), (5.5, 7)]), [None, 2, 2])
+
+    def test_missing_interval_ends_the_group(self) -> None:
+        self.assertEqual(tie_leaders([(1, 2), None, (1.5, 3)]), [None, None, None])
+
+
+class RepsTests(unittest.TestCase):
+    def test_smallest_run_count_reaching_the_width(self) -> None:
+        # Wilson width at p = 0.5: 0.2002 with 92 runs, 0.1992 with 93.
+        self.assertEqual(reps_for_ci_width(0.5, 0.2, 1), 93)
+        self.assertEqual(reps_for_ci_width(0.5, 0.2003, 1), 92)
+
+    def test_runs_are_converted_to_reps_per_task(self) -> None:
+        self.assertEqual(reps_for_ci_width(0.5, 0.2, 10), 10)
+
+    def test_no_data_assumes_one_half(self) -> None:
+        self.assertEqual(reps_for_ci_width(None, 0.2, 1), reps_for_ci_width(0.5, 0.2, 1))
+
+    def test_unreachable_width_gives_none(self) -> None:
+        self.assertIsNone(reps_for_ci_width(0.5, 1e-9, 1, max_runs=50))
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
 `tests/test_report.py`:
 
 ```python
 """Tests for the report derived from the contract (`hbench.report`)."""
 
 import math
+import re
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -5587,6 +6232,7 @@ from typing import Any
 import fixtures
 from hbench.core.convert import trials_from_rows
 from hbench.report import aggregate, fmt_int, fmt_money, render_markdown, write_csv
+from hbench.stats import pass_at_k, pass_hat_k, reps_for_ci_width, wilson_interval
 from test_golden import GOLDEN, mask_summary
 
 NOW = datetime(2026, 11, 24, 12, 30)
@@ -5648,6 +6294,217 @@ class AggregateTests(unittest.TestCase):
         trials = trials_from_rows([fixtures.run_row(passed=False, cost_computed=1.0)])
         (entry,) = aggregate(trials, "auto")
         self.assertEqual((entry["cost_per_solved"], entry["tokens_per_solved"]), (float("inf"), float("inf")))
+
+
+LEGACY_KEYS = [
+    "harness",
+    "model",
+    "cost_source",
+    "runs",
+    "solved",
+    "pass_rate",
+    "tokens_total",
+    "tokens_per_run",
+    "tokens_per_solved",
+    "cache_hit",
+    "cost_total",
+    "cost_per_run",
+    "cost_per_solved",
+    "cost_per_1m_tokens",
+    "avg_turns",
+    "avg_wall_s",
+    "parse_failures",
+]
+
+
+def pair_trials(
+    harness: str, model: str, outcomes: list[bool], costs: list[float | None] | None = None, task: str = "t1"
+) -> list[Any]:
+    """Trials of one pair on one task: one per outcome, rep 1.. in order."""
+    costs = costs if costs is not None else [0.1] * len(outcomes)
+    rows = [
+        fixtures.run_row(harness=harness, model=model, task=task, rep=i, passed=ok, cost_computed=c)
+        for i, (ok, c) in enumerate(zip(outcomes, costs, strict=True), 1)
+    ]
+    return trials_from_rows(rows)
+
+
+class StatisticsTests(unittest.TestCase):
+    def test_three_reps_get_interval_and_pass_estimators(self) -> None:
+        (entry,) = aggregate(pair_trials("h", "m", [True, True, False]), "auto")
+        low, high = wilson_interval(2, 3)
+        self.assertEqual((entry["pass_ci_low"], entry["pass_ci_high"]), (low, high))
+        self.assertEqual(
+            (entry["k"], entry["pass_at_k"], entry["pass_hat_k"]), (3, pass_at_k(3, 2, 3), pass_hat_k(3, 2, 3))
+        )
+        self.assertLessEqual(entry["cost_per_solved_ci_low"], entry["cost_per_solved"])
+        self.assertGreaterEqual(entry["cost_per_solved_ci_high"], entry["cost_per_solved"])
+        self.assertEqual((entry["null_control"], entry["tie_with"]), (False, None))
+
+    def test_existing_keys_keep_their_order(self) -> None:
+        (entry,) = aggregate(pair_trials("h", "m", [True]), "auto")
+        self.assertEqual(list(entry)[:17], LEGACY_KEYS)
+
+    def test_k_is_the_smallest_run_count_over_tasks(self) -> None:
+        trials = pair_trials("h", "m", [True, False, True], task="a") + pair_trials("h", "m", [True], task="b")
+        trials += pair_trials("x", "m", [True], task="a")  # another pair has no runs on task b
+        table = {e["harness"]: e for e in aggregate(trials, "auto")}
+        self.assertEqual((table["h"]["k"], table["x"]["k"]), (1, 1))
+        self.assertAlmostEqual(table["h"]["pass_at_k"], (2 / 3 + 1) / 2)
+
+    def test_unknown_cost_gives_no_interval_tie_or_frontier(self) -> None:
+        trials = pair_trials("h", "m", [True, True, True], [0.1, None, 0.1])
+        (entry,) = aggregate(trials, "auto")
+        self.assertEqual(
+            (entry["cost_per_solved"], entry["cost_per_solved_ci_low"], entry["cost_per_solved_ci_high"]),
+            (None, None, None),
+        )
+        self.assertEqual((entry["tie_with"], entry["pareto"]), (None, False))
+
+    def test_zero_passes_have_infinite_cost_and_no_interval(self) -> None:
+        (entry,) = aggregate(pair_trials("h", "m", [False, False]), "auto")
+        self.assertEqual((entry["cost_per_solved"], entry["cost_per_solved_ci_low"]), (math.inf, None))
+        self.assertEqual(entry["tie_with"], None)
+
+    def test_overlapping_cost_intervals_tie_with_the_leader(self) -> None:
+        trials = pair_trials("a", "m", [True] * 4, [0.10, 0.10, 0.12, 0.12])
+        trials += pair_trials("b", "m", [True] * 4, [0.11, 0.11, 0.12, 0.12])
+        table = aggregate(trials, "auto")
+        self.assertEqual([e["harness"] for e in table], ["a", "b"])
+        self.assertEqual([e["tie_with"] for e in table], [1, 1])
+
+    def test_pareto_marks_pairs_no_other_pair_beats(self) -> None:
+        trials = pair_trials("cheap", "m", [True, True], [0.1, 0.1]) + pair_trials(
+            "dear", "m", [True, True], [0.2, 0.2]
+        )
+        trials += pair_trials("weak", "m", [True, False], [0.05, 0.05])
+        table = {e["harness"]: e["pareto"] for e in aggregate(trials, "auto")}
+        self.assertEqual(table, {"cheap": True, "dear": False, "weak": True})
+
+    def test_null_pairs_are_flagged_and_stay_off_the_frontier(self) -> None:
+        trials = pair_trials("null", "none", [True], [0.0]) + pair_trials("h", "m", [True])
+        table = {e["harness"]: e for e in aggregate(trials, "auto", null_harnesses={"null"})}
+        self.assertEqual((table["null"]["null_control"], table["null"]["pareto"]), (True, False))
+        self.assertEqual((table["h"]["null_control"], table["h"]["pareto"]), (False, True))
+
+    def test_target_width_sets_the_repetitions_needed(self) -> None:
+        trials = pair_trials("h", "m", [True, False])
+        (wide,) = aggregate(trials, "auto", target_ci_width=0.4)
+        (narrow,) = aggregate(trials, "auto", target_ci_width=0.1)
+        self.assertLess(wide["reps_needed"], narrow["reps_needed"])
+        self.assertEqual(narrow["reps_needed"], reps_for_ci_width(0.5, 0.1, 1))
+
+
+def render(trials: list[Any], null: tuple[str, ...] = (), **kwargs: Any) -> str:
+    width = kwargs.get("target_ci_width", 0.2)
+    table = aggregate(trials, "auto", null_harnesses=null, target_ci_width=width)
+    return render_markdown(table, trials, "auto", NOW, **kwargs)
+
+
+class RenderStatisticsTests(unittest.TestCase):
+    def test_reps_fixture_matches_its_golden(self) -> None:
+        trials = trials_from_rows(fixtures.read_rows(GOLDEN / "results_reps.jsonl"))
+        self.assertEqual(mask_summary(render(trials, ("null",))), (GOLDEN / "summary_reps.md").read_text())
+
+    def test_main_table_shows_interval_estimators_tie_and_frontier(self) -> None:
+        md = render(pair_trials("h", "m", [True, True, False], [0.05, 0.06, 0.07]))
+        self.assertIn("| Pass 95% CI | pass@k | pass^k | Cost/solved 95% CI | Tie | Pareto |", md)
+        self.assertRegex(md, r"\| 21–94% \| 100% \(k=3\) \| 0% \(k=3\) \| \$0\.0500–inf \| +\| yes \|")
+
+    def test_recommendation_is_the_cheapest_pair_within_the_tolerance(self) -> None:
+        trials = pair_trials("best", "m", [True] * 20, [0.5] * 20) + pair_trials(
+            "close", "m", [True] * 19 + [False], [0.1] * 20
+        )
+        trials += pair_trials("far", "m", [True] * 10 + [False] * 10, [0.01] * 20)
+        md = render(trials)
+        self.assertIn(
+            "**Recommendation:** close/m — cheapest per solved task within 5 pp of the best pass rate (100%).", md
+        )
+        self.assertIn("within 60 pp", render(trials, recommend_within_pp=60))
+
+    def test_unknown_cost_unsolved_and_null_pairs_are_never_recommended(self) -> None:
+        trials = pair_trials("nocost", "m", [True], [None]) + pair_trials("nopass", "m", [False])
+        trials += pair_trials("null", "none", [True], [0.0])
+        self.assertNotIn("Recommendation", render(trials, ("null",)))
+
+    def test_pareto_section_lists_the_frontier(self) -> None:
+        md = render(pair_trials("cheap", "m", [True]) + pair_trials("dear", "m", [True], [0.2]))
+        self.assertIn("## Pareto frontier (cost per run × pass rate)\n\n- cheap/m: $0.1000 per run, 100%\n", md)
+        self.assertNotIn("dear/m: $", md)
+
+    def test_null_control_that_solves_a_task_prints_a_warning(self) -> None:
+        md = render(pair_trials("null", "none", [True, False], [0.0, 0.0]) + pair_trials("h", "m", [True]), ("null",))
+        self.assertIn("## Negative control\n\n**Warning:** null control solved tasks: null/none (1/2).", md)
+
+    def test_null_control_that_solves_nothing_is_reported_clean(self) -> None:
+        md = render(pair_trials("null", "none", [False], [0.0]) + pair_trials("h", "m", [True]), ("null",))
+        self.assertIn("## Negative control\n\nnull control solved nothing.", md)
+
+    def test_no_negative_control_section_without_null_pairs(self) -> None:
+        self.assertNotIn("Negative control", render(pair_trials("h", "m", [True])))
+
+    def test_discrimination_lists_saturated_and_unsolved_tasks_without_null_pairs(self) -> None:
+        trials = pair_trials("a", "m", [True, True], task="easy") + pair_trials("b", "m", [True], task="easy")
+        trials += pair_trials("a", "m", [False], task="hard") + pair_trials("b", "m", [False], task="hard")
+        trials += pair_trials("a", "m", [True, False], task="mixed") + pair_trials("b", "m", [True], task="mixed")
+        trials += pair_trials("null", "none", [False], [0.0], task="easy")
+        md = render(trials, ("null",))
+        self.assertIn("- Saturated (solved in every run): easy\n- Unsolved (never solved): hard\n", md)
+
+    def test_single_pair_has_discrimination_but_no_paired_comparison(self) -> None:
+        md = render(pair_trials("h", "m", [True, False], task="t1") + pair_trials("h", "m", [True], task="t2"))
+        self.assertIn("- Saturated (solved in every run): t2", md)
+        self.assertNotIn("Paired comparison", md)
+
+    def test_paired_comparison_counts_discordant_runs_against_the_first_pair(self) -> None:
+        trials = pair_trials("a", "m", [True] * 6, [0.1] * 6) + pair_trials("b", "m", [False] * 6, [0.2] * 6)
+        trials += pair_trials("c", "m", [True] * 6, [0.3] * 6)
+        md = render(trials)
+        self.assertIn("## Paired comparison vs #1 (McNemar, exact)\n", md)
+        self.assertIn("- #3 b/m: b=6, c=0, p=0.0312", md)
+        self.assertIn("- #2 c/m: b=0, c=0, p=1.0000", md)
+
+    def test_paired_comparison_skips_pairs_that_share_no_runs(self) -> None:
+        md = render(pair_trials("a", "m", [True], task="x") + pair_trials("b", "m", [True], task="y"))
+        self.assertNotIn("Paired comparison", md)
+
+    def test_repetitions_section_gives_reps_per_task_for_the_target_width(self) -> None:
+        md = render(pair_trials("h", "m", [True, False]), target_ci_width=0.4)
+        self.assertIn(
+            f"- To reach a pass-rate CI width of 0.40: h/m needs {reps_for_ci_width(0.5, 0.4, 1)} reps per task.", md
+        )
+
+    def test_a_report_of_null_pairs_only_has_no_recommendation_or_repetitions(self) -> None:
+        md = render(pair_trials("null", "none", [False], [0.0]), ("null",))
+        self.assertEqual([h for h in ("Recommendation", "Repetitions", "Discrimination") if h in md], [])
+        self.assertIn("null control solved nothing.", md)
+
+    def test_unreachable_repetitions_say_more_than_the_limit(self) -> None:
+        trials = pair_trials("h", "m", [True, False], task="a") + pair_trials("h", "m", [True, False], task="b")
+        md = render(trials, target_ci_width=1e-9)
+        self.assertIn("h/m needs more than 5000 reps per task.", md)
+
+    def test_a_null_control_that_passed_is_ranked_after_every_real_pair(self) -> None:
+        trials = pair_trials("null", "none", [True, True], [0.0, 0.0]) + pair_trials("a", "m", [True, True])
+        trials += pair_trials("b", "m", [True, False]) + pair_trials("c", "m", [False, False])
+        trials += pair_trials("d", "m", [True, True], [None, None])  # unknown cost sorts before the null control
+        md = render(trials, ("null",))
+        ranks = re.findall(r"^\| (\d) \| (\w+) \|", md, re.M)
+        self.assertEqual([h for _, h in ranks], ["a", "b", "c", "d", "null"])
+        self.assertIn("- #2 b/m:", md)
+        self.assertNotIn("- #1 ", md)
+        self.assertIn("**Warning:** null control solved tasks: null/none (2/2).", md)
+        self.assertNotIn("**Recommendation:** null", md)
+
+    def test_pairs_with_no_pass_stay_off_the_frontier(self) -> None:
+        md = render(pair_trials("good", "m", [True], [0.2]) + pair_trials("free", "m", [False], [0.01]))
+        self.assertIn("- good/m:", md)
+        self.assertNotIn("- free/m:", md)
+
+    def test_every_review_focus_case_renders(self) -> None:
+        trials = pair_trials("h", "m", [False, False], [None, 0.1]) + pair_trials("x", "m", [True], task="other")
+        trials += pair_trials("h", "m", [True], [0.1], task="other")
+        self.assertIn("## Per task", render(trials))
 
 
 class FormatTests(unittest.TestCase):
@@ -5861,6 +6718,60 @@ class CliDispatchTests(unittest.TestCase):
         self.cli("run", "--allow-unsandboxed", "--only", "claude")
         shutil.copytree(self.base / "results", self.base / "results-litellm")
         self.assertIn("Cost source: `litellm`", self.cli("report", "--litellm"))
+
+
+class ReportOptionsTests(unittest.TestCase):
+    """`report` over hand-written rows: `--drop-saturated` and the knobs read from the config."""
+
+    def setUp(self) -> None:
+        self.base = fixtures.tmpdir(self)
+        (self.base / "results").mkdir()
+        self.cfg: dict[str, Any] = {
+            "output_dir": "results",
+            "harnesses": {"null": {"parser": "null", "command": ["true"]}},
+        }
+
+    def report(self, *argv: str) -> str:
+        cfg_path = self.base / "config.json"
+        cfg_path.write_text(json.dumps(self.cfg))
+        with fixtures.quiet() as out:
+            cli.main(["report", "--config", str(cfg_path), *argv])
+        return out.getvalue()
+
+    def write_rows(self, *rows: dict[str, Any]) -> None:
+        fixtures.write_rows(self.base / "results" / "results.jsonl", *rows)
+
+    def row(self, task: str, harness: str, passed: bool, rep: int = 1) -> dict[str, Any]:
+        return fixtures.run_row(task=task, harness=harness, model="m", passed=passed, rep=rep, cost_computed=0.1)
+
+    def test_drop_saturated_removes_the_task_from_the_matrix_and_the_pass_rates(self) -> None:
+        self.write_rows(
+            self.row("easy", "a", True),
+            self.row("hard", "a", True),
+            self.row("easy", "b", True),
+            self.row("hard", "b", False),
+            self.row("easy", "null", False),  # a failing null pair does not keep `easy` from being saturated
+        )
+        kept = self.report()
+        dropped = self.report("--drop-saturated")
+        self.assertIn("| easy |", kept)
+        self.assertNotIn("| easy |", dropped)
+        self.assertIn("| hard |", dropped)
+        self.assertIn("| 1 | a | m | 1/1 | 100% |", dropped)
+        self.assertIn("| 1 | a | m | 2/2 | 100% |", kept)
+
+    def test_dropping_every_task_says_so_and_exits_cleanly(self) -> None:
+        self.write_rows(self.row("easy", "a", True), self.row("easy", "b", True))
+        out = self.report("--drop-saturated")
+        self.assertIn("no tasks left after --drop-saturated", out)
+        self.assertNotIn("| # |", out)
+
+    def test_config_knobs_reach_the_report(self) -> None:
+        self.cfg.update(recommend_within_pp=60, target_ci_width=0.4)
+        self.write_rows(self.row("t", "a", True), self.row("t", "a", False, rep=2))
+        out = self.report()
+        self.assertIn("within 60 pp", out)
+        self.assertIn("CI width of 0.40", out)
 
 
 class ShimMainTests(unittest.TestCase):

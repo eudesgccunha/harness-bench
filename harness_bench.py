@@ -211,12 +211,21 @@ def parse_codex(stdout):
     return u
 
 
+def parse_null(stdout):
+    """Negative control: no model is called, so usage is zero and the cost is a real 0.0.
+    A `null` pair that solves a task means the hidden tests are too lenient."""
+    u = empty_usage()
+    u["cost_reported"] = 0.0
+    return u
+
+
 PARSERS = {
     "claude": parse_claude,
     "opencode": parse_opencode,
     "pi": parse_pi,
     "cursor": parse_cursor,
     "codex": parse_codex,
+    "null": parse_null,
 }
 
 
@@ -281,8 +290,20 @@ def check_cost_source(name):
         sys.exit(f"invalid cost_source {name!r}: use one of {', '.join(report.COST_SOURCES)}")
 
 
+def report_options(cfg):
+    """`(recommend_within_pp, target_ci_width)` from the config, validated; exits with a message naming the key."""
+    pp = cfg.get("recommend_within_pp", 5)
+    width = cfg.get("target_ci_width", 0.2)
+    if isinstance(pp, bool) or not isinstance(pp, int | float) or not 0 <= pp <= 100:
+        sys.exit(f"invalid recommend_within_pp {pp!r}: use a number from 0 to 100")
+    if isinstance(width, bool) or not isinstance(width, int | float) or not 0 < width <= 1:
+        sys.exit(f"invalid target_ci_width {width!r}: use a number above 0 and up to 1")
+    return pp, width
+
+
 def validate_config(cfg):
     check_cost_source(cfg.get("cost_source", "auto"))
+    report_options(cfg)
     for task in cfg["tasks"]:
         if SAFE_NAME.search(task["id"]) or task["id"].startswith("."):
             sys.exit(f"invalid task id {task['id']!r}: use only letters, digits, _ . - (no leading dot)")
@@ -782,10 +803,19 @@ def cmd_report(args, cfg, base):
         sys.exit(f"no results in {results_path}")
     cost_source = getattr(args, "cost_source", None) or cfg.get("cost_source", "auto")
     check_cost_source(cost_source)
+    within_pp, target_width = report_options(cfg)
+    null_harnesses = {name for name, h in cfg.get("harnesses", {}).items() if h.get("parser") == "null"}
     trials = trials_from_rows(rows, warn=print)
-    table = report.aggregate(trials, cost_source)
+    if getattr(args, "drop_saturated", False):
+        trials = report.drop_saturated(trials, null_harnesses)
+        if not trials:
+            print("no tasks left after --drop-saturated")
+            return
+    table = report.aggregate(trials, cost_source, null_harnesses=null_harnesses, target_ci_width=target_width)
     report.write_csv(table, out_dir / "summary.csv")
-    md = report.render_markdown(table, trials, cost_source, datetime.now())
+    md = report.render_markdown(
+        table, trials, cost_source, datetime.now(), recommend_within_pp=within_pp, target_ci_width=target_width
+    )
     (out_dir / "summary.md").write_text(md)
     print("\n" + md)
     print(f"saved {out_dir / 'summary.md'} and {out_dir / 'summary.csv'}")

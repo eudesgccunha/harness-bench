@@ -6,9 +6,11 @@ Each item is scheduled in a phase of the [evolution plan](evolution-plan.md):
 
 | Item | Phase |
 |---|---|
-| M1 Wilson CI, M4 discrimination, M5 recommendation and chart, M10 efficiency, M11 paired comparison | 2 |
+| M1 Wilson CI, M4 discrimination, M5 recommendation (text), M11 paired comparison | 2 (done, [ADR 0006](adr/0006-report-statistics.md)) |
+| M5 chart (`summary.html`) | 7 (sinks) |
+| M10 efficiency (tool calls) | 3 (needs parser changes, runner protocol) |
 | M2 `validate`, M12 task packs | 4 |
-| M3 `null` harness | 2 (negative control, next to M4; not built in Phase 0) |
+| M3 `null` harness | 2 (done: negative control) |
 | M6 failure breakdown, M14 transcript hygiene | 1 |
 | M7 provenance | 1 (versions in the contract), 6 (image digest) |
 | M8 `doctor`, M15 egress restriction | 6 |

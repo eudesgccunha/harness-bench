@@ -1,6 +1,7 @@
 """Tests for the report derived from the contract (`hbench.report`)."""
 
 import math
+import re
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Any
 import fixtures
 from hbench.core.convert import trials_from_rows
 from hbench.report import aggregate, fmt_int, fmt_money, render_markdown, write_csv
+from hbench.stats import pass_at_k, pass_hat_k, reps_for_ci_width, wilson_interval
 from test_golden import GOLDEN, mask_summary
 
 NOW = datetime(2026, 11, 24, 12, 30)
@@ -70,6 +72,217 @@ class AggregateTests(unittest.TestCase):
         trials = trials_from_rows([fixtures.run_row(passed=False, cost_computed=1.0)])
         (entry,) = aggregate(trials, "auto")
         self.assertEqual((entry["cost_per_solved"], entry["tokens_per_solved"]), (float("inf"), float("inf")))
+
+
+LEGACY_KEYS = [
+    "harness",
+    "model",
+    "cost_source",
+    "runs",
+    "solved",
+    "pass_rate",
+    "tokens_total",
+    "tokens_per_run",
+    "tokens_per_solved",
+    "cache_hit",
+    "cost_total",
+    "cost_per_run",
+    "cost_per_solved",
+    "cost_per_1m_tokens",
+    "avg_turns",
+    "avg_wall_s",
+    "parse_failures",
+]
+
+
+def pair_trials(
+    harness: str, model: str, outcomes: list[bool], costs: list[float | None] | None = None, task: str = "t1"
+) -> list[Any]:
+    """Trials of one pair on one task: one per outcome, rep 1.. in order."""
+    costs = costs if costs is not None else [0.1] * len(outcomes)
+    rows = [
+        fixtures.run_row(harness=harness, model=model, task=task, rep=i, passed=ok, cost_computed=c)
+        for i, (ok, c) in enumerate(zip(outcomes, costs, strict=True), 1)
+    ]
+    return trials_from_rows(rows)
+
+
+class StatisticsTests(unittest.TestCase):
+    def test_three_reps_get_interval_and_pass_estimators(self) -> None:
+        (entry,) = aggregate(pair_trials("h", "m", [True, True, False]), "auto")
+        low, high = wilson_interval(2, 3)
+        self.assertEqual((entry["pass_ci_low"], entry["pass_ci_high"]), (low, high))
+        self.assertEqual(
+            (entry["k"], entry["pass_at_k"], entry["pass_hat_k"]), (3, pass_at_k(3, 2, 3), pass_hat_k(3, 2, 3))
+        )
+        self.assertLessEqual(entry["cost_per_solved_ci_low"], entry["cost_per_solved"])
+        self.assertGreaterEqual(entry["cost_per_solved_ci_high"], entry["cost_per_solved"])
+        self.assertEqual((entry["null_control"], entry["tie_with"]), (False, None))
+
+    def test_existing_keys_keep_their_order(self) -> None:
+        (entry,) = aggregate(pair_trials("h", "m", [True]), "auto")
+        self.assertEqual(list(entry)[:17], LEGACY_KEYS)
+
+    def test_k_is_the_smallest_run_count_over_tasks(self) -> None:
+        trials = pair_trials("h", "m", [True, False, True], task="a") + pair_trials("h", "m", [True], task="b")
+        trials += pair_trials("x", "m", [True], task="a")  # another pair has no runs on task b
+        table = {e["harness"]: e for e in aggregate(trials, "auto")}
+        self.assertEqual((table["h"]["k"], table["x"]["k"]), (1, 1))
+        self.assertAlmostEqual(table["h"]["pass_at_k"], (2 / 3 + 1) / 2)
+
+    def test_unknown_cost_gives_no_interval_tie_or_frontier(self) -> None:
+        trials = pair_trials("h", "m", [True, True, True], [0.1, None, 0.1])
+        (entry,) = aggregate(trials, "auto")
+        self.assertEqual(
+            (entry["cost_per_solved"], entry["cost_per_solved_ci_low"], entry["cost_per_solved_ci_high"]),
+            (None, None, None),
+        )
+        self.assertEqual((entry["tie_with"], entry["pareto"]), (None, False))
+
+    def test_zero_passes_have_infinite_cost_and_no_interval(self) -> None:
+        (entry,) = aggregate(pair_trials("h", "m", [False, False]), "auto")
+        self.assertEqual((entry["cost_per_solved"], entry["cost_per_solved_ci_low"]), (math.inf, None))
+        self.assertEqual(entry["tie_with"], None)
+
+    def test_overlapping_cost_intervals_tie_with_the_leader(self) -> None:
+        trials = pair_trials("a", "m", [True] * 4, [0.10, 0.10, 0.12, 0.12])
+        trials += pair_trials("b", "m", [True] * 4, [0.11, 0.11, 0.12, 0.12])
+        table = aggregate(trials, "auto")
+        self.assertEqual([e["harness"] for e in table], ["a", "b"])
+        self.assertEqual([e["tie_with"] for e in table], [1, 1])
+
+    def test_pareto_marks_pairs_no_other_pair_beats(self) -> None:
+        trials = pair_trials("cheap", "m", [True, True], [0.1, 0.1]) + pair_trials(
+            "dear", "m", [True, True], [0.2, 0.2]
+        )
+        trials += pair_trials("weak", "m", [True, False], [0.05, 0.05])
+        table = {e["harness"]: e["pareto"] for e in aggregate(trials, "auto")}
+        self.assertEqual(table, {"cheap": True, "dear": False, "weak": True})
+
+    def test_null_pairs_are_flagged_and_stay_off_the_frontier(self) -> None:
+        trials = pair_trials("null", "none", [True], [0.0]) + pair_trials("h", "m", [True])
+        table = {e["harness"]: e for e in aggregate(trials, "auto", null_harnesses={"null"})}
+        self.assertEqual((table["null"]["null_control"], table["null"]["pareto"]), (True, False))
+        self.assertEqual((table["h"]["null_control"], table["h"]["pareto"]), (False, True))
+
+    def test_target_width_sets_the_repetitions_needed(self) -> None:
+        trials = pair_trials("h", "m", [True, False])
+        (wide,) = aggregate(trials, "auto", target_ci_width=0.4)
+        (narrow,) = aggregate(trials, "auto", target_ci_width=0.1)
+        self.assertLess(wide["reps_needed"], narrow["reps_needed"])
+        self.assertEqual(narrow["reps_needed"], reps_for_ci_width(0.5, 0.1, 1))
+
+
+def render(trials: list[Any], null: tuple[str, ...] = (), **kwargs: Any) -> str:
+    width = kwargs.get("target_ci_width", 0.2)
+    table = aggregate(trials, "auto", null_harnesses=null, target_ci_width=width)
+    return render_markdown(table, trials, "auto", NOW, **kwargs)
+
+
+class RenderStatisticsTests(unittest.TestCase):
+    def test_reps_fixture_matches_its_golden(self) -> None:
+        trials = trials_from_rows(fixtures.read_rows(GOLDEN / "results_reps.jsonl"))
+        self.assertEqual(mask_summary(render(trials, ("null",))), (GOLDEN / "summary_reps.md").read_text())
+
+    def test_main_table_shows_interval_estimators_tie_and_frontier(self) -> None:
+        md = render(pair_trials("h", "m", [True, True, False], [0.05, 0.06, 0.07]))
+        self.assertIn("| Pass 95% CI | pass@k | pass^k | Cost/solved 95% CI | Tie | Pareto |", md)
+        self.assertRegex(md, r"\| 21–94% \| 100% \(k=3\) \| 0% \(k=3\) \| \$0\.0500–inf \| +\| yes \|")
+
+    def test_recommendation_is_the_cheapest_pair_within_the_tolerance(self) -> None:
+        trials = pair_trials("best", "m", [True] * 20, [0.5] * 20) + pair_trials(
+            "close", "m", [True] * 19 + [False], [0.1] * 20
+        )
+        trials += pair_trials("far", "m", [True] * 10 + [False] * 10, [0.01] * 20)
+        md = render(trials)
+        self.assertIn(
+            "**Recommendation:** close/m — cheapest per solved task within 5 pp of the best pass rate (100%).", md
+        )
+        self.assertIn("within 60 pp", render(trials, recommend_within_pp=60))
+
+    def test_unknown_cost_unsolved_and_null_pairs_are_never_recommended(self) -> None:
+        trials = pair_trials("nocost", "m", [True], [None]) + pair_trials("nopass", "m", [False])
+        trials += pair_trials("null", "none", [True], [0.0])
+        self.assertNotIn("Recommendation", render(trials, ("null",)))
+
+    def test_pareto_section_lists_the_frontier(self) -> None:
+        md = render(pair_trials("cheap", "m", [True]) + pair_trials("dear", "m", [True], [0.2]))
+        self.assertIn("## Pareto frontier (cost per run × pass rate)\n\n- cheap/m: $0.1000 per run, 100%\n", md)
+        self.assertNotIn("dear/m: $", md)
+
+    def test_null_control_that_solves_a_task_prints_a_warning(self) -> None:
+        md = render(pair_trials("null", "none", [True, False], [0.0, 0.0]) + pair_trials("h", "m", [True]), ("null",))
+        self.assertIn("## Negative control\n\n**Warning:** null control solved tasks: null/none (1/2).", md)
+
+    def test_null_control_that_solves_nothing_is_reported_clean(self) -> None:
+        md = render(pair_trials("null", "none", [False], [0.0]) + pair_trials("h", "m", [True]), ("null",))
+        self.assertIn("## Negative control\n\nnull control solved nothing.", md)
+
+    def test_no_negative_control_section_without_null_pairs(self) -> None:
+        self.assertNotIn("Negative control", render(pair_trials("h", "m", [True])))
+
+    def test_discrimination_lists_saturated_and_unsolved_tasks_without_null_pairs(self) -> None:
+        trials = pair_trials("a", "m", [True, True], task="easy") + pair_trials("b", "m", [True], task="easy")
+        trials += pair_trials("a", "m", [False], task="hard") + pair_trials("b", "m", [False], task="hard")
+        trials += pair_trials("a", "m", [True, False], task="mixed") + pair_trials("b", "m", [True], task="mixed")
+        trials += pair_trials("null", "none", [False], [0.0], task="easy")
+        md = render(trials, ("null",))
+        self.assertIn("- Saturated (solved in every run): easy\n- Unsolved (never solved): hard\n", md)
+
+    def test_single_pair_has_discrimination_but_no_paired_comparison(self) -> None:
+        md = render(pair_trials("h", "m", [True, False], task="t1") + pair_trials("h", "m", [True], task="t2"))
+        self.assertIn("- Saturated (solved in every run): t2", md)
+        self.assertNotIn("Paired comparison", md)
+
+    def test_paired_comparison_counts_discordant_runs_against_the_first_pair(self) -> None:
+        trials = pair_trials("a", "m", [True] * 6, [0.1] * 6) + pair_trials("b", "m", [False] * 6, [0.2] * 6)
+        trials += pair_trials("c", "m", [True] * 6, [0.3] * 6)
+        md = render(trials)
+        self.assertIn("## Paired comparison vs #1 (McNemar, exact)\n", md)
+        self.assertIn("- #3 b/m: b=6, c=0, p=0.0312", md)
+        self.assertIn("- #2 c/m: b=0, c=0, p=1.0000", md)
+
+    def test_paired_comparison_skips_pairs_that_share_no_runs(self) -> None:
+        md = render(pair_trials("a", "m", [True], task="x") + pair_trials("b", "m", [True], task="y"))
+        self.assertNotIn("Paired comparison", md)
+
+    def test_repetitions_section_gives_reps_per_task_for_the_target_width(self) -> None:
+        md = render(pair_trials("h", "m", [True, False]), target_ci_width=0.4)
+        self.assertIn(
+            f"- To reach a pass-rate CI width of 0.40: h/m needs {reps_for_ci_width(0.5, 0.4, 1)} reps per task.", md
+        )
+
+    def test_a_report_of_null_pairs_only_has_no_recommendation_or_repetitions(self) -> None:
+        md = render(pair_trials("null", "none", [False], [0.0]), ("null",))
+        self.assertEqual([h for h in ("Recommendation", "Repetitions", "Discrimination") if h in md], [])
+        self.assertIn("null control solved nothing.", md)
+
+    def test_unreachable_repetitions_say_more_than_the_limit(self) -> None:
+        trials = pair_trials("h", "m", [True, False], task="a") + pair_trials("h", "m", [True, False], task="b")
+        md = render(trials, target_ci_width=1e-9)
+        self.assertIn("h/m needs more than 5000 reps per task.", md)
+
+    def test_a_null_control_that_passed_is_ranked_after_every_real_pair(self) -> None:
+        trials = pair_trials("null", "none", [True, True], [0.0, 0.0]) + pair_trials("a", "m", [True, True])
+        trials += pair_trials("b", "m", [True, False]) + pair_trials("c", "m", [False, False])
+        trials += pair_trials("d", "m", [True, True], [None, None])  # unknown cost sorts before the null control
+        md = render(trials, ("null",))
+        ranks = re.findall(r"^\| (\d) \| (\w+) \|", md, re.M)
+        self.assertEqual([h for _, h in ranks], ["a", "b", "c", "d", "null"])
+        self.assertIn("- #2 b/m:", md)
+        self.assertNotIn("- #1 ", md)
+        self.assertIn("**Warning:** null control solved tasks: null/none (2/2).", md)
+        self.assertNotIn("**Recommendation:** null", md)
+
+    def test_pairs_with_no_pass_stay_off_the_frontier(self) -> None:
+        md = render(pair_trials("good", "m", [True], [0.2]) + pair_trials("free", "m", [False], [0.01]))
+        self.assertIn("- good/m:", md)
+        self.assertNotIn("- free/m:", md)
+
+    def test_every_review_focus_case_renders(self) -> None:
+        trials = pair_trials("h", "m", [False, False], [None, 0.1]) + pair_trials("x", "m", [True], task="other")
+        trials += pair_trials("h", "m", [True], [0.1], task="other")
+        self.assertIn("## Per task", render(trials))
 
 
 class FormatTests(unittest.TestCase):

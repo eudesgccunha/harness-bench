@@ -265,15 +265,19 @@ Engine items deliberately left alone in Phase 0 (no behavior change allowed ther
 
 A ranking by cost per success is only trustworthy with explicit uncertainty.
 
-- [ ] Pass rate with a confidence interval (Wilson).
-- [ ] pass@k (capability) and pass^k (consistency) per target.
-- [ ] Cost per solved task, with a bootstrap CI.
-- [ ] Ranking with statistical ties (targets with overlapping CIs are marked as tied).
-- [ ] Cost × pass rate Pareto frontier in `summary.md`.
-- [ ] Minimum `--reps` recommendation for a desired CI width.
+- [x] Pass rate with a confidence interval (Wilson).
+- [x] pass@k (capability) and pass^k (consistency) per target.
+- [x] Cost per solved task, with a bootstrap CI.
+- [x] Ranking with statistical ties (targets with overlapping CIs are marked as tied).
+- [x] Cost × pass rate Pareto frontier in `summary.md`.
+- [x] Minimum `--reps` recommendation for a desired CI width.
 
-Acceptance: `summary.md` shows CI, pass^k and ties. `stats/` functions have tests with
-known cases.
+Implementation plan:
+[`superpowers/plans/2026-11-24-phase-2-statistics.md`](superpowers/plans/2026-11-24-phase-2-statistics.md).
+Decisions: [ADR 0006](adr/0006-report-statistics.md).
+
+Acceptance: `summary.md` shows CI, pass^k and ties. `hbench/stats.py` functions have tests
+with known cases.
 
 ### Phase 3 — Runner and grader protocols
 

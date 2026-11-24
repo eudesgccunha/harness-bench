@@ -108,6 +108,11 @@ class PiParserTests(unittest.TestCase):
         self.assertIsNone(hb.parse_pi(jl({"type": "session"})))
 
 
+class NullParserTests(unittest.TestCase):
+    def test_usage_is_zero_and_the_cost_is_a_real_zero(self) -> None:
+        self.assertEqual(hb.parse_null("anything"), {**hb.empty_usage(), "cost_reported": 0.0})
+
+
 class CursorParserTests(unittest.TestCase):
     def test_result_without_usage_returns_none(self) -> None:
         self.assertIsNone(hb.parse_cursor(jl({"type": "result", "result": "ok"})))
