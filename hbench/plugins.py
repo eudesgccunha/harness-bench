@@ -1,9 +1,10 @@
 """Plugins through entry points (ADR 0007, decision 7).
 
-Third-party packages register a factory `(config) -> HarnessRunner | Grader` in the groups
-`harness_bench.runners` and `harness_bench.graders`. Built-in names always win: callers only come here for a
-name that is not built in, so a plain run never imports third-party code. Every failure is a `PluginError`
-with a message that names the plugin, never a traceback from the engine.
+Third-party packages register a factory `(config) -> HarnessRunner | Grader | redactor` in the groups
+`harness_bench.runners`, `harness_bench.graders` and `harness_bench.redactors` (a redactor is a callable
+`(text: str) -> str` that runs on an artifact before it is sent to the judge). Built-in names always win: callers
+only come here for a name that is not built in, so a plain run never imports third-party code. Every failure is a
+`PluginError` with a message that names the plugin, never a traceback from the engine.
 """
 
 from collections.abc import Callable, Collection, Mapping
@@ -12,6 +13,7 @@ from typing import Any, TypeGuard
 
 RUNNER_GROUP = "harness_bench.runners"
 GRADER_GROUP = "harness_bench.graders"
+REDACTOR_GROUP = "harness_bench.redactors"
 
 
 class PluginError(ValueError):
@@ -86,3 +88,12 @@ def create_plugin[T](
     if not accepts(built):
         raise PluginError(f"plugin {group}:{name} returned a {type(built).__name__}, not a {expected}")
     return built
+
+
+def _is_redactor(obj: object) -> TypeGuard[Callable[[str], str]]:
+    return callable(obj)
+
+
+def redactor_for(name: str, config: Mapping[str, Any]) -> Callable[[str], str]:
+    """The redactor of the plugin `name` (there are no built-in ones), built from `config` (the `judge` section)."""
+    return create_plugin(REDACTOR_GROUP, name, (), config, _is_redactor, "callable")

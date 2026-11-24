@@ -323,16 +323,21 @@ Acceptance: anyone clones the repo and runs an example suite from scratch.
 The harness × model comparison also applies to agents that produce artifacts other than
 code. It comes in as an extension, without changing the core.
 
-- [ ] `llm_rubric` grader: LLM judge through the OpenAI-compatible gateway, versioned
+- [x] `llm_rubric` grader: LLM judge through the OpenAI-compatible gateway, versioned
       rubric, structured output, `temperature=0`, judge recorded in the result.
-- [ ] `html_check` grader: valid HTML, required elements, no external scripts, broken
+- [x] `html_check` grader: valid HTML, required elements, no external scripts, broken
       links.
-- [ ] `structured_output` grader: validates JSON against a schema.
-- [ ] Judge calibration: a command that compares judge scores with human labels on a
+- [x] `structured_output` grader: validates JSON against a schema.
+- [x] Judge calibration: a command that compares judge scores with human labels on a
       sample and reports agreement. Without calibration, the rubric is marked
       "experimental" in the report.
-- [ ] Redaction hook before content goes to the judge (interface; the implementation
+- [x] Redaction hook before content goes to the judge (interface; the implementation
       belongs to the user).
+
+Plan: [`superpowers/plans/2026-11-24-phase-5-artifact-graders.md`](superpowers/plans/2026-11-24-phase-5-artifact-graders.md).
+Decisions: [ADR 0009](adr/0009-artifact-graders-and-judge.md). The network rule widens only when
+a config has a `judge` section and a task uses `llm_rubric`. Data contract 1.2.0 adds
+`GraderResult.judge`.
 
 Acceptance: an example suite that generates a synthetic HTML report runs with rubric +
 `html_check`.

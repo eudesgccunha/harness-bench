@@ -8,6 +8,7 @@ from typing import Any
 
 import fixtures
 from hbench import cli, suites
+from hbench.graders import grade_plan
 
 SUITES = fixtures.ROOT / "suites"
 EXAMPLE_SUITES = (SUITES / "regression", SUITES / "examples-capability")
@@ -142,6 +143,37 @@ class LoadSuiteTests(SuiteCase):
 
     def test_a_suite_that_is_not_an_object_is_rejected(self) -> None:
         self.assert_rejected(write_suite(self.root, []), "must be a JSON object")
+
+
+class SchemaFileTests(SuiteCase):
+    def suite_with_schema(self, schema: str | None, ref: str = "s.json") -> Path:
+        grader = {"type": "structured_output", "file": "out.json", "schema": ref}
+        suite_dir = write_suite(self.root, suite_file(tasks=[task_entry(graders=[grader])]))
+        if schema is None:
+            (suite_dir / "s.json").unlink(missing_ok=True)
+        else:
+            (suite_dir / "s.json").write_text(schema)
+        return suite_dir
+
+    def test_a_valid_schema_file_loads(self) -> None:
+        suites.load_suite(self.suite_with_schema('{"type": "object"}'))
+
+    def test_a_broken_schema_file_is_found_when_the_suite_loads(self) -> None:
+        for text, fragment in (
+            ("{not json", "Expecting"),
+            ('{"type": "string", "pattern": "x"}', "pattern"),
+            ("[]", "schema"),
+            (None, "cannot be read"),
+        ):
+            self.assert_rejected(self.suite_with_schema(text), "s.json")
+            self.assert_rejected(self.suite_with_schema(text), fragment)
+
+    def test_a_schema_file_that_leaves_the_suite_is_found_when_the_suite_loads(self) -> None:
+        self.assert_rejected(self.suite_with_schema(None, ref="../s.json"), "../s.json")
+
+    def test_a_schema_written_in_the_task_is_not_a_file(self) -> None:
+        grader = {"type": "structured_output", "file": "out.json", "schema": {"type": "object"}}
+        suites.load_suite(write_suite(self.root, suite_file(tasks=[task_entry(graders=[grader])])))
 
 
 class SuiteFieldTests(SuiteCase):
@@ -382,6 +414,20 @@ class ExampleSuiteTests(unittest.TestCase):
             for task in suite.tasks:
                 self.assertEqual((task.provenance.source, task.provenance.license), ("synthetic", "MIT"), task.id)
                 self.assertIsNotNone(task.solution, task.id)
+
+    def test_the_artifacts_suite_loads_with_its_three_graders_and_every_file_it_names(self) -> None:
+        suite = suites.load_suite(SUITES / "examples-artifacts")
+        (task,) = suites.suite_tasks(suite)
+        self.assertEqual(
+            (suite.kind, task["id"], task["grade"]), ("capability", "examples-artifacts/html-report", {"mode": "all"})
+        )
+        self.assertEqual([g["type"] for g in task["graders"]], ["html_check", "structured_output", "llm_rubric"])
+        self.assertEqual(len(grade_plan(task).graders), 3)
+        for name in ("rubrics/report-quality.json", "schemas/summary.schema.json"):
+            self.assertTrue((suite.path / name).is_file(), name)
+        for name in ("report.html", "summary.json"):
+            self.assertTrue((Path(task["solution"]) / name).is_file(), name)
+        self.assertFalse((Path(task["repo"]) / "report.html").exists())
 
     def test_every_hidden_test_file_carries_the_contamination_marker(self) -> None:
         files = [p for suite in EXAMPLE_SUITES for p in suite.glob("*/hidden_tests/test_*.py")]

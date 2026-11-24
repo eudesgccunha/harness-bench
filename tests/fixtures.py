@@ -23,6 +23,11 @@ FIZZBUZZ = ROOT / "suites" / "regression" / "fizzbuzz"  # the sample task: `repo
 HARNESS_KINDS = ("claude", "opencode", "pi", "codex", "cursor")
 
 
+def fake_secret(label: str) -> str:
+    """A fake key for a test, built at runtime so no key-shaped literal sits in the repository (secret scanning)."""
+    return "-".join(["sk", "test", label, "k" * 12])
+
+
 def prices() -> dict[str, dict[str, int]]:
     """A fresh price table (one entry, `x`), so callers may mutate it."""
     return {"x": {"input": 3, "output": 15}}

@@ -342,6 +342,124 @@ def main() -> None:
             "suite loader: a symlink in a suite is rejected and nothing is written outside",
         )
 
+        # --- artifact graders and the LLM judge, through the fake gateway
+        judge_log = tmp / "judge.jsonl"
+        os.environ["FAKE_JUDGE_LOG"] = str(judge_log)
+        shutil.copytree(ROOT / "suites" / "examples-artifacts", tmp / "suites" / "examples-artifacts")
+        judge_cfg = {
+            "base_url": f"http://127.0.0.1:{port}",
+            "api_key": "${FAKE_KEY}",
+            "model": "fake-judge",
+            "timeout": 10,
+        }
+        art_env = dict(harness_env, FAKE_CANARY_FILE="${FAKE_CANARY_FILE}")
+        host_secret = tmp / "host-secret.txt"
+        host_secret.write_text("HOST-SECRET-CONTENT")
+
+        def artifacts_config(name: str, mode: str, judge: dict[str, Any] = judge_cfg) -> str:
+            config = dict(
+                cfg,
+                output_dir=f"results-{name}",
+                suites=["suites/examples-artifacts"],
+                tasks=[],
+                harnesses={"claude": fixtures.harness("claude", art_env, mode)},
+                matrix=[{"harness": "claude", "model": "m"}],
+                judge=judge,
+            )
+            (tmp / f"config-{name}.json").write_text(json.dumps(config))
+            return f"config-{name}.json"
+
+        def artifact_trial(name: str) -> dict[str, Any]:
+            (run_dir_art,) = [p.parent for p in (tmp / f"results-{name}").glob("*/trials.jsonl")]
+            (trial_art,) = results(run_dir_art / "trials.jsonl")
+            return trial_art
+
+        os.environ["FAKE_CANARY_FILE"] = str(host_secret)
+        run(tmp, "harness_bench.py", "run", "--allow-unsandboxed", config=artifacts_config("art", "artifacts"))
+        trial = artifact_trial("art")
+        by_grader = {g["grader"]: g for g in trial["graders"]}
+        check(
+            trial["status"] == "passed"
+            and set(by_grader) == {"html_check", "structured_output", "llm_rubric:report-quality"}
+            and all(g["passed"] for g in by_grader.values()),
+            "artifacts: html_check, structured_output and the judge all pass on the report",
+        )
+        judged = by_grader["llm_rubric:report-quality"]
+        check(
+            (judged["judge"], judged["grader_version"], judged["score"]) == ("fake-judge", "1.0.0", 0.9),
+            "artifacts: the result names the rubric version and the judge model",
+        )
+        recorded = "".join(f.read_text() for f in (tmp / "results-art").glob("**/*.json*") if "logs" not in f.parts)
+        (judge_log_file,) = (tmp / "results-art/logs").glob("*grader-2-llm_rubric.log")
+        check(
+            "JUDGE-REASON-CANARY" not in recorded and "JUDGE-REASON-CANARY" in judge_log_file.read_text(),
+            "artifacts: the judge's reason is in the grader log only, never in the results",
+        )
+        check("## Judges" in (tmp / "results-art/summary.md").read_text(), "artifacts: the report lists the judge")
+        check(
+            "**experimental**" in (tmp / "results-art/summary.md").read_text(),
+            "artifacts: an uncalibrated judge is marked experimental",
+        )
+        p = subprocess.run(
+            [PY, "-m", "hbench", "suite", "validate", "--run", "--allow-unsandboxed", "--config", "config-art.json"],
+            cwd=tmp,
+            capture_output=True,
+            text=True,
+        )
+        check(
+            p.returncode == 0 and "examples-artifacts/html-report: ok" in p.stdout,
+            "suite validate --run: the artifacts task fails untouched and passes with its solution",
+        )
+
+        # the agent pastes a configured secret into the artifact: the judge must only see the redacted form
+        judge_log.unlink()
+        run(
+            tmp,
+            "harness_bench.py",
+            "run",
+            "--allow-unsandboxed",
+            config=artifacts_config("art-secret", "artifacts-secret"),
+        )
+        requests = judge_log.read_text()
+        check(
+            "Sales by region" in requests and API_KEY not in requests and "***REDACTED***" in requests,
+            "judge: a secret in the artifact reaches the judge redacted, never as it is",
+        )
+
+        # the agent plants report.html as a symlink to a host file: no grader reads it, the judge never sees it
+        judge_log.unlink()
+        run(
+            tmp, "harness_bench.py", "run", "--allow-unsandboxed", config=artifacts_config("art-link", "artifacts-link")
+        )
+        trial = artifact_trial("art-link")
+        by_grader = {g["grader"]: g["passed"] for g in trial["graders"]}
+        check(
+            trial["status"] == "failed" and not by_grader["html_check"] and not by_grader["llm_rubric"],
+            "artifacts: a report.html symlinked to a host file fails the graders",
+        )
+        check(
+            not judge_log.exists() or "HOST-SECRET-CONTENT" not in judge_log.read_text(),
+            "judge: the content of a host file behind a planted symlink is never sent",
+        )
+
+        # a judge that echoes a configured key in its reason: the grader log redacts it (the reason is free text)
+        os.environ["FAKE_JUDGE_REASON"] = f"leak {fake_litellm.KEY} and {API_KEY}"
+        run(tmp, "harness_bench.py", "run", "--allow-unsandboxed", config=artifacts_config("art-reason", "artifacts"))
+        del os.environ["FAKE_JUDGE_REASON"]
+        (reason_log,) = (tmp / "results-art-reason/logs").glob("*grader-2-llm_rubric.log")
+        reason_text = reason_log.read_text()
+        check(
+            "***REDACTED***" in reason_text and fake_litellm.KEY not in reason_text and API_KEY not in reason_text,
+            "judge: a key echoed in the judge's reason is redacted in the grader log",
+        )
+
+        # a judge over plain http to a remote host is refused before anything runs
+        remote = artifacts_config(
+            "art-remote", "artifacts", judge=dict(judge_cfg, base_url="http://litellm.example.com")
+        )
+        p = run(tmp, "harness_bench.py", "run", "--allow-unsandboxed", config=remote, expect_ok=False)
+        check(p.returncode != 0 and "judge.base_url" in p.stderr, "judge: plain http to a remote host is refused")
+
         # --- config validation and URL policy
         for bad, why in (
             (dict(fizz, id="/etc"), "absolute task id"),

@@ -350,8 +350,31 @@ class ToolCallsTests(unittest.TestCase):
         loaded = TrialResult.from_dict(d)
         self.assertEqual((loaded.usage.tool_calls, loaded.schema_version), (None, "1.0.0"))
 
-    def test_the_current_contract_version_is_1_1_0(self) -> None:
-        self.assertEqual((SCHEMA_VERSION, trial().schema_version), ("1.1.0", "1.1.0"))
+    def test_the_current_contract_version_is_1_2_0(self) -> None:
+        self.assertEqual((SCHEMA_VERSION, trial().schema_version), ("1.2.0", "1.2.0"))
+
+
+class JudgeFieldTests(unittest.TestCase):
+    def test_a_grader_result_has_no_judge_by_default_and_the_judge_round_trips(self) -> None:
+        plain = GraderResult(grader="g", grader_version="1", passed=True)
+        judged = GraderResult(grader="llm_rubric:q", grader_version="2", passed=True, score=0.8, judge="gpt-x")
+        self.assertIsNone(plain.judge)
+        self.assertEqual(GraderResult.from_dict(judged.to_dict()), judged)
+        self.assertEqual(judged.to_dict()["judge"], "gpt-x")
+
+    def test_a_1_1_0_trial_without_judge_still_loads_with_none(self) -> None:
+        d = trial().to_dict()
+        d["schema_version"] = "1.1.0"
+        for grader in d["graders"]:
+            del grader["judge"]
+        loaded = TrialResult.from_dict(d)
+        self.assertEqual((loaded.schema_version, loaded.graders[0].judge), ("1.1.0", None))
+
+    def test_the_judge_must_be_a_string_or_none(self) -> None:
+        bad_judges: list[Any] = [3, True, ["m"]]
+        for bad in bad_judges:
+            with self.assertRaises(ContractError, msg=repr(bad)):
+                GraderResult(grader="g", grader_version="1", passed=True, judge=bad)
 
     def test_tool_calls_must_be_a_whole_number_of_at_least_zero(self) -> None:
         for bad in (-1, 1.5, True, "3"):

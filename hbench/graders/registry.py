@@ -9,12 +9,18 @@ from hbench.graders.command import CommandGrader
 from hbench.graders.compose import check_grade
 from hbench.graders.diff_constraints import DiffConstraintsGrader
 from hbench.graders.hidden_tests import HiddenTestsGrader
+from hbench.graders.html_check import HtmlCheckGrader
+from hbench.graders.llm_rubric import LlmRubricGrader
+from hbench.graders.structured_output import StructuredOutputGrader
 from hbench.plugins import GRADER_GROUP, create_plugin
 
 GRADERS: Mapping[str, Callable[[Mapping[str, Any]], Grader]] = {
     "hidden_tests": HiddenTestsGrader,
     "command": CommandGrader,
     "diff_constraints": DiffConstraintsGrader,
+    "html_check": HtmlCheckGrader,
+    "llm_rubric": LlmRubricGrader,
+    "structured_output": StructuredOutputGrader,
 }
 
 

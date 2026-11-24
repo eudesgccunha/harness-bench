@@ -1,6 +1,7 @@
 """Tests for LiteLLM access, `reconcile` and the LiteLLM-only wrapper, against a local scripted server."""
 
 import json
+import os
 import shutil
 import sys
 import threading
@@ -64,6 +65,9 @@ class ServerTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.server = ScriptedServer()
         self.addCleanup(self.server.close)
+        env = mock.patch.dict(os.environ, {"HB_TEST_LITELLM_KEY": KEY})
+        env.start()
+        self.addCleanup(env.stop)
 
 
 class LitellmGetTests(ServerTestCase):
@@ -118,7 +122,7 @@ class ReconcileTests(ServerTestCase):
         super().setUp()
         self.base = fixtures.tmpdir(self)
         (self.base / "results").mkdir()
-        self.cfg: dict[str, Any] = {"litellm": {"base_url": self.server.url, "api_key": KEY}}
+        self.cfg: dict[str, Any] = {"litellm": {"base_url": self.server.url, "api_key": "${HB_TEST_LITELLM_KEY}"}}
 
     def reconcile(self) -> str:
         with fixtures.quiet() as out:
@@ -129,6 +133,16 @@ class ReconcileTests(ServerTestCase):
         with self.assertRaises(SystemExit) as cm:
             hb.cmd_reconcile(mock.Mock(), {}, self.base)
         self.assertIn("no 'litellm' section", str(cm.exception.code))
+
+    def test_a_key_written_in_the_config_is_refused_because_it_could_not_be_redacted(self) -> None:
+        for key in (KEY, "", 3, None, "prefix${HB_TEST_LITELLM_KEY}", "${HB_TEST_LITELLM_KEY}x"):
+            self.cfg["litellm"]["api_key"] = key
+            with self.assertRaises(SystemExit, msg=repr(key)) as cm:
+                hb.cmd_reconcile(mock.Mock(), self.cfg, self.base)
+            self.assertIn("litellm.api_key must name an environment variable", str(cm.exception.code))
+            with self.assertRaises(SystemExit, msg=repr(key)) as cm:
+                hb.validate_config(dict(fixtures.fake_config({}), litellm=self.cfg["litellm"]))
+            self.assertIn("litellm.api_key must name an environment variable", str(cm.exception.code))
 
     def test_empty_key_exits(self) -> None:
         self.cfg["litellm"]["api_key"] = "${HB_SURELY_UNSET_VAR}"
@@ -210,7 +224,7 @@ class WrapperMainTests(ServerTestCase):
         self.base = fixtures.tmpdir(self)
         cfg = fixtures.fake_config({})
         cfg["matrix"] = [{"harness": "claude", "model": "fix"}]
-        cfg["litellm"] = {"base_url": self.server.url, "api_key": KEY}
+        cfg["litellm"] = {"base_url": self.server.url, "api_key": "${HB_TEST_LITELLM_KEY}"}
         (self.base / "config.json").write_text(json.dumps(cfg))
         (self.base / "results-litellm").mkdir()
 

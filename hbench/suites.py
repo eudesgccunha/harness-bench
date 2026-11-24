@@ -15,6 +15,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal
 
+from hbench.graders.structured_output import load_schema_file
+
 SUITE_SCHEMA_VERSION = "1.0.0"
 SUITE_FILE = "suite.json"
 
@@ -203,6 +205,22 @@ def _engine_data(suite_dir: Path, entry: Mapping[str, Any], where: str) -> dict[
     return data
 
 
+def _check_schema_files(suite_dir: Path, entry: Mapping[str, Any], where: str) -> None:
+    """A `structured_output` grader may name a schema file: read it now, so a broken one fails `suite validate`
+    and `run` instead of failing every trial at grading."""
+    graders = entry.get("graders")
+    for grader in graders if isinstance(graders, list) else []:
+        if (
+            isinstance(grader, dict)
+            and grader.get("type") == "structured_output"
+            and isinstance(grader.get("schema"), str)
+        ):
+            try:
+                load_schema_file(suite_dir, grader["schema"])
+            except ValueError as e:
+                raise SuiteError(f"{where}: schema file {grader['schema']!r}: {e}") from e
+
+
 def _task(suite_dir: Path, index: int, entry: object) -> SuiteTask:
     where = f"tasks[{index}]"
     if not isinstance(entry, dict):
@@ -215,6 +233,7 @@ def _task(suite_dir: Path, index: int, entry: object) -> SuiteTask:
     for key in _REQUIRED_TASK_KEYS:
         if key not in entry:
             raise SuiteError(f"{where}: missing key {key!r}")
+    _check_schema_files(suite_dir, entry, where)
     solution = None
     if "solution" in entry:
         solution = _suite_directory(suite_dir, entry["solution"], f"{where} key 'solution'")

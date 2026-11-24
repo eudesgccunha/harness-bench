@@ -1,6 +1,6 @@
 """Fake coding-agent CLI for tests. Prints the JSON shape of a real harness.
 
-Usage: fake_agent.py <claude|opencode|pi|codex|cursor> <fix|nofix|hack|probe-hidden|plant-link|hide-git|hide-git-clean|hide-ignore|hide-attr|hide-config>
+Usage: fake_agent.py <claude|opencode|pi|codex|cursor> <fix|nofix|hack|probe-hidden|plant-link|artifacts|artifacts-secret|artifacts-link|hide-git|hide-git-clean|hide-ignore|hide-attr|hide-config>
 "fix" repairs fizzbuzz.py in the cwd. "hack" leaves the bug and tampers with the test
 infrastructure instead (rewrites run_tests.py, adds conftest.py, moves git refs).
 The "hide-*" modes fix the bug and then try to hide a forbidden change from the diff:
@@ -14,6 +14,8 @@ workdir, its parents up to `/` and the roots in $FAKE_SCAN_ROOTS): a file named 
 separated) or a .py file holding the marker that every example hidden test carries. It exits 7 when it finds one.
 "plant-link" fixes the bug and plants `test_hidden.py` as a symlink to $FAKE_CANARY_FILE, as an agent would to
 make the grader overwrite a host file.
+"artifacts" writes `report.html` and `summary.json` from `data.csv` (the examples-artifacts suite); "artifacts-secret"
+also puts $FAKE_API_KEY in the report, and "artifacts-link" plants `report.html` as a symlink to $FAKE_CANARY_FILE.
 Security probes: exits 9 if the LiteLLM spend key or SECRET_CANARY reached the agent,
 prints FAKE_API_KEY to stderr (must be redacted in logs), and records git history depth. When BENCH_TAG is set (and kind is not cursor),
 the tag is appended to $FAKE_TAGS_FILE, which fake_litellm.py serves as spend logs.
@@ -147,6 +149,23 @@ def hide_forbidden_change() -> None:
             f.write("* filter=x diff=x\n")
 
 
+if mode in ("artifacts", "artifacts-secret"):
+    # Turns `data.csv` into the two artifacts of the examples-artifacts suite. `artifacts-secret` also leaks the key
+    # of the agent's environment into the report, as an agent might paste its environment into a document.
+    leak = f"<p>{os.environ.get('FAKE_API_KEY', '')}</p>" if mode == "artifacts-secret" else ""
+    with open("report.html", "w") as f:
+        f.write(
+            "<!doctype html><html><head><meta charset='utf-8'><title>Report</title></head><body>"
+            f"<h1>Sales by region</h1><table><tr><td>north</td><td>10</td></tr><tr><td>south</td><td>20</td></tr>"
+            f"</table>{leak}</body></html>\n"
+        )
+    with open("summary.json", "w") as f:
+        json.dump({"total": 30, "rows": 2, "regions": ["north", "south"]}, f)
+if mode == "artifacts-link":
+    # An agent that plants a symlink where the report goes, to make a grader read a host file and send it to the judge.
+    os.symlink(os.environ["FAKE_CANARY_FILE"], "report.html")
+    with open("summary.json", "w") as f:
+        json.dump({"total": 245, "rows": 3, "regions": ["north", "south", "east"]}, f)
 if mode == "plant-link":
     os.symlink(os.environ["FAKE_CANARY_FILE"], "test_hidden.py")
 if mode.startswith("hide-"):

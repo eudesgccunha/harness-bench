@@ -15,7 +15,7 @@ from enum import Enum, StrEnum
 from types import MappingProxyType, UnionType
 from typing import Any, ClassVar, Self, get_args, get_origin, get_type_hints
 
-SCHEMA_VERSION = "1.1.0"
+SCHEMA_VERSION = "1.2.0"
 _VERSION_RE = re.compile(r"^(\d+)\.\d+\.\d+$")
 _MAJOR = SCHEMA_VERSION.split(".")[0]
 
@@ -220,6 +220,7 @@ class GraderResult(_Model):
     score: float | None = None
     timed_out: bool = False
     details_uri: str | None = None
+    judge: str | None = None  # the model that judged the artifact (llm_rubric); None for every other grader
 
     def __post_init__(self) -> None:
         super().__post_init__()

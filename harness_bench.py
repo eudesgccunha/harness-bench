@@ -21,7 +21,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -36,14 +38,17 @@ if sys.version_info < (3, 12):
 
 from hbench import cli, report  # noqa: E402
 from hbench import runners as _runners  # noqa: E402
+from hbench.calibration import Calibration, read_calibration  # noqa: E402
 from hbench.core.convert import trial_from_row_lenient, trials_from_rows  # noqa: E402
 from hbench.core.ids import new_run_id, sha256_json  # noqa: E402
 from hbench.core.models import GraderResult, RunInfo, Target  # noqa: E402
 from hbench.graders import GRADERS as GRADERS, Change, GradeContext, GradePlan, compose, grade_plan  # noqa: E402
-from hbench.results import RunWriter, apply_gateway_costs  # noqa: E402
+from hbench.results import RunWriter, apply_gateway_costs, read_trials  # noqa: E402
 from hbench.runners import PARSERS as PARSERS, empty_usage as empty_usage, json_lines as json_lines  # noqa: E402
 from hbench.runners import num as num, runner_for  # noqa: E402
-from hbench.graders.base import RunStep  # noqa: E402
+from hbench.graders.base import LogStep, RunStep, discard_log  # noqa: E402
+from hbench.judge import GatewayJudge, Judge, JudgeError  # noqa: E402
+from hbench.plugins import PluginError, redactor_for  # noqa: E402
 from hbench.runners.base import ParseUsage, build_argv  # noqa: E402
 from hbench.safe_copy import safe_copy_into  # noqa: E402
 from hbench.suites import SUITE_ONLY_KEYS, SUITE_PATH_KEYS, Suite, SuiteError, load_suite, suite_tasks  # noqa: E402
@@ -115,7 +120,23 @@ def base_env(cfg: Mapping[str, Any]) -> dict[str, str]:
 
 
 def spend_key_vars(cfg: Mapping[str, Any]) -> set[str]:
-    return env_var_names((cfg.get("litellm") or {}).get("api_key"))
+    """The environment variables that hold a gateway key (LiteLLM spend key, judge key): never given to an agent,
+    always redacted."""
+    judge = cfg.get("judge")
+    judge_key = judge.get("api_key") if isinstance(judge, Mapping) else None
+    return env_var_names((cfg.get("litellm") or {}).get("api_key")) | env_var_names(
+        judge_key if isinstance(judge_key, str) else None
+    )
+
+
+def require_env_ref(value: object, name: str) -> None:
+    """Exits unless `value` is exactly one `${VAR}` reference. A key written into the config is not in the
+    environment, so the redaction of logs and the filter of the agent's environment would never know it."""
+    if not isinstance(value, str) or not re.fullmatch(r"\$\{\w+\}", value):
+        sys.exit(
+            f"{name} must name an environment variable, written exactly ${{VAR}}; "
+            "a key written in the config is never redacted"
+        )
 
 
 def redact(text: str, secrets: Iterable[str]) -> str:
@@ -195,8 +216,71 @@ def valid_task_id(task: Mapping[str, Any]) -> bool:
     return not any(SAFE_NAME.search(part) or part.startswith(".") for part in parts)
 
 
+JUDGE_KEYS = frozenset({"base_url", "api_key", "model", "timeout", "max_artifact_bytes", "calibration", "redactor"})
+JUDGE_TIMEOUT = 120
+JUDGE_MAX_ARTIFACT_BYTES = 200_000
+MAX_JUDGE_REPLY_BYTES = 1_000_000
+MAX_GRADER_LOG_CHARS = 100_000  # one write of a grader log, after redaction
+
+
+def uses_judge(cfg: Mapping[str, Any]) -> bool:
+    """Whether a task of `cfg` has an `llm_rubric` grader, the only reason the engine ever calls the judge."""
+    return any(
+        isinstance(grader, Mapping) and grader.get("type") == "llm_rubric"
+        for task in cfg.get("tasks", [])
+        for grader in (task.get("graders") if isinstance(task.get("graders"), list) else [])
+    )
+
+
+def _judge_text(section: Mapping[str, Any], key: str) -> str:
+    """The required string `judge.<key>` with its `${VAR}` references expanded, which must not be empty."""
+    value = section.get(key)
+    if not isinstance(value, str) or not value:
+        sys.exit(f"judge.{key} must be a non-empty string")
+    expanded = expand_env(value)
+    if not expanded:
+        names = ", ".join(sorted(env_var_names(value))) or "the value"
+        sys.exit(f"judge.{key} is empty: set the environment variable {names}")
+    return expanded
+
+
+def validate_judge(cfg: Mapping[str, Any]) -> None:
+    """`check_judge_section`, but only for a config with an `llm_rubric` task: without one the engine never reads
+    the section."""
+    if uses_judge(cfg):
+        check_judge_section(cfg)
+
+
+def check_judge_section(cfg: Mapping[str, Any]) -> None:
+    """Exits unless the `judge` section of `cfg` is complete and its URL passes the rule of `check_litellm_url`."""
+    section = cfg.get("judge")
+    if not isinstance(section, Mapping):
+        sys.exit(
+            "the config needs a 'judge' object with base_url, api_key and model (llm_rubric and judge calibrate use it)"
+        )
+    unknown = sorted(set(section) - JUDGE_KEYS)
+    if unknown:
+        sys.exit(f"judge: unknown key(s) {', '.join(unknown)}")
+    check_litellm_url(_judge_text(section, "base_url"), "judge.base_url")
+    require_env_ref(section.get("api_key"), "judge.api_key")
+    _judge_text(section, "api_key")
+    if not isinstance(section.get("model"), str) or not section["model"]:
+        sys.exit("judge.model must be a non-empty string")
+    timeout = section.get("timeout", JUDGE_TIMEOUT)
+    if isinstance(timeout, bool) or not isinstance(timeout, int | float) or timeout <= 0:
+        sys.exit(f"judge.timeout must be a number of seconds above 0, got {timeout!r}")
+    limit = section.get("max_artifact_bytes", JUDGE_MAX_ARTIFACT_BYTES)
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        sys.exit(f"judge.max_artifact_bytes must be a whole number above 0, got {limit!r}")
+    for key in ("calibration", "redactor"):
+        if key in section and (not isinstance(section[key], str) or not section[key]):
+            sys.exit(f"judge.{key} must be a non-empty string")
+
+
 def validate_config(cfg: Mapping[str, Any]) -> None:
     check_cost_source(cfg.get("cost_source", "auto"))
+    if cfg.get("litellm"):
+        require_env_ref(cfg["litellm"].get("api_key"), "litellm.api_key")
     report_options(cfg)
     file_names: dict[str, str] = {}
     for task in cfg["tasks"]:
@@ -229,6 +313,7 @@ def validate_config(cfg: Mapping[str, Any]) -> None:
             runner_for(harness)
         except ValueError as e:
             sys.exit(f"harness {name}: {e}")
+    validate_judge(cfg)
     leaked = spend_key_vars(cfg) & (
         set(cfg.get("env_passthrough", []))
         | {v for h in cfg["harnesses"].values() for val in h.get("env", {}).values() for v in env_var_names(val)}
@@ -669,6 +754,27 @@ def step_runner(
     return run_for
 
 
+def grader_logger(logs_dir: Path, tag: str, secrets: Iterable[str]) -> Callable[[str], LogStep]:
+    """`log_for(stem)` for `grade_trial`: a `LogStep` that appends redacted text to `<tag>.<stem>.log` in `logs_dir`.
+    The file starts empty for each trial. This is the only place a judge's `reason` is ever written."""
+    secret_list = list(secrets)
+
+    def log_for(stem: str) -> LogStep:
+        path = logs_dir / f"{tag}.{safe(stem)}.log"
+        path.unlink(missing_ok=True)
+
+        def log(text: str) -> None:
+            clean = redact(text, secret_list)  # redact the whole text first, then cut: no secret is cut in half
+            if len(clean) > MAX_GRADER_LOG_CHARS:
+                clean = clean[:MAX_GRADER_LOG_CHARS] + "\n[log cut]\n"
+            with path.open("a") as f:
+                f.write(clean)
+
+        return log
+
+    return log_for
+
+
 def grade_trial(
     plan: GradePlan,
     task: Mapping[str, Any],
@@ -676,15 +782,26 @@ def grade_trial(
     workdir: Path,
     changes: tuple[Change, ...],
     run_for: Callable[[str], RunStep],
+    judge: Judge | None = None,
+    log_for: Callable[[str], LogStep] | None = None,
 ) -> tuple[bool, list[GraderResult]]:
     """Run the task's graders over the finished workdir and compose them: `(passed, results)`.
 
     `run_for(prefix)` gives a grader its `run`: the engine's `run_step`, with log names starting at `prefix`.
+    `log_for(stem)` gives it a redacted log file (none: the text is dropped) and `judge` the LLM judge of the run.
     A grader that raises fails (only its exception type is printed, since the message may hold agent output)."""
     results = []
     for index, grader in enumerate(plan.graders):
         prefix = "" if grader.name == "hidden_tests" else f"grader-{index}-"
-        ctx = GradeContext(workdir=workdir, task=task, base=base, changes=changes, run=run_for(prefix))
+        ctx = GradeContext(
+            workdir=workdir,
+            task=task,
+            base=base,
+            changes=changes,
+            run=run_for(prefix),
+            log=log_for(f"grader-{index}-{grader.name}") if log_for else discard_log,
+            judge=judge,
+        )
         try:
             results.append(grader.grade(ctx))
         except Exception as e:
@@ -766,7 +883,11 @@ def run_task_attempt(
     rmtree_inside(git_dir, git_root)
     restore_protected(task, workdir, snap)
     rmtree_inside(snap, work_root)
-    passed, _ = grade_trial(grade_plan(task), task, base, workdir, changes, run_for)
+    with_task = {**cfg, "tasks": [task]}
+    judge = make_judge(with_task, secrets, load_redactor(cfg["judge"]) if uses_judge(with_task) else None)
+    passed, _ = grade_trial(
+        grade_plan(task), task, base, workdir, changes, run_for, judge, grader_logger(logs_dir, tag, secrets)
+    )
     rmtree_inside(workdir, work_root)
     return passed
 
@@ -838,6 +959,7 @@ def _run_matrix(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path, gi
         print(f"work dir: {work_root}")
     secrets_all = [os.environ.get(v, "") for v in spend_key_vars(cfg)]
     plans = {task["id"]: grade_plan(task) for task in cfg["tasks"]}
+    redactor = load_redactor(cfg["judge"]) if uses_judge(cfg) else None
     writer = None if args.dry_run else RunWriter(out_dir, make_run_info(cfg, args.only, sandboxed))
 
     for pair in cfg["matrix"]:
@@ -919,7 +1041,17 @@ def _run_matrix(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path, gi
 
                 run_for = step_runner(cfg, logs_dir, tag, workdir, env_file, secrets, cmd_env)
 
-                passed, grader_results = grade_trial(plans[task["id"]], task, base, workdir, changes, run_for)
+                judge = make_judge(cfg, secrets, redactor)
+                passed, grader_results = grade_trial(
+                    plans[task["id"]],
+                    task,
+                    base,
+                    workdir,
+                    changes,
+                    run_for,
+                    judge,
+                    grader_logger(logs_dir, tag, secrets),
+                )
                 test_to = any(r.timed_out for r in grader_results)
 
                 row = {
@@ -987,11 +1119,12 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def check_litellm_url(base_url: str) -> None:
+def check_litellm_url(base_url: str, name: str = "litellm.base_url") -> None:
+    """Exits unless `base_url` is https, or http to localhost. `name` is the setting shown in the message."""
     u = urllib.parse.urlparse(base_url)
     if u.scheme == "https" or (u.scheme == "http" and u.hostname in LOCAL_HOSTS):
         return
-    sys.exit(f"litellm.base_url must use https (http only for localhost): {base_url}")
+    sys.exit(f"{name} must use https (http only for localhost): {base_url}")
 
 
 def litellm_get(base_url: str, key: str, path: str, params: Mapping[str, Any]) -> Any:
@@ -1001,6 +1134,104 @@ def litellm_get(base_url: str, key: str, path: str, params: Mapping[str, Any]) -
     opener = urllib.request.build_opener(_NoRedirect)
     with opener.open(req, timeout=120) as r:
         return json.loads(r.read().decode())
+
+
+def judge_post(url: str, headers: Mapping[str, str], body: bytes, timeout: float) -> bytes:
+    """The one POST of the engine, for the LLM judge: `<judge.base_url>/chat/completions`. It applies the URL rule
+    of `check_litellm_url` and the opener that refuses redirects (the Authorization header must not reach another
+    host), and reads at most `MAX_JUDGE_REPLY_BYTES`. Raises `JudgeError` for a refused URL or an oversized reply;
+    any other failure (HTTP status, timeout, connection) is raised as it is for the judge to wrap."""
+    try:
+        check_litellm_url(url, "judge.base_url")
+    except SystemExit as e:
+        raise JudgeError(str(e.code)) from e
+    request = urllib.request.Request(url, data=body, headers=dict(headers), method="POST")
+    # `timeout` alone limits each socket operation, so a server that drips the status line, the headers or the body
+    # never times out. urllib gives no hook before each operation, so the whole exchange runs in a daemon thread
+    # (it cannot keep the process alive) and the caller waits at most `timeout` for it.
+    outcome: list[bytes | BaseException] = []
+    abandoned = threading.Event()
+
+    def exchange() -> None:
+        try:
+            outcome.append(_judge_exchange(request, timeout, abandoned))
+        except BaseException as e:  # handed to the caller, which re-raises it
+            outcome.append(e)
+
+    worker = threading.Thread(target=exchange, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive() or not outcome:
+        abandoned.set()  # the thread stops at its next read; its sockets time out on their own
+        raise TimeoutError("the judge reply took too long")
+    result = outcome[0]
+    if isinstance(result, BaseException):
+        raise result
+    return result
+
+
+def _judge_exchange(request: urllib.request.Request, timeout: float, abandoned: threading.Event) -> bytes:
+    """Send `request` and read the reply, at most `MAX_JUDGE_REPLY_BYTES`; stops reading once `abandoned` is set."""
+    chunks: list[bytes] = []
+    size = 0
+    try:
+        with urllib.request.build_opener(_NoRedirect).open(request, timeout=timeout) as r:
+            while chunk := r.read1(min(65_536, MAX_JUDGE_REPLY_BYTES + 1 - size)):  # one socket read at a time
+                chunks.append(chunk)
+                size += len(chunk)
+                if size > MAX_JUDGE_REPLY_BYTES:
+                    raise JudgeError("the judge reply is too large")
+                if abandoned.is_set():
+                    raise TimeoutError("the judge reply took too long")
+    except urllib.error.HTTPError as e:
+        e.close()  # an error status holds the socket open until it is closed
+        raise
+    return b"".join(chunks)
+
+
+def load_redactor(judge_cfg: Mapping[str, Any]) -> Callable[[str], str] | None:
+    """The redactor plugin named by `judge.redactor`, or None. Exits with the plugin's message when it fails."""
+    name = judge_cfg.get("redactor")
+    if not name:
+        return None
+    try:
+        return redactor_for(name, judge_cfg)
+    except PluginError as e:
+        sys.exit(f"judge.redactor: {e}")
+
+
+def make_judge(cfg: Mapping[str, Any], secrets: Iterable[str], plugin: Callable[[str], str] | None) -> Judge | None:
+    """The judge of a run, or None when no task uses `llm_rubric`. What it is shown passes through the engine's
+    secret redaction (the same `secrets` as the logs) and then `plugin`, the user's redactor. The judge is cheap: a
+    trial builds its own, because the secrets of an agent's environment differ per harness."""
+    return gateway_judge(cfg["judge"], secrets, plugin) if uses_judge(cfg) else None
+
+
+def gateway_judge(section: Mapping[str, Any], secrets: Iterable[str], plugin: Callable[[str], str] | None) -> Judge:
+    """The judge of a checked `judge` section, with the redaction of `make_judge`."""
+    secret_list = list(secrets)
+
+    def redact_for_judge(text: str) -> str:
+        text = redact(text, secret_list)
+        return plugin(text) if plugin else text
+
+    return GatewayJudge(
+        base_url=expand_env(section["base_url"]),
+        api_key=expand_env(section["api_key"]),
+        model=section["model"],
+        timeout=section.get("timeout", JUDGE_TIMEOUT),
+        max_artifact_bytes=section.get("max_artifact_bytes", JUDGE_MAX_ARTIFACT_BYTES),
+        redact=redact_for_judge,
+        post=judge_post,
+    )
+
+
+def calibration_judge(cfg: Mapping[str, Any]) -> Judge:
+    """The judge for `judge calibrate`: the config must have a valid `judge` section (checked here), whether or not
+    a task uses it. Its redaction covers the same secrets as a run."""
+    check_judge_section(cfg)
+    secrets = [os.environ.get(v, "") for v in spend_key_vars(cfg)]
+    return gateway_judge(cfg["judge"], secrets, load_redactor(cfg["judge"]))
 
 
 def litellm_rows(base_url: str, key: str, start: datetime, end: datetime) -> list[dict[str, Any]]:
@@ -1046,6 +1277,7 @@ def row_tags(r: Mapping[str, Any]) -> list[Any]:
 
 def cmd_reconcile(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path) -> None:
     lcfg = cfg.get("litellm") or sys.exit("config has no 'litellm' section")
+    require_env_ref(lcfg.get("api_key"), "litellm.api_key")
     base_url, key = expand_env(lcfg["base_url"]), expand_env(lcfg["api_key"])
     if not base_url or not key:
         sys.exit("litellm.base_url / litellm.api_key empty (check env vars)")
@@ -1091,6 +1323,20 @@ def aggregate(rows: Iterable[Mapping[str, Any]], cost_source: str) -> list[dict[
     return report.aggregate(trials_from_rows(rows), cost_source)
 
 
+def load_calibration(cfg: Mapping[str, Any], base: Path) -> Calibration | None:
+    """The calibration file named by `judge.calibration` (relative to the config), or None. A file that cannot be
+    read is a warning: the judges are then reported as experimental."""
+    section = cfg.get("judge")
+    path = section.get("calibration") if isinstance(section, Mapping) else None
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        return read_calibration(base / path)
+    except ValueError as e:
+        print(f"warning: {e}; judges are reported as experimental")
+        return None
+
+
 def cmd_report(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path) -> None:
     out_dir = base / cfg.get("output_dir", "results")
     results_path = out_dir / "results.jsonl"
@@ -1124,6 +1370,8 @@ def cmd_report(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path) -> 
         recommend_within_pp=within_pp,
         target_ci_width=target_width,
         suite_kinds=suite_kinds,
+        judged=read_trials(out_dir) if isinstance(cfg.get("judge"), Mapping) else (),
+        calibration=load_calibration(cfg, base),
     )
     (out_dir / "summary.md").write_text(md)
     print("\n" + md)

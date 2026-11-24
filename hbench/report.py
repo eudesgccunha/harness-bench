@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from hbench.calibration import MIN_KAPPA, MIN_LABELS, Calibration, calibration_status
 from hbench.core.models import CostSource, TrialResult
 from hbench.stats import (
     MAX_RUNS,
@@ -405,6 +406,44 @@ def _suite_kind_lines(
     return lines
 
 
+_JUDGE_PREFIX = "llm_rubric:"
+
+
+def _judge_lines(judged: Sequence[TrialResult], calibration: Calibration | None) -> list[str]:
+    """`## Judges`: every rubric version x judge model pair that scored an artifact, calibrated or **experimental**.
+    A pair is calibrated when `calibration` is for that rubric id, version and model, with kappa >= `MIN_KAPPA` on at
+    least `MIN_LABELS` labels. Only results that name both the rubric and the judge count."""
+    pairs = sorted(
+        {
+            (g.grader.removeprefix(_JUDGE_PREFIX), g.grader_version, g.judge)
+            for t in judged
+            for g in t.graders
+            if g.grader.startswith(_JUDGE_PREFIX) and g.judge is not None
+        }
+    )
+    if not pairs:
+        return []
+    lines = [
+        "",
+        "## Judges",
+        "",
+        f"A judge is calibrated when its calibration file matches the rubric version and judge model, with kappa >= "
+        f"{MIN_KAPPA} on at least {MIN_LABELS} human labels. Scores of an **experimental** judge are not validated.",
+        "",
+        "| Rubric | Version | Judge | Status |",
+        "|---|---|---|---|",
+    ]
+    for rubric, version, judge in pairs:
+        reason = calibration_status(calibration, rubric, version, judge)
+        status = (
+            f"calibrated (kappa {calibration.kappa:.2f}, {calibration.n} labels)"
+            if reason is None and calibration
+            else f"**experimental** ({reason})"
+        )
+        lines.append(f"| {rubric} | {version} | {judge} | {status} |")
+    return lines
+
+
 def render_markdown(
     table: Sequence[Mapping[str, Any]],
     trials: Sequence[TrialResult],
@@ -414,8 +453,12 @@ def render_markdown(
     recommend_within_pp: float = 5.0,
     target_ci_width: float = 0.2,
     suite_kinds: Mapping[str, str] | None = None,
+    judged: Sequence[TrialResult] = (),
+    calibration: Calibration | None = None,
 ) -> str:
-    """The summary. `suite_kinds` maps a suite name to its kind and adds the `## By suite kind` section."""
+    """The summary. `suite_kinds` maps a suite name to its kind and adds the `## By suite kind` section. `judged`
+    are the contract trials with grader results (`trials.jsonl`): when one has an `llm_rubric` result, the
+    `## Judges` section lists each rubric x judge pair, checked against `calibration`."""
     lines = [
         f"# Harness x model — {now.strftime('%Y-%m-%d %H:%M')}",
         "",
@@ -441,4 +484,5 @@ def render_markdown(
     lines += _repetitions_lines(table, trials, target_ci_width)
     lines += _per_task_lines(table, trials)
     lines += _suite_kind_lines(table, trials, suite_kinds or {})
+    lines += _judge_lines(judged, calibration)
     return "\n".join(lines) + "\n"

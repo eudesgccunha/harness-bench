@@ -8,7 +8,7 @@ import json
 import os
 import shutil
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime
 from pathlib import Path
 
@@ -56,6 +56,20 @@ class RunWriter:
 
     def _write_info(self) -> None:
         _atomic_write(self.run_dir / "run.json", json.dumps(self.info.to_dict(), indent=2) + "\n")
+
+
+def read_trials(out_dir: Path, warn: Callable[[str], None] = print) -> list[TrialResult]:
+    """Every trial of every run directory in `out_dir`, oldest file name first. A file that is not valid contract
+    data is skipped with a `warn` message."""
+    trials: list[TrialResult] = []
+    for path in sorted(out_dir.glob("*/trials.jsonl")):
+        try:
+            trials += [
+                TrialResult.from_dict(json.loads(line)) for line in path.read_text().splitlines() if line.strip()
+            ]
+        except ValueError as e:  # ContractError and json.JSONDecodeError are both ValueErrors
+            warn(f"warning: {path} skipped, not valid trial data: {e}")
+    return trials
 
 
 def _with_gateway_cost(trial: TrialResult, cost: float) -> TrialResult:

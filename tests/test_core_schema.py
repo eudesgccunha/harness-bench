@@ -8,7 +8,7 @@ from typing import Any
 
 import fixtures  # noqa: F401  (puts the repo root on sys.path)
 from hbench.core import models
-from hbench.core.schema import RUN_SCHEMA, TRIAL_SCHEMA, schema_document, validate
+from hbench.core.schema import RUN_SCHEMA, TRIAL_SCHEMA, check_schema, schema_document, validate
 from test_core_models import run_info, trial
 
 
@@ -89,8 +89,8 @@ class ValidateContractTests(unittest.TestCase):
     def test_schema_document_holds_both_schemas_with_ids(self) -> None:
         doc = schema_document()
         self.assertEqual((doc["trial"], doc["run"]), (TRIAL_SCHEMA, RUN_SCHEMA))
-        self.assertTrue(TRIAL_SCHEMA["$id"].endswith("/trial/1.1.0"))
-        self.assertTrue(RUN_SCHEMA["$id"].endswith("/run/1.1.0"))
+        self.assertTrue(TRIAL_SCHEMA["$id"].endswith("/trial/1.2.0"))
+        self.assertTrue(RUN_SCHEMA["$id"].endswith("/run/1.2.0"))
 
 
 class ValidatorKeywordTests(unittest.TestCase):
@@ -118,6 +118,64 @@ class ValidatorKeywordTests(unittest.TestCase):
     def test_unknown_type_name_raises(self) -> None:
         with self.assertRaises(ValueError):
             validate(1, {"type": "color"})
+
+
+class CheckSchemaTests(unittest.TestCase):
+    def test_a_supported_schema_is_returned_as_it_is(self) -> None:
+        schema = {
+            "$defs": {"n": {"type": ["integer", "null"], "minimum": 0, "maximum": 5}},
+            "type": "object",
+            "properties": {"a": {"$ref": "#/$defs/n"}, "b": {"type": "array", "items": {"enum": [1, 2]}}},
+            "required": ["a"],
+            "additionalProperties": False,
+        }
+        self.assertIs(check_schema(schema), schema)
+        self.assertEqual(check_schema(TRIAL_SCHEMA), TRIAL_SCHEMA)
+
+    def test_every_malformed_or_unsupported_schema_is_refused(self) -> None:
+        cycle = {"$defs": {"a": {"$ref": "#/$defs/b"}, "b": {"$ref": "#/$defs/a"}}, "$ref": "#/$defs/a"}
+        bad_schemas: list[object] = [
+            [],
+            "string",
+            {"pattern": "x"},
+            {"type": 3},
+            {"type": [3]},
+            {"type": "color"},
+            {"required": "a"},
+            {"required": [1]},
+            {"enum": "a"},
+            {"minimum": True},
+            {"maximum": "9"},
+            {"additionalProperties": {"type": "string"}},
+            {"properties": []},
+            {"$defs": 3},
+            {"properties": {"a": []}},
+            {"properties": {"a": {"format": "uri"}}},
+            {"items": 3},
+            {"items": {"minLength": 1}},
+            {"$ref": 3},
+            {"$ref": "#/$defs/missing"},
+            {"$ref": "http://elsewhere/x"},
+            {"$defs": {"a": 3}, "$ref": "#/$defs/a"},
+            {"$defs": {"a": {"$ref": "#/$defs/a"}}, "$ref": "#/$defs/a"},
+            cycle,
+        ]
+        for bad in bad_schemas:
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                check_schema(bad)
+
+    def test_a_ref_below_the_root_needs_the_root_defs(self) -> None:
+        with self.assertRaises(ValueError):
+            check_schema({"properties": {"a": {"$ref": "#/$defs/n"}}})
+
+    def test_a_recursive_schema_through_properties_is_fine(self) -> None:
+        tree = {
+            "$defs": {
+                "node": {"type": "object", "properties": {"kids": {"type": "array", "items": {"$ref": "#/$defs/node"}}}}
+            },
+            "$ref": "#/$defs/node",
+        }
+        self.assertIs(check_schema(tree), tree)
 
 
 def _node(schema: Mapping[str, Any], name: str | None) -> Mapping[str, Any]:

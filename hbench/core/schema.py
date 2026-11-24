@@ -44,6 +44,7 @@ _GRADER_RESULT = _object(
         "score": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "timed_out": _BOOLEAN,
         "details_uri": _NULLABLE_STRING,
+        "judge": _NULLABLE_STRING,
     },
     ["grader", "grader_version", "passed"],
 )
@@ -181,6 +182,68 @@ _TYPE_CHECKS = {
         isinstance(v, int | float) and not isinstance(v, bool) and (isinstance(v, int) or math.isfinite(v))
     ),
 }
+
+
+def check_schema(schema: object) -> Mapping[str, Any]:
+    """`schema` itself, or raises `ValueError` unless it is an object that `validate` supports everywhere: only
+    supported keywords and types, well-formed `properties`, `items`, `required`, `enum`, bounds and `$defs`, every
+    `$ref` resolvable and no `$ref` that only points at itself. A config error found here never reaches a grading
+    run."""
+    if not isinstance(schema, Mapping):
+        raise ValueError("$: a schema must be an object")
+    _check_schema(schema, schema, "$")
+    return schema
+
+
+def _check_schema(node: object, root: object, path: str) -> None:
+    if not isinstance(node, Mapping):
+        raise ValueError(f"{path}: a schema must be an object")
+    unsupported = set(node) - _KEYWORDS
+    if unsupported:
+        raise ValueError(f"{path}: unsupported schema keyword {sorted(unsupported)[0]!r}")
+    if "type" in node:
+        declared = node["type"]
+        if not (
+            isinstance(declared, str) or (isinstance(declared, list) and all(isinstance(t, str) for t in declared))
+        ):
+            raise ValueError(f"{path}: type must be a string or a list of strings")
+        _type_names(node)
+    if "$ref" in node:
+        _check_ref(node, root, path)
+    if "required" in node and not (
+        isinstance(node["required"], list) and all(isinstance(k, str) for k in node["required"])
+    ):
+        raise ValueError(f"{path}: required must be a list of strings")
+    if "enum" in node and not isinstance(node["enum"], list):
+        raise ValueError(f"{path}: enum must be a list")
+    for bound in ("minimum", "maximum"):
+        if bound in node and (isinstance(node[bound], bool) or not isinstance(node[bound], int | float)):
+            raise ValueError(f"{path}: {bound} must be a number")
+    if "additionalProperties" in node and not isinstance(node["additionalProperties"], bool):
+        raise ValueError(f"{path}: additionalProperties must be true or false")
+    for keyword in ("properties", "$defs"):
+        if keyword in node and not isinstance(node[keyword], Mapping):
+            raise ValueError(f"{path}: {keyword} must be an object")
+        for name, child in node.get(keyword, {}).items():
+            _check_schema(child, root, f"{path}.{keyword}.{name}")
+    if "items" in node:
+        _check_schema(node["items"], root, f"{path}.items")
+
+
+def _check_ref(node: Mapping[str, Any], root: object, path: str) -> None:
+    """The `$ref` of `node` must resolve and its chain of bare `$ref`s must end (a cycle would never finish)."""
+    if not isinstance(root, Mapping) or not isinstance(node["$ref"], str):
+        raise ValueError(f"{path}: $ref must be a string pointing into $defs")
+    seen: set[str] = set()
+    current: Mapping[str, Any] = node
+    while "$ref" in current:
+        ref = current["$ref"]
+        if ref in seen:
+            raise ValueError(f"{path}: $ref {ref!r} points back at itself")
+        seen.add(ref)
+        current = _resolve(ref, root)
+        if not isinstance(current, Mapping):
+            raise ValueError(f"{path}: $ref {ref!r} does not point at a schema")
 
 
 def validate(instance: object, schema: Mapping[str, Any]) -> list[str]:

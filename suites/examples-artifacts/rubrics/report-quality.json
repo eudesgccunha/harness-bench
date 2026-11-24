@@ -1,0 +1,6 @@
+{
+  "id": "report-quality",
+  "version": "1.0.0",
+  "criteria": "The artifact is an HTML sales report for three regions: north 120, south 80 and east 45. Give a high score only when all of these hold: it has a clear title; a table lists every region with the right amount; one sentence names the north region as the one with the highest sales; the text is accurate and does not invent numbers or regions. Subtract for missing regions, wrong amounts, a wrong top region or filler text.",
+  "pass_threshold": 0.7
+}

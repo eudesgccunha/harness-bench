@@ -108,3 +108,20 @@ after the agent (before `protected_paths` are restored); `grade_trial` runs the 
 `run_step`, so each grader command gets the env allowlist, `wrap()` and a redacted log. `validate_config`
 resolves every runner and grader type before any agent runs. Coupling 1 (`cmd_run` does everything) is
 reduced: runner and grader are now behind protocols.
+
+## Phase 5: artifact graders and the judge
+
+Decisions: [ADR 0009](adr/0009-artifact-graders-and-judge.md). The engine owns the network the way it owns processes:
+graders never open a socket, they receive a `judge` through `GradeContext`.
+
+| Module | Role |
+|---|---|
+| `hbench/graders/{html_check,structured_output,llm_rubric}.py` | The artifact graders. They write violations and the judge's `reason` through `ctx.log` only. |
+| `hbench/graders/_files.py` | `resolve_artifact`, `artifact_file`, `read_artifact`: a file of the workdir is read only when no part of its path is a symlink, it has one hard link and is a regular file. `asset_root` is where a grader's rubric and schema files live (the suite directory, else the config directory). |
+| `hbench/judge.py` | `Rubric`, `JudgeVerdict`, the `Judge` protocol and `GatewayJudge`, which builds the chat request (fixed system prompt, random delimiters, redaction, size limit) and validates the reply. It takes the engine's `post`, so it opens no socket. |
+| `hbench/calibration.py` | `calibrate`, `cohens_kappa`, labels and calibration files, `calibration_status` (calibrated or the reason it is experimental). |
+| `hbench/core/schema.py` `check_schema` | Checks that a schema uses only the keywords `validate` supports (a config error otherwise). |
+| `harness_bench.py` | `judge_post` (the only `POST`: `check_litellm_url`, `_NoRedirect`, reply size limit), `make_judge` (secret redaction, then the `harness_bench.redactors` plugin), `grader_logger` (redacted grader logs), `validate_judge`. |
+
+`report.py` adds `## Judges` from the trials in `trials.jsonl` and the calibration file named by `judge.calibration`.
+Plan: [`superpowers/plans/2026-11-24-phase-5-artifact-graders.md`](superpowers/plans/2026-11-24-phase-5-artifact-graders.md).

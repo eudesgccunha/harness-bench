@@ -9,8 +9,11 @@ from typing import Any
 
 import fixtures
 from hbench.core.convert import trials_from_rows
+from hbench.calibration import Calibration
+from hbench.core.models import GraderResult
 from hbench.report import aggregate, fmt_int, fmt_money, fmt_tool_calls, render_markdown, write_csv
 from hbench.stats import pass_at_k, pass_hat_k, reps_for_ci_width, wilson_interval
+from test_core_models import trial
 from test_golden import GOLDEN, mask_summary
 
 NOW = datetime(2026, 11, 24, 12, 30)
@@ -177,6 +180,71 @@ def render(trials: list[Any], null: tuple[str, ...] = (), **kwargs: Any) -> str:
     width = kwargs.get("target_ci_width", 0.2)
     table = aggregate(trials, "auto", null_harnesses=null, target_ci_width=width)
     return render_markdown(table, trials, "auto", NOW, **kwargs)
+
+
+def judged(rubric: str = "q", version: str = "2", judge: str | None = "judge-model", grader: str | None = None) -> Any:
+    result = GraderResult(
+        grader=grader or f"llm_rubric:{rubric}", grader_version=version, passed=True, score=0.9, judge=judge
+    )
+    return trial(graders=(GraderResult(grader="html_check", grader_version="1", passed=True), result))
+
+
+def calibration(**overrides: Any) -> Calibration:
+    values: dict[str, Any] = {
+        "rubric_id": "q",
+        "rubric_version": "2",
+        "judge": "judge-model",
+        "n": 25,
+        "mean_absolute_error": 0.1,
+        "agreement": 0.9,
+        "kappa": 0.7,
+    }
+    values.update(overrides)
+    return Calibration(**values)
+
+
+class JudgesSectionTests(unittest.TestCase):
+    def section(self, trials: list[Any], cal: Calibration | None = None) -> str:
+        md = render(trials[:1] or [trial()], judged=trials, calibration=cal)
+        return md.partition("## Judges")[2]
+
+    def test_no_section_without_llm_rubric_results(self) -> None:
+        for judged_trials in ([], [trial()], [judged(grader="llm_rubric")], [judged(judge=None)]):
+            self.assertNotIn("## Judges", render([trial()], judged=judged_trials), judged_trials)
+
+    def test_a_pair_without_calibration_is_experimental(self) -> None:
+        text = self.section([judged()])
+        self.assertIn("| q | 2 | judge-model | **experimental** (no calibration) |", text)
+        self.assertIn("kappa >= 0.6", text)
+
+    def test_a_matching_calibration_makes_the_pair_calibrated(self) -> None:
+        self.assertIn(
+            "| q | 2 | judge-model | calibrated (kappa 0.70, 25 labels) |", self.section([judged()], calibration())
+        )
+
+    def test_a_calibration_that_does_not_fit_leaves_it_experimental_with_the_reason(self) -> None:
+        for cal, word in (
+            (calibration(rubric_version="1"), "another rubric"),
+            (calibration(judge="other"), "another judge"),
+            (calibration(kappa=0.5), "kappa 0.50"),
+            (calibration(n=10), "10 labels"),
+        ):
+            text = self.section([judged()], cal)
+            self.assertIn("**experimental**", text)
+            self.assertIn(word, text)
+
+    def test_every_pair_in_use_is_listed_once_and_sorted(self) -> None:
+        trials = [judged("b"), judged("a"), judged("a"), judged("a", "3"), judged("a", judge="other")]
+        rows = [line for line in self.section(trials).splitlines() if line.startswith("| a") or line.startswith("| b")]
+        self.assertEqual(
+            [row.split(" | ")[:3] for row in rows],
+            [
+                ["| a", "2", "judge-model"],
+                ["| a", "2", "other"],
+                ["| a", "3", "judge-model"],
+                ["| b", "2", "judge-model"],
+            ],
+        )
 
 
 class RenderStatisticsTests(unittest.TestCase):

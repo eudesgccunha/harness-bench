@@ -1,0 +1,24 @@
+{
+  "schema_version": "1.0.0",
+  "name": "examples-artifacts",
+  "version": "1.0.0",
+  "kind": "capability",
+  "description": "One synthetic task written for this repository (MIT) that grades artifacts other than code: an HTML report and a JSON summary built from a small CSV. Graded by html_check, structured_output and an llm_rubric judge, so running it needs a judge section in the config. Stdlib only.",
+  "tasks": [
+    {
+      "id": "html-report",
+      "repo": "html-report/repo",
+      "prompt": "Read README.md and data.csv, then write report.html and summary.json as README.md describes. Do not edit data.csv. Do not ask questions.",
+      "solution": "html-report/solution",
+      "graders": [
+        {"type": "html_check", "file": "report.html", "required": ["h1", "table"]},
+        {"type": "structured_output", "file": "summary.json", "schema": "schemas/summary.schema.json"},
+        {"type": "llm_rubric", "file": "report.html", "rubric": "rubrics/report-quality.json"}
+      ],
+      "grade": {"mode": "all"},
+      "protected_paths": ["data.csv"],
+      "tags": ["html", "json", "report", "judge"],
+      "provenance": {"source": "synthetic", "license": "MIT", "url": null}
+    }
+  ]
+}

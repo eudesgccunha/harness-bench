@@ -15,7 +15,9 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from hbench.calibration import calibrate, calibration_status, read_labels, write_calibration
 from hbench.core.schema import schema_document
+from hbench.judge import JudgeError
 from hbench.profiles import apply_litellm_profile
 from hbench.suites import Suite, SuiteError, load_suite, suite_label, suite_tasks
 
@@ -26,7 +28,8 @@ _DESCRIPTION = (
     "  python3 -m hbench report    --config config.json [--drop-saturated]\n"
     "  python3 -m hbench schema export [--out PATH]       # JSON Schema of trials.jsonl and run.json\n"
     "  python3 -m hbench suite list     [--config C | PATH...]\n"
-    "  python3 -m hbench suite validate [--config C] [--run [--allow-unsandboxed]] [PATH...]\n\n"
+    "  python3 -m hbench suite validate [--config C] [--run [--allow-unsandboxed]] [PATH...]\n"
+    "  python3 -m hbench judge calibrate --config C --labels LABELS.jsonl --out calibration.json\n\n"
     "Add --litellm to run, report or reconcile for the LiteLLM-only benchmark."
 )
 
@@ -105,6 +108,21 @@ def build_parser(epilog: str | None = None) -> argparse.ArgumentParser:
         "--allow-unsandboxed", action="store_true", help="with --run: no sandbox.prefix (only inside a disposable VM)"
     )
     validate.add_argument("paths", nargs="*", metavar="PATH", help="suite directories")
+    judge = sub.add_parser("judge", help="LLM judge tools")
+    judge_sub = judge.add_subparsers(dest="judge_cmd", required=True)
+    calibrate_cmd = judge_sub.add_parser(
+        "calibrate", help="compare the configured judge with human scores (agreement, error, kappa)"
+    )
+    calibrate_cmd.add_argument("--config", required=True, help="config with a 'judge' section")
+    calibrate_cmd.add_argument(
+        "--labels",
+        required=True,
+        help=(
+            "JSONL: artifact, rubric (paths) and human_score. Trusted input: the files it names are read "
+            "and sent to the judge"
+        ),
+    )
+    calibrate_cmd.add_argument("--out", required=True, help="write the calibration result to this file")
     return ap
 
 
@@ -203,6 +221,25 @@ def _suite(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def _judge_calibrate(args: argparse.Namespace) -> None:
+    """`judge calibrate`: judge every label with the configured judge and write the calibration file."""
+    engine = _engine()
+    cfg = json.loads(Path(args.config).resolve().read_text())
+    judge = engine.calibration_judge(cfg)
+    try:
+        result = calibrate(judge, read_labels(Path(args.labels)))
+    except (JudgeError, ValueError) as e:
+        sys.exit(f"judge calibrate: {e}")
+    write_calibration(Path(args.out), result)
+    reason = calibration_status(result, result.rubric_id, result.rubric_version, result.judge)
+    print(
+        f"{result.rubric_id}@{result.rubric_version} judged by {result.judge}: n={result.n} "
+        f"mean absolute error {result.mean_absolute_error:.3f}, agreement {result.agreement:.2f}, "
+        f"kappa {result.kappa:.2f}"
+    )
+    print(f"{'calibrated' if reason is None else f'experimental: {reason}'}; saved {args.out}")
+
+
 def _run_litellm(engine: ModuleType, args: argparse.Namespace, cfg: dict[str, Any], base: Path) -> None:
     """`run` under the LiteLLM profile: report only after reconcile, when the gateway cost exists."""
     engine.cmd_run(args, cfg, base)
@@ -224,6 +261,9 @@ def main(argv: Sequence[str] | None = None, *, epilog: str | None = None) -> Non
         return
     if args.cmd == "suite":
         _suite(parser, args)
+        return
+    if args.cmd == "judge":
+        _judge_calibrate(args)
         return
     engine = _engine()
     cfg_path = Path(args.config).resolve()

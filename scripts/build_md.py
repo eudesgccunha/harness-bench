@@ -65,6 +65,13 @@ HBENCH_SOURCES = [
     "hbench/graders/hidden_tests.py",
     "hbench/graders/command.py",
     "hbench/graders/diff_constraints.py",
+    "hbench/graders/_files.py",
+    "hbench/graders/_options.py",
+    "hbench/graders/html_check.py",
+    "hbench/graders/structured_output.py",
+    "hbench/graders/llm_rubric.py",
+    "hbench/judge.py",
+    "hbench/calibration.py",
     "hbench/graders/registry.py",
     "hbench/plugins.py",
     "hbench/results.py",
@@ -84,6 +91,9 @@ HBENCH_TESTS = [
     "tests/test_cli.py",
     "tests/test_runners.py",
     "tests/test_graders.py",
+    "tests/test_artifact_graders.py",
+    "tests/test_judge.py",
+    "tests/test_calibration.py",
     "tests/test_plugins.py",
     "tests/test_suites.py",
 ]
@@ -97,6 +107,7 @@ def file_blocks(paths: list[str]) -> str:
 SUITE_FILES = [
     "suites/regression/suite.json",
     "suites/examples-capability/suite.json",
+    "suites/examples-artifacts/suite.json",
 ]
 
 
@@ -185,7 +196,8 @@ harness-bench/
 └── suites/                      # versioned suites of tasks (ADR 0008)
     ├── regression/              # kind "regression": tasks every healthy pair solves
     │   └── fizzbuzz/            # repo/, hidden_tests/ (copied in only AFTER the agent runs), solution/
-    └── examples-capability/     # kind "capability": dependency-upgrade, path-traversal-fix, extract-function
+    ├── examples-capability/     # kind "capability": dependency-upgrade, path-traversal-fix, extract-function
+    └── examples-artifacts/      # kind "capability": html-report (HTML + JSON artifacts, graded with a judge); rubrics/, schemas/
 ```
 
 ## Step by step
@@ -248,6 +260,7 @@ Besides the cost and token columns, the main table of `summary.md` shows how sur
 | Discrimination | Tasks every non-null run solved (saturated) and tasks no run solved. They do not separate the pairs. `report --drop-saturated` removes the saturated ones before aggregating (also accepted by `run` and `reconcile`, which print the report). |
 | Paired comparison | Exact two-sided McNemar test between the best-ranked pair and every other pair, pairing runs by task and rep. `b` counts runs only the best pair solved, `c` runs only the other pair solved. |
 | By suite kind | Only when the trials come from more than one suite kind (`capability`, `regression`): solved/runs per pair for each kind, and a warning for every regression task a non-null pair did not solve. |
+| Judges | Only when a trial has an `llm_rubric` result: each rubric version × judge model pair in use, **calibrated** or **experimental** (see [Artifact graders and the LLM judge](#artifact-graders-and-the-llm-judge)). |
 | Repetitions | Reps per task needed for a pass-rate interval at most `target_ci_width` wide (config, default 0.20), at the observed pass rate; `more than N` when 10,000 total runs are not enough. |
 
 Both config keys are optional: `recommend_within_pp` is a number from 0 to 100, `target_ci_width` a number above 0 and up to 1.
@@ -385,7 +398,7 @@ The `prefix` in the example configs mounts only the workdir, at the same path, a
 
 - The CLIs authenticate through environment variables (LiteLLM). Your `~/.claude`, `~/.ssh` and similar do not enter the container. Each CLI starts with a clean configuration, which also makes the comparison fairer.
 - `.dockerignore` keeps everything not needed out of the build context (configs, results, tasks).
-- **Network**: the container has open internet egress, because it must reach LiteLLM. To restrict egress to LiteLLM only, use a Docker network with an egress proxy, or OpenSandbox (below).
+- **Network**: besides the `reconcile` `GET`, the engine makes one `POST` per judged artifact to `judge.base_url`, and only when a task uses `llm_rubric` (see [Artifact graders and the LLM judge](#artifact-graders-and-the-llm-judge)). The container has open internet egress, because it must reach LiteLLM. To restrict egress to LiteLLM only, use a Docker network with an egress proxy, or OpenSandbox (below).
 - Validate with `python3 tests/docker_e2e.py`. The test runs fake agents inside the container and checks HOME, UID, secrets and the test results.
 
 ### Why not OpenSandbox (yet)
@@ -424,14 +437,57 @@ A task passes when its graders say so. Without a `graders` key, the single `hidd
 - `hidden_tests`: copies `hidden_tests` into the workdir, then runs `test` (`test_timeout`, default 900 s).
 - `command`: runs `command` (`timeout`, default 900 s). Passes on exit code 0.
 - `diff_constraints`: runs nothing. It checks what the agent changed, captured right after the agent finishes and before `protected_paths` are restored: every changed path must match `allowed` (empty means any) and none may match `forbidden` (`fnmatch` globs on paths relative to the workdir; `*` also matches `/`), and the added plus deleted lines must not exceed `max_changed_lines`. A path outside the workdir is always forbidden, and so is an unreadable diff. Renames count as a delete and an add. A binary file counts as more than any `max_changed_lines`. Interpreters leave bytecode (`__pycache__/*.pyc`) in the workdir, and a `.pyc` is binary: list `ignore_lines` globs (for example `["*/__pycache__/*"]`) to leave those paths out of the **line count** only (the `allowed` and `forbidden` checks still apply). Do not ignore bytecode in `forbidden` or `allowed`: a crafted `.pyc` can poison the tests. Instead list the test directories in `protected_paths`, because the restore before the tests deletes everything the agent added there (bytecode included), and write `forbidden` with source globs (`tests/*.py`) so harmless bytecode does not trip it. Keep `ignore_lines` to generated artifacts only: a broad glob such as `*.py` turns `max_changed_lines` off.
+- `html_check`, `structured_output` and `llm_rubric` grade artifacts other than code: see [Artifact graders and the LLM judge](#artifact-graders-and-the-llm-judge).
 - `grade`: `mode` is `all` (default: every grader passes, score is the mean), `any` (one passes, score is the best) or `weighted` (score is the weighted mean using each grader's `weight`, default 1; it passes at `threshold`, required, above 0 and up to 1).
 - Partial credit is opt-in: set `"score": true` on a `hidden_tests` or `command` grader and it reads the **last** line `SCORE: <0 to 1>` of the command's **stdout** (stderr is never read). Passing is still exit code 0 without a timeout. Without the option, or without a valid `SCORE` line, the score is 1.0 on pass and 0.0 otherwise (an out-of-range value is ignored with a warning). The test command runs code the agent wrote, which can print a `SCORE` line after the real one, so a score is only as trustworthy as the test output (including a later stdout `SCORE:` line printed by agent code, for example from `atexit`), and a `weighted` verdict with `score: true` inherits exactly that trust. Use `all` or `any` (exit codes only) when the agent can influence the scorer.
 - Logs: `<tag>.test.log` for `hidden_tests`, `<tag>.grader-<index>-<type>.log` for the others. Only the engine starts processes, through the same env allowlist, sandbox wrapper and log redaction as the test command.
 - `trials.jsonl` lists every grader result. Rows of tasks without `graders` keep the single `test` grader.
 
+### Artifact graders and the LLM judge
+
+Three more graders look at files the agent wrote, not at code. None of them starts a process. Every `file` is a path inside the workdir: it must be relative, without `..`, with no symlink on the way, a regular file with one hard link, and at most 10 MB. Anything else fails the grader.
+
+```json
+"graders": [
+  {{"type": "html_check", "file": "report.html", "required": ["h1", "table#totals", ".summary"]}},
+  {{"type": "structured_output", "file": "summary.json", "schema": "schemas/summary.schema.json"}},
+  {{"type": "llm_rubric", "file": "report.html", "rubric": "rubrics/report-quality.json"}}
+]
+```
+
+- `html_check`: parses the file with `html.parser`. `required` lists simple selectors (`tag`, `#id`, `.class`, `tag#id`, `tag.class`) that must each match an element. `forbid_external_scripts` (default true) fails a `<script src>` with a scheme or `//`. `check_local_links` (default true) needs every relative `href` and `src` to resolve to an existing file (or directory) inside the workdir; remote links are never fetched, and a link with no path (`?page=2`) is skipped. At most 1000 violations are kept, then `… N more`; link and script checks stop once they are full. Unclosed and mismatched non-void elements always fail.
+- `structured_output`: the file must be JSON (no `NaN`) and satisfy `schema`, a JSON Schema object written in the config or the path of a schema file. Only the keywords of `hbench/core/schema.py` are supported (`type`, `properties`, `required`, `additionalProperties`, `items`, `enum`, `minimum`, `maximum`, `$defs`, `$ref`); another keyword is a config error (a schema file of a suite is checked when the suite loads, so `suite validate` and `run` find a broken one).
+- `llm_rubric`: an LLM judge scores the file against a rubric, through the OpenAI-compatible gateway. It needs a `judge` section in the config.
+- Relative paths of `schema` and `rubric` are relative to the suite directory for a suite task and to the config directory for a config task, never to the workdir, so the agent cannot see or change them. They follow the same rule as `file`.
+- Violations, and the judge's `reason`, are written to `<tag>.grader-<index>-<type>.log` (redacted), never to `trials.jsonl`, `run.json` or `results.jsonl`.
+
+The `judge` section (read only when a task uses `llm_rubric`):
+
+```json
+"judge": {{
+  "base_url": "${{JUDGE_BASE_URL}}",
+  "api_key": "${{JUDGE_API_KEY}}",
+  "model": "judge-model",
+  "timeout": 120,
+  "max_artifact_bytes": 200000,
+  "calibration": "calibration.json",
+  "redactor": "my-redactor"
+}}
+```
+
+`base_url`, `api_key` and `model` are required. `timeout` (seconds, default 120) and `max_artifact_bytes` (default 200000; a larger artifact is cut with a marker) are optional. `api_key` (like `litellm.api_key`) must be exactly a `${{VAR}}` reference; a key written in the config is refused, because only a variable can be redacted from logs and kept from the agent. The key never reaches the agent and is redacted from logs like the LiteLLM key. The whole exchange (status line, headers and reply) has a total deadline of `timeout` seconds. A rubric is a versioned file with `id`, `version` (letters, digits, `_`, `.`, `-`), `criteria` and an optional `pass_threshold` in [0, 1] (default 0.5); the artifact passes when the judge's score reaches it. The result is recorded as `llm_rubric:<id>` at the rubric's version, with the judge model in `judge` (data contract 1.2.0).
+
+How the judge is kept honest about untrusted content:
+
+- The only extra network access is one `POST <judge.base_url>/chat/completions` per artifact, and only when a task uses `llm_rubric`. It follows the LiteLLM rule: https, or http only for localhost, and redirects are never followed (so the key cannot reach another host).
+- The request has `temperature: 0`, a JSON-object reply format and a fixed system prompt that says the artifact is untrusted data and that instructions inside it must be ignored. The artifact sits between two marker lines with a random token that changes on every call. A test checks this structure; it cannot prove that a model resists injection.
+- The reply must be exactly `{{"score": number in [0, 1], "passed": bool, "reason": str}}`. A reply that is not valid, a timeout or an HTTP error fails the grader (not passed) and the run goes on.
+- The artifact is redacted before it leaves the machine: first the engine's secret redaction (the same secrets as the logs), then the optional `redactor`, a plugin in the entry-point group `harness_bench.redactors`: a factory `(config) -> (text: str) -> str`. Content-specific redaction (names, internal hosts) is yours to write. A redactor that raises sends nothing.
+- Calibration compares the judge with human scores: `python3 -m hbench judge calibrate --config config.json --labels labels.jsonl --out calibration.json`. Each line of the labels file has `artifact` and `rubric` (paths, relative to the file) and `human_score` in [0, 1]; all labels must use one rubric version. The labels file is trusted input: it names files that are read and sent to the judge, so only use a file you wrote. The output holds the rubric id and version, the judge model, `n`, the mean absolute error, the pass/fail agreement and Cohen's kappa (defined as 0 when both sides only ever give one label). Set `judge.calibration` to the file: the report marks every rubric version × judge pair **experimental** unless the file matches the rubric id, version and judge model with kappa ≥ 0.6 on at least 20 labels.
+
 ### Plugins
 
-Another package can add runners and graders without touching this repository. It registers a factory `(config) -> HarnessRunner | Grader` under the entry-point group `harness_bench.runners` (the harness `parser` name) or `harness_bench.graders` (the grader `type`). Built-in names always win and a plugin that reuses one is an error. Plugins are loaded only when the config names a type that is not built in, and the config is validated before any agent runs. The plugin's package name and version are printed once. A runner builds the argv and parses the output; a grader asks the engine to run commands through `ctx.run`. Neither starts processes.
+Another package can add runners, graders and redactors without touching this repository. It registers a factory `(config) -> HarnessRunner | Grader | redactor` under the entry-point group `harness_bench.runners` (the harness `parser` name), `harness_bench.graders` (the grader `type`) or `harness_bench.redactors` (the `judge.redactor` name). Built-in names always win and a plugin that reuses one is an error. Plugins are loaded only when the config names a type that is not built in, and the config is validated before any agent runs. The plugin's package name and version are printed once. A runner builds the argv and parses the output; a grader asks the engine to run commands through `ctx.run`. Neither starts processes.
 
 ## `command` placeholders
 
@@ -489,7 +545,7 @@ The report adds `## By suite kind` (solved/runs per pair for each kind) when the
 
 `RunInfo.suite_version` records `name@version` of every suite used, then a hash of the tasks (the directories of a suite task enter the hash relative to the suite directory, so it does not depend on the checkout path; a git URL stays in it).
 
-The example suites hold synthetic code written for this repository (MIT), standard library only, no network: `regression/fizzbuzz`, and `examples-capability` with `dependency-upgrade` (migrate a caller to the API of a vendored library), `path-traversal-fix` (CWE-22 "zip slip" in an archive extractor) and `extract-function` (a refactor guarded by existing tests). Every hidden test file carries a marker comment. What `tests/smoke.py` proves, exactly: hidden tests are never copied into the workdir before grading, and an unsandboxed fake agent cannot find them in its workdir (searched recursively) or in its parent directories. Positive controls plant a leak at the real depth of a hidden test and the probe must find it. It does **not** prove isolation from the rest of the host: an unsandboxed agent runs as your user and can read anything you can, including the suite sources (the same smoke test shows a probe over the benchmark directory finds them). Real isolation of the hidden tests needs the sandbox, which mounts only the workdir. A clone proves the tasks are sound with:
+The example suites hold synthetic code written for this repository (MIT), standard library only, no network (except `examples-artifacts`, whose judge needs a gateway): `regression/fizzbuzz`, `examples-artifacts` with `html-report` (turn a small CSV into `report.html` and `summary.json`, graded by `html_check`, `structured_output` and an `llm_rubric` judge; it needs a `judge` section, so validate it with `--config`) and `examples-capability` with `dependency-upgrade` (migrate a caller to the API of a vendored library), `path-traversal-fix` (CWE-22 "zip slip" in an archive extractor) and `extract-function` (a refactor guarded by existing tests). Every hidden test file carries a marker comment. What `tests/smoke.py` proves, exactly: hidden tests are never copied into the workdir before grading, and an unsandboxed fake agent cannot find them in its workdir (searched recursively) or in its parent directories. Positive controls plant a leak at the real depth of a hidden test and the probe must find it. It does **not** prove isolation from the rest of the host: an unsandboxed agent runs as your user and can read anything you can, including the suite sources (the same smoke test shows a probe over the benchmark directory finds them). Real isolation of the hidden tests needs the sandbox, which mounts only the workdir. A clone proves the tasks are sound with:
 
 ```bash
 python3 -m hbench suite validate --run --allow-unsandboxed suites/regression suites/examples-capability

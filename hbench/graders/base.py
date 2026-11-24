@@ -11,11 +11,19 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from hbench.core.models import GraderResult
+from hbench.judge import Judge
 
 # run(command, timeout, log_name) -> (exit code, timed out, stdout, stderr). A score is only ever read from stdout.
 RunStep = Callable[[str, int, str], tuple[int | None, bool, str, str]]
 
+# log(text): append text to the grader's own log file (redacted by the engine). Never part of the results.
+LogStep = Callable[[str], None]
+
 _SCORE_LINE = re.compile(r"SCORE:\s*([0-9.]+)\s*")
+
+
+def discard_log(text: str) -> None:
+    """The default log: the engine gives a grader a real one."""
 
 
 @dataclass(frozen=True)
@@ -30,13 +38,16 @@ class Change:
 @dataclass(frozen=True)
 class GradeContext:
     """Everything a grader may use: the workdir, the task config, the benchmark dir, the agent's changes
-    (captured before protected paths are restored) and the engine's `run`."""
+    (captured before protected paths are restored), the engine's `run` and `log`, and the engine's `judge` (None when
+    the config has no `judge` section). A grader never opens a socket or starts a process itself."""
 
     workdir: Path
     task: Mapping[str, Any]
     base: Path
     changes: tuple[Change, ...]
     run: RunStep
+    log: LogStep = discard_log
+    judge: Judge | None = None
 
 
 @runtime_checkable

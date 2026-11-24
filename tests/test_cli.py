@@ -5,6 +5,7 @@ import copy
 import importlib
 import io
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -137,10 +138,13 @@ class CliDispatchTests(unittest.TestCase):
     def setUp(self) -> None:
         self.server = ScriptedServer()
         self.addCleanup(self.server.close)
+        env = mock.patch.dict(os.environ, {"HB_TEST_LITELLM_KEY": "k-test"})
+        env.start()
+        self.addCleanup(env.stop)
         self.base = fixtures.tmpdir(self)
         shutil.copytree(fixtures.FIZZBUZZ, self.base / "tasks" / "fizzbuzz")
         self.cfg = fixtures.fake_config({})
-        self.cfg["litellm"] = {"base_url": self.server.url, "api_key": "k-test"}
+        self.cfg["litellm"] = {"base_url": self.server.url, "api_key": "${HB_TEST_LITELLM_KEY}"}
         self.cfg_path = self.base / "config.json"
         self.cfg_path.write_text(json.dumps(self.cfg))
         self.server.route("/spend/logs/v2", ok({"data": [], "total_pages": 1}))
