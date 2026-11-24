@@ -161,11 +161,17 @@ class CmdReportTests(unittest.TestCase):
             fixtures.call_quiet(hb.cmd_report, args(), {}, self.base)
         self.assertIn("no results at", str(cm.exception.code))
 
-    def test_empty_results_file_crashes_with_index_error(self) -> None:
-        # CURRENT BEHAVIOR (bug, reported in Phase 0, not fixed): table[0] fails on zero rows.
+    def test_empty_results_file_exits_with_no_results(self) -> None:
         fixtures.write_rows(self.base / "results" / "results.jsonl")
-        with self.assertRaises(IndexError):
+        with self.assertRaises(SystemExit) as cm:
             fixtures.call_quiet(hb.cmd_report, args(), {}, self.base)
+        self.assertIn("no results in", str(cm.exception.code))
+
+    def test_unknown_cost_source_exits_with_a_message_not_a_traceback(self) -> None:
+        fixtures.write_rows(self.base / "results" / "results.jsonl", fixtures.run_row())
+        with self.assertRaises(SystemExit) as cm:
+            fixtures.call_quiet(hb.cmd_report, args(cost_source="bogus"), {}, self.base)
+        self.assertIn("auto, litellm, computed, reported", str(cm.exception.code))
 
     def test_pairs_without_token_data_get_a_warning(self) -> None:
         fixtures.write_rows(self.base / "results" / "results.jsonl", fixtures.run_row(parse_ok=False))

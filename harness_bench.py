@@ -10,11 +10,9 @@ Usage:
   python3 harness_bench.py report --config config.json
 """
 
-import argparse
-import csv
 import json
-import math
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -29,6 +27,14 @@ from pathlib import Path
 
 if sys.version_info < (3, 12):
     sys.exit("Python 3.12+ required")
+
+from hbench import cli, report  # noqa: E402
+from hbench.core.convert import trial_from_row_lenient, trials_from_rows  # noqa: E402
+from hbench.core.ids import new_run_id, sha256_json  # noqa: E402
+from hbench.core.models import RunInfo, Target  # noqa: E402
+from hbench.results import RunWriter, apply_gateway_costs  # noqa: E402
+
+VERSION = "0.0.0"
 
 
 # ---------------------------------------------------------------- helpers
@@ -270,7 +276,13 @@ def redact(text, secrets):
     return text
 
 
+def check_cost_source(name):
+    if name not in report.COST_SOURCES:
+        sys.exit(f"invalid cost_source {name!r}: use one of {', '.join(report.COST_SOURCES)}")
+
+
 def validate_config(cfg):
+    check_cost_source(cfg.get("cost_source", "auto"))
     for task in cfg["tasks"]:
         if SAFE_NAME.search(task["id"]) or task["id"].startswith("."):
             sys.exit(f"invalid task id {task['id']!r}: use only letters, digits, _ . - (no leading dot)")
@@ -337,8 +349,13 @@ def run_proc(argv, cwd, env, timeout):
         return -1, True, out, err
 
 
+def git_bin():
+    """Absolute path of the git executable; exits with a clear message when it is missing."""
+    return shutil.which("git") or sys.exit("git not found on PATH")
+
+
 def git(*args, cwd=None):
-    subprocess.run(["git", *args], cwd=cwd, check=True, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    subprocess.run([git_bin(), *args], cwd=cwd, check=True, stdin=subprocess.DEVNULL, capture_output=True, text=True)
 
 
 def is_git_source(src):
@@ -373,7 +390,7 @@ def make_baseline(workdir):
     git("add", "-A", cwd=workdir)
     git(*ident, "commit", "--quiet", "--allow-empty", "-m", "baseline", cwd=workdir)
     return subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=workdir, capture_output=True, text=True, check=True
+        [git_bin(), "rev-parse", "HEAD"], cwd=workdir, capture_output=True, text=True, check=True
     ).stdout.strip()
 
 
@@ -414,7 +431,7 @@ def save_diff(workdir, baseline, path, limit=2_000_000):
     try:
         git("add", "-A", cwd=workdir)
         p = subprocess.run(
-            ["git", "diff", "--cached", "--stat", "--patch", baseline],
+            [git_bin(), "diff", "--cached", "--stat", "--patch", baseline],
             cwd=workdir,
             capture_output=True,
             text=True,
@@ -452,6 +469,43 @@ def resolve_work_root(cfg, base):
     return Path(tempfile.mkdtemp(prefix="harness-bench-work-"))
 
 
+def run_step(cfg, command, env, timeout, log_path, workdir, env_file, secrets):
+    """Run a setup/test command through the sandbox wrapper, write its redacted log; return (rc, timed_out)."""
+    write_env_file(env, env_file)
+    try:
+        rc, to, out, err = run_proc(wrap(cfg, ["sh", "-c", command], workdir, env_file), workdir, env, timeout)
+    finally:
+        env_file.unlink(missing_ok=True)
+    log_path.write_text(redact(out + "\n--- stderr ---\n" + err, secrets))
+    return rc, to
+
+
+def make_run_info(cfg, only, sandboxed):
+    """Metadata of this `run`. The config hash covers `${VAR}` references, never expanded values."""
+    targets = tuple(
+        Target(
+            harness=pair["harness"],
+            harness_version=cfg["harnesses"][pair["harness"]].get("version", "unknown"),
+            model=pair["model"],
+            params={},
+        )
+        for pair in cfg["matrix"]
+        if not only or pair["harness"] in only
+    )
+    return RunInfo(
+        run_id=new_run_id(),
+        started_at=datetime.now(UTC),
+        finished_at=None,
+        harness_bench_version=VERSION,
+        config_sha256=sha256_json(cfg),
+        suite_version=sha256_json(cfg["tasks"])[:12],
+        python=platform.python_version(),
+        platform=platform.platform(),
+        sandboxed=sandboxed,
+        targets=targets,
+    )
+
+
 def cmd_run(args, cfg, base):
     validate_config(cfg)
     sandboxed = bool((cfg.get("sandbox") or {}).get("prefix"))
@@ -474,6 +528,7 @@ def cmd_run(args, cfg, base):
     if work_root:
         print(f"work dir: {work_root}")
     secrets_all = [os.environ.get(v, "") for v in spend_key_vars(cfg)]
+    writer = None if args.dry_run else RunWriter(out_dir, make_run_info(cfg, args.only, sandboxed))
 
     for pair in cfg["matrix"]:
         hname, model = pair["harness"], pair["model"]
@@ -504,19 +559,17 @@ def cmd_run(args, cfg, base):
                 prepare_workdir(task, base, workdir)
                 env_file = work_root / f".{tag}.env"
 
-                def step(command, env, timeout, log_name):
-                    write_env_file(env, env_file)
-                    try:
-                        rc, to, out, err = run_proc(
-                            wrap(cfg, ["sh", "-c", command], workdir, env_file), workdir, env, timeout
-                        )
-                    finally:
-                        env_file.unlink(missing_ok=True)
-                    (logs_dir / log_name).write_text(redact(out + "\n--- stderr ---\n" + err, secrets))
-                    return rc, to
-
                 if task.get("setup"):
-                    step(task["setup"], cmd_env, task.get("setup_timeout", 900), f"{tag}.setup.log")
+                    run_step(
+                        cfg,
+                        task["setup"],
+                        cmd_env,
+                        task.get("setup_timeout", 900),
+                        logs_dir / f"{tag}.setup.log",
+                        workdir,
+                        env_file,
+                        secrets,
+                    )
                 baseline = make_baseline(workdir)
                 snap = work_root / f".{tag}.protected"
                 if snap.exists():
@@ -550,7 +603,16 @@ def cmd_run(args, cfg, base):
                 if task.get("hidden_tests"):
                     src = (base / task["hidden_tests"]).resolve()
                     shutil.copytree(src, workdir, dirs_exist_ok=True)
-                test_rc, test_to = step(task["test"], cmd_env, task.get("test_timeout", 900), f"{tag}.test.log")
+                test_rc, test_to = run_step(
+                    cfg,
+                    task["test"],
+                    cmd_env,
+                    task.get("test_timeout", 900),
+                    logs_dir / f"{tag}.test.log",
+                    workdir,
+                    env_file,
+                    secrets,
+                )
 
                 row = {
                     "ts": datetime.now(UTC).isoformat(timespec="seconds"),
@@ -570,11 +632,21 @@ def cmd_run(args, cfg, base):
                     **usage,
                     "cost_computed": computed_cost(usage, price) if parse_ok else None,
                 }
+                # Built before the legacy row is written, so a bad row cannot leave the two files out of step.
+                trial = trial_from_row_lenient(
+                    row,
+                    run_id=writer.info.run_id,  # dry runs never reach this point, so the writer exists
+                    suite_version=writer.info.suite_version,
+                    harness_version=h.get("version", "unknown"),
+                    test_timed_out=test_to,
+                    warn=print,
+                )
                 with results_path.open("a") as f:
                     f.write(json.dumps(row) + "\n")
+                writer.append(trial)
+                tokens = sum(usage[k] for k in ("input", "output", "reasoning", "cache_read", "cache_write"))
                 print(
-                    f"done  {tag} passed={row['passed']} tokens="
-                    f"{usage['input'] + usage['output'] + usage['reasoning'] + usage['cache_read'] + usage['cache_write']}"
+                    f"done  {tag} passed={row['passed']} tokens={tokens}"
                     f" cost={row['cost_computed'] if row['cost_computed'] is not None else usage['cost_reported']}",
                     flush=True,
                 )
@@ -582,6 +654,8 @@ def cmd_run(args, cfg, base):
                     rmtree_inside(workdir, work_root)
     if work_root and not args.keep and not cfg.get("work_dir"):
         shutil.rmtree(work_root, ignore_errors=True)
+    if writer:
+        writer.close(datetime.now(UTC))
     if not args.dry_run and not getattr(args, "no_report", False):
         cmd_report(args, cfg, base)
 
@@ -669,16 +743,19 @@ def cmd_reconcile(args, cfg, base):
         for t in row_tags(row):
             by_tag.setdefault(t, []).append(row)
     matched = 0
+    spend_by_tag = {}
     for r in runs:
         hits = by_tag.get(r.get("run_tag"), [])
         if hits:
             matched += 1
             r["cost_litellm"] = sum(num(h, "spend") for h in hits)
+            spend_by_tag[r["run_tag"]] = r["cost_litellm"]
             r["litellm_requests"] = len(hits)
             r["litellm_prompt_tokens"] = sum(num(h, "prompt_tokens") for h in hits)
             r["litellm_completion_tokens"] = sum(num(h, "completion_tokens") for h in hits)
     results_path.write_text("".join(json.dumps(r) + "\n" for r in runs))
     print(f"LiteLLM: {len(logs)} log rows, {matched}/{len(runs)} runs matched by tag")
+    print(f"contract: {apply_gateway_costs(results_path.parent, spend_by_tag)} trials updated")
     if matched < len(tagged):
         print(
             "Unmatched runs: harness did not send x-litellm-tags, run not via LiteLLM "
@@ -690,71 +767,9 @@ def cmd_reconcile(args, cfg, base):
 # ---------------------------------------------------------------- report
 
 
-def fmt_money(v):
-    if v is None:
-        return "n/a"
-    if math.isinf(v):
-        return "inf"
-    return f"${v:.4f}" if v < 1 else f"${v:.2f}"
-
-
-def fmt_int(v):
-    return "n/a" if v is None or math.isinf(v) else f"{v:,.0f}"
-
-
 def aggregate(rows, cost_source):
-    groups = {}
-    for r in rows:
-        groups.setdefault((r["harness"], r["model"]), []).append(r)
-    table = []
-    for (h, m), rs in groups.items():
-        n = len(rs)
-        solved = sum(1 for r in rs if r["passed"])
-        tokens = sum(r["input"] + r["output"] + r.get("reasoning", 0) + r["cache_read"] + r["cache_write"] for r in rs)
-        fresh_in = sum(r["input"] for r in rs)
-        cache_read = sum(r["cache_read"] for r in rs)
-
-        def run_cost(r):
-            if cost_source != "auto":
-                v = r.get(f"cost_{cost_source}")
-                return v, (cost_source if v is not None else None)
-            for src in ("litellm", "computed", "reported"):
-                if r.get(f"cost_{src}") is not None:
-                    return r[f"cost_{src}"], src
-            return None, None
-
-        picked = [run_cost(r) for r in rs]
-        costs = [c for c, _ in picked]
-        cost = None if any(c is None for c in costs) else sum(costs)
-        sources = sorted({src for _, src in picked if src})
-        table.append(
-            {
-                "harness": h,
-                "model": m,
-                "cost_source": "+".join(sources) or "n/a",
-                "runs": n,
-                "solved": solved,
-                "pass_rate": solved / n,
-                "tokens_total": tokens,
-                "tokens_per_run": tokens / n,
-                "tokens_per_solved": tokens / solved if solved else math.inf,
-                "cache_hit": cache_read / (cache_read + fresh_in) if cache_read + fresh_in else 0,
-                "cost_total": cost,
-                "cost_per_run": cost / n if cost is not None else None,
-                "cost_per_solved": (cost / solved if solved else math.inf) if cost is not None else None,
-                "cost_per_1m_tokens": cost / tokens * 1e6 if cost is not None and tokens else None,
-                "avg_turns": sum(r["turns"] for r in rs) / n,
-                "avg_wall_s": sum(r["wall_s"] for r in rs) / n,
-                "parse_failures": sum(1 for r in rs if not r["parse_ok"]),
-            }
-        )
-
-    def sort_key(t):
-        c = t["cost_per_solved"]
-        return (c is None, c if c is not None else 0, -t["pass_rate"])
-
-    table.sort(key=sort_key)
-    return table
+    """Per harness x model entries from legacy rows (the work is done over contract trials)."""
+    return report.aggregate(trials_from_rows(rows), cost_source)
 
 
 def cmd_report(args, cfg, base):
@@ -763,62 +778,14 @@ def cmd_report(args, cfg, base):
     if not results_path.exists():
         sys.exit(f"no results at {results_path}")
     rows = list(json_lines(results_path.read_text()))
+    if not rows:
+        sys.exit(f"no results in {results_path}")
     cost_source = getattr(args, "cost_source", None) or cfg.get("cost_source", "auto")
-    table = aggregate(rows, cost_source)
-
-    with (out_dir / "summary.csv").open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(table[0].keys()))
-        w.writeheader()
-        w.writerows(table)
-
-    head = (
-        "| # | Harness | Model | Solved | Pass rate | Cost/solved | Cost/run "
-        "| Cost/1M tokens | Tokens/solved | Tokens/run | Cache hit | Turns | Time (s) "
-        "| Cost source |"
-    )
-    lines = [
-        f"# Harness x model — {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-        "",
-        f"Cost source: `{cost_source}` (auto = litellm > computed > reported). Sorted by cost per solved task.",
-        "",
-        head,
-        "|" + "---|" * 14,
-    ]
-    for i, t in enumerate(table, 1):
-        lines.append(
-            f"| {i} | {t['harness']} | {t['model']} | {t['solved']}/{t['runs']} "
-            f"| {t['pass_rate']:.0%} | {fmt_money(t['cost_per_solved'])} | {fmt_money(t['cost_per_run'])} "
-            f"| {fmt_money(t['cost_per_1m_tokens'])} | {fmt_int(t['tokens_per_solved'])} "
-            f"| {fmt_int(t['tokens_per_run'])} | {t['cache_hit']:.0%} | {t['avg_turns']:.1f} "
-            f"| {t['avg_wall_s']:.0f} | {t['cost_source']} |"
-        )
-    bad = [t for t in table if t["parse_failures"]]
-    if bad:
-        lines += [
-            "",
-            "**Warning:** no token data from the harness for: "
-            + ", ".join(f"{t['harness']}/{t['model']} ({t['parse_failures']})" for t in bad)
-            + ". See `results/logs/*.agent.jsonl`.",
-        ]
-
-    # per-task pass matrix
-    tasks = sorted({r["task"] for r in rows})
-    pairs = [(t["harness"], t["model"]) for t in table]
-    lines += [
-        "",
-        "## Per task (solved/runs)",
-        "",
-        "| Task | " + " | ".join(f"{h}<br>{m}" for h, m in pairs) + " |",
-        "|---|" + "---|" * len(pairs),
-    ]
-    for task in tasks:
-        cells = []
-        for h, m in pairs:
-            rs = [r for r in rows if r["task"] == task and r["harness"] == h and r["model"] == m]
-            cells.append(f"{sum(r['passed'] for r in rs)}/{len(rs)}" if rs else "-")
-        lines.append(f"| {task} | " + " | ".join(cells) + " |")
-
-    md = "\n".join(lines) + "\n"
+    check_cost_source(cost_source)
+    trials = trials_from_rows(rows, warn=print)
+    table = report.aggregate(trials, cost_source)
+    report.write_csv(table, out_dir / "summary.csv")
+    md = report.render_markdown(table, trials, cost_source, datetime.now())
     (out_dir / "summary.md").write_text(md)
     print("\n" + md)
     print(f"saved {out_dir / 'summary.md'} and {out_dir / 'summary.csv'}")
@@ -828,28 +795,8 @@ def cmd_report(args, cfg, base):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    r = sub.add_parser("run")
-    r.add_argument("--config", required=True)
-    r.add_argument("--reps", type=int)
-    r.add_argument("--only", nargs="*", help="only these harness names")
-    r.add_argument("--keep", action="store_true", help="keep work directories")
-    r.add_argument("--dry-run", action="store_true", help="print commands only")
-    r.add_argument(
-        "--allow-unsandboxed", action="store_true", help="run without sandbox.prefix (only inside a disposable VM)"
-    )
-    p = sub.add_parser("report")
-    p.add_argument("--config", required=True)
-    p.add_argument("--cost-source", choices=["auto", "litellm", "computed", "reported"])
-    c = sub.add_parser("reconcile", help="fetch real spend per run from LiteLLM")
-    c.add_argument("--config", required=True)
-    args = ap.parse_args()
-
-    cfg_path = Path(args.config).resolve()
-    cfg = json.loads(cfg_path.read_text())
-    base = cfg_path.parent
-    {"run": cmd_run, "report": cmd_report, "reconcile": cmd_reconcile}[args.cmd](args, cfg, base)
+    """Entry point: the single CLI in `hbench.cli` (same commands and flags as before)."""
+    cli.main()
 
 
 if __name__ == "__main__":

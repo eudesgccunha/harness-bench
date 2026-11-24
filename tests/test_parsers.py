@@ -1,7 +1,6 @@
 """Unit tests for the output parsers, cost helpers and formatting. In-process, no subprocesses."""
 
 import json
-import math
 import unittest
 from typing import Any
 
@@ -168,16 +167,6 @@ class ComputedCostTests(unittest.TestCase):
 
     def test_explicit_cache_read_price_wins(self) -> None:
         self.assertAlmostEqual(hb.computed_cost(self.USAGE, {"input": 1, "output": 2, "cache_read": 0.5}), 3.5)
-
-
-class FormatTests(unittest.TestCase):
-    def test_money_none_inf_small_and_large(self) -> None:
-        self.assertEqual(
-            [hb.fmt_money(v) for v in (None, math.inf, 0.12345, 12.345)], ["n/a", "inf", "$0.1235", "$12.35"]
-        )
-
-    def test_int_none_inf_and_grouping(self) -> None:
-        self.assertEqual([hb.fmt_int(v) for v in (None, math.inf, 1234567.4)], ["n/a", "n/a", "1,234,567"])
 
 
 class RowTagsTests(unittest.TestCase):

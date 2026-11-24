@@ -240,11 +240,15 @@ Acceptance: green CI and a golden file identical to current behavior.
 
 ### Phase 1 — Data contract and structured output
 
-- [ ] Implement `core/` (section 3).
-- [ ] Write `results/<run_id>/trials.jsonl` + `run.json` (run metadata).
-- [ ] Generate `summary.md` **from** the JSONL (the golden file still matches).
-- [ ] Single CLI, keeping `harness_bench.py` and `harness_bench_litellm.py` as shims.
-- [ ] `harness-bench schema export` writes JSON Schema for data consumers.
+Implementation plan:
+[`superpowers/plans/2026-11-24-phase-1-data-contract.md`](superpowers/plans/2026-11-24-phase-1-data-contract.md).
+Decisions: [ADR 0005](adr/0005-data-contract-and-package.md).
+
+- [x] Implement `core/` (section 3).
+- [x] Write `results/<run_id>/trials.jsonl` + `run.json` (run metadata).
+- [x] Generate `summary.md` **from** the JSONL (the golden file still matches).
+- [x] Single CLI, keeping `harness_bench.py` and `harness_bench_litellm.py` as shims.
+- [x] `harness-bench schema export` writes JSON Schema for data consumers.
 
 Acceptance: same results as before and a JSONL that validates against the schema.
 
@@ -252,10 +256,10 @@ Acceptance: same results as before and a JSONL that validates against the schema
 
 Engine items deliberately left alone in Phase 0 (no behavior change allowed there):
 
-- [ ] `step()` closure in `cmd_run` (ruff B023 ignored) → pass loop values as arguments.
-- [ ] Long lines in `harness_bench.py` (E501 ignored per file) → wrap, then drop the ignore.
-- [ ] `git` is called by name (bandit B607 skipped) → resolve once with `shutil.which`.
-- [ ] `cmd_report` crashes with `IndexError` on an empty `results.jsonl` (pinned by `test_empty_results_file_crashes_with_index_error`) → exit with "no results", update the test.
+- [x] `step()` closure in `cmd_run` (ruff B023 ignored) → pass loop values as arguments.
+- [x] Long lines in `harness_bench.py` (E501 ignored per file) → wrap, then drop the ignore.
+- [x] `git` is called by name (bandit B607 skipped) → resolve once with `shutil.which`.
+- [x] `cmd_report` crashes with `IndexError` on an empty `results.jsonl` (pinned by `test_empty_results_file_crashes_with_index_error`) → exit with "no results", update the test.
 
 ### Phase 2 — Statistics for decisions
 

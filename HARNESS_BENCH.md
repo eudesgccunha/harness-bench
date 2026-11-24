@@ -54,6 +54,7 @@ If a run shows cost `n/a`, its tag did not reach LiteLLM. See the "LiteLLM: what
 harness-bench/
 ├── harness_bench.py
 ├── harness_bench_litellm.py     # LiteLLM-only variant (no Cursor)
+├── hbench/                      # data contract, report and single CLI (ADR 0005)
 ├── README.md / AGENTS.md
 ├── scripts/build_md.py          # generates this HARNESS_BENCH.md
 ├── sandbox/Dockerfile           # sandbox image with the CLIs
@@ -328,11 +329,9 @@ Usage:
   python3 harness_bench.py report --config config.json
 """
 
-import argparse
-import csv
 import json
-import math
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -347,6 +346,14 @@ from pathlib import Path
 
 if sys.version_info < (3, 12):
     sys.exit("Python 3.12+ required")
+
+from hbench import cli, report  # noqa: E402
+from hbench.core.convert import trial_from_row_lenient, trials_from_rows  # noqa: E402
+from hbench.core.ids import new_run_id, sha256_json  # noqa: E402
+from hbench.core.models import RunInfo, Target  # noqa: E402
+from hbench.results import RunWriter, apply_gateway_costs  # noqa: E402
+
+VERSION = "0.0.0"
 
 
 # ---------------------------------------------------------------- helpers
@@ -588,7 +595,13 @@ def redact(text, secrets):
     return text
 
 
+def check_cost_source(name):
+    if name not in report.COST_SOURCES:
+        sys.exit(f"invalid cost_source {name!r}: use one of {', '.join(report.COST_SOURCES)}")
+
+
 def validate_config(cfg):
+    check_cost_source(cfg.get("cost_source", "auto"))
     for task in cfg["tasks"]:
         if SAFE_NAME.search(task["id"]) or task["id"].startswith("."):
             sys.exit(f"invalid task id {task['id']!r}: use only letters, digits, _ . - (no leading dot)")
@@ -655,8 +668,13 @@ def run_proc(argv, cwd, env, timeout):
         return -1, True, out, err
 
 
+def git_bin():
+    """Absolute path of the git executable; exits with a clear message when it is missing."""
+    return shutil.which("git") or sys.exit("git not found on PATH")
+
+
 def git(*args, cwd=None):
-    subprocess.run(["git", *args], cwd=cwd, check=True, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    subprocess.run([git_bin(), *args], cwd=cwd, check=True, stdin=subprocess.DEVNULL, capture_output=True, text=True)
 
 
 def is_git_source(src):
@@ -691,7 +709,7 @@ def make_baseline(workdir):
     git("add", "-A", cwd=workdir)
     git(*ident, "commit", "--quiet", "--allow-empty", "-m", "baseline", cwd=workdir)
     return subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=workdir, capture_output=True, text=True, check=True
+        [git_bin(), "rev-parse", "HEAD"], cwd=workdir, capture_output=True, text=True, check=True
     ).stdout.strip()
 
 
@@ -732,7 +750,7 @@ def save_diff(workdir, baseline, path, limit=2_000_000):
     try:
         git("add", "-A", cwd=workdir)
         p = subprocess.run(
-            ["git", "diff", "--cached", "--stat", "--patch", baseline],
+            [git_bin(), "diff", "--cached", "--stat", "--patch", baseline],
             cwd=workdir,
             capture_output=True,
             text=True,
@@ -770,6 +788,43 @@ def resolve_work_root(cfg, base):
     return Path(tempfile.mkdtemp(prefix="harness-bench-work-"))
 
 
+def run_step(cfg, command, env, timeout, log_path, workdir, env_file, secrets):
+    """Run a setup/test command through the sandbox wrapper, write its redacted log; return (rc, timed_out)."""
+    write_env_file(env, env_file)
+    try:
+        rc, to, out, err = run_proc(wrap(cfg, ["sh", "-c", command], workdir, env_file), workdir, env, timeout)
+    finally:
+        env_file.unlink(missing_ok=True)
+    log_path.write_text(redact(out + "\n--- stderr ---\n" + err, secrets))
+    return rc, to
+
+
+def make_run_info(cfg, only, sandboxed):
+    """Metadata of this `run`. The config hash covers `${VAR}` references, never expanded values."""
+    targets = tuple(
+        Target(
+            harness=pair["harness"],
+            harness_version=cfg["harnesses"][pair["harness"]].get("version", "unknown"),
+            model=pair["model"],
+            params={},
+        )
+        for pair in cfg["matrix"]
+        if not only or pair["harness"] in only
+    )
+    return RunInfo(
+        run_id=new_run_id(),
+        started_at=datetime.now(UTC),
+        finished_at=None,
+        harness_bench_version=VERSION,
+        config_sha256=sha256_json(cfg),
+        suite_version=sha256_json(cfg["tasks"])[:12],
+        python=platform.python_version(),
+        platform=platform.platform(),
+        sandboxed=sandboxed,
+        targets=targets,
+    )
+
+
 def cmd_run(args, cfg, base):
     validate_config(cfg)
     sandboxed = bool((cfg.get("sandbox") or {}).get("prefix"))
@@ -792,6 +847,7 @@ def cmd_run(args, cfg, base):
     if work_root:
         print(f"work dir: {work_root}")
     secrets_all = [os.environ.get(v, "") for v in spend_key_vars(cfg)]
+    writer = None if args.dry_run else RunWriter(out_dir, make_run_info(cfg, args.only, sandboxed))
 
     for pair in cfg["matrix"]:
         hname, model = pair["harness"], pair["model"]
@@ -822,19 +878,17 @@ def cmd_run(args, cfg, base):
                 prepare_workdir(task, base, workdir)
                 env_file = work_root / f".{tag}.env"
 
-                def step(command, env, timeout, log_name):
-                    write_env_file(env, env_file)
-                    try:
-                        rc, to, out, err = run_proc(
-                            wrap(cfg, ["sh", "-c", command], workdir, env_file), workdir, env, timeout
-                        )
-                    finally:
-                        env_file.unlink(missing_ok=True)
-                    (logs_dir / log_name).write_text(redact(out + "\n--- stderr ---\n" + err, secrets))
-                    return rc, to
-
                 if task.get("setup"):
-                    step(task["setup"], cmd_env, task.get("setup_timeout", 900), f"{tag}.setup.log")
+                    run_step(
+                        cfg,
+                        task["setup"],
+                        cmd_env,
+                        task.get("setup_timeout", 900),
+                        logs_dir / f"{tag}.setup.log",
+                        workdir,
+                        env_file,
+                        secrets,
+                    )
                 baseline = make_baseline(workdir)
                 snap = work_root / f".{tag}.protected"
                 if snap.exists():
@@ -868,7 +922,16 @@ def cmd_run(args, cfg, base):
                 if task.get("hidden_tests"):
                     src = (base / task["hidden_tests"]).resolve()
                     shutil.copytree(src, workdir, dirs_exist_ok=True)
-                test_rc, test_to = step(task["test"], cmd_env, task.get("test_timeout", 900), f"{tag}.test.log")
+                test_rc, test_to = run_step(
+                    cfg,
+                    task["test"],
+                    cmd_env,
+                    task.get("test_timeout", 900),
+                    logs_dir / f"{tag}.test.log",
+                    workdir,
+                    env_file,
+                    secrets,
+                )
 
                 row = {
                     "ts": datetime.now(UTC).isoformat(timespec="seconds"),
@@ -888,11 +951,21 @@ def cmd_run(args, cfg, base):
                     **usage,
                     "cost_computed": computed_cost(usage, price) if parse_ok else None,
                 }
+                # Built before the legacy row is written, so a bad row cannot leave the two files out of step.
+                trial = trial_from_row_lenient(
+                    row,
+                    run_id=writer.info.run_id,  # dry runs never reach this point, so the writer exists
+                    suite_version=writer.info.suite_version,
+                    harness_version=h.get("version", "unknown"),
+                    test_timed_out=test_to,
+                    warn=print,
+                )
                 with results_path.open("a") as f:
                     f.write(json.dumps(row) + "\n")
+                writer.append(trial)
+                tokens = sum(usage[k] for k in ("input", "output", "reasoning", "cache_read", "cache_write"))
                 print(
-                    f"done  {tag} passed={row['passed']} tokens="
-                    f"{usage['input'] + usage['output'] + usage['reasoning'] + usage['cache_read'] + usage['cache_write']}"
+                    f"done  {tag} passed={row['passed']} tokens={tokens}"
                     f" cost={row['cost_computed'] if row['cost_computed'] is not None else usage['cost_reported']}",
                     flush=True,
                 )
@@ -900,6 +973,8 @@ def cmd_run(args, cfg, base):
                     rmtree_inside(workdir, work_root)
     if work_root and not args.keep and not cfg.get("work_dir"):
         shutil.rmtree(work_root, ignore_errors=True)
+    if writer:
+        writer.close(datetime.now(UTC))
     if not args.dry_run and not getattr(args, "no_report", False):
         cmd_report(args, cfg, base)
 
@@ -987,16 +1062,19 @@ def cmd_reconcile(args, cfg, base):
         for t in row_tags(row):
             by_tag.setdefault(t, []).append(row)
     matched = 0
+    spend_by_tag = {}
     for r in runs:
         hits = by_tag.get(r.get("run_tag"), [])
         if hits:
             matched += 1
             r["cost_litellm"] = sum(num(h, "spend") for h in hits)
+            spend_by_tag[r["run_tag"]] = r["cost_litellm"]
             r["litellm_requests"] = len(hits)
             r["litellm_prompt_tokens"] = sum(num(h, "prompt_tokens") for h in hits)
             r["litellm_completion_tokens"] = sum(num(h, "completion_tokens") for h in hits)
     results_path.write_text("".join(json.dumps(r) + "\n" for r in runs))
     print(f"LiteLLM: {len(logs)} log rows, {matched}/{len(runs)} runs matched by tag")
+    print(f"contract: {apply_gateway_costs(results_path.parent, spend_by_tag)} trials updated")
     if matched < len(tagged):
         print(
             "Unmatched runs: harness did not send x-litellm-tags, run not via LiteLLM "
@@ -1008,71 +1086,9 @@ def cmd_reconcile(args, cfg, base):
 # ---------------------------------------------------------------- report
 
 
-def fmt_money(v):
-    if v is None:
-        return "n/a"
-    if math.isinf(v):
-        return "inf"
-    return f"${v:.4f}" if v < 1 else f"${v:.2f}"
-
-
-def fmt_int(v):
-    return "n/a" if v is None or math.isinf(v) else f"{v:,.0f}"
-
-
 def aggregate(rows, cost_source):
-    groups = {}
-    for r in rows:
-        groups.setdefault((r["harness"], r["model"]), []).append(r)
-    table = []
-    for (h, m), rs in groups.items():
-        n = len(rs)
-        solved = sum(1 for r in rs if r["passed"])
-        tokens = sum(r["input"] + r["output"] + r.get("reasoning", 0) + r["cache_read"] + r["cache_write"] for r in rs)
-        fresh_in = sum(r["input"] for r in rs)
-        cache_read = sum(r["cache_read"] for r in rs)
-
-        def run_cost(r):
-            if cost_source != "auto":
-                v = r.get(f"cost_{cost_source}")
-                return v, (cost_source if v is not None else None)
-            for src in ("litellm", "computed", "reported"):
-                if r.get(f"cost_{src}") is not None:
-                    return r[f"cost_{src}"], src
-            return None, None
-
-        picked = [run_cost(r) for r in rs]
-        costs = [c for c, _ in picked]
-        cost = None if any(c is None for c in costs) else sum(costs)
-        sources = sorted({src for _, src in picked if src})
-        table.append(
-            {
-                "harness": h,
-                "model": m,
-                "cost_source": "+".join(sources) or "n/a",
-                "runs": n,
-                "solved": solved,
-                "pass_rate": solved / n,
-                "tokens_total": tokens,
-                "tokens_per_run": tokens / n,
-                "tokens_per_solved": tokens / solved if solved else math.inf,
-                "cache_hit": cache_read / (cache_read + fresh_in) if cache_read + fresh_in else 0,
-                "cost_total": cost,
-                "cost_per_run": cost / n if cost is not None else None,
-                "cost_per_solved": (cost / solved if solved else math.inf) if cost is not None else None,
-                "cost_per_1m_tokens": cost / tokens * 1e6 if cost is not None and tokens else None,
-                "avg_turns": sum(r["turns"] for r in rs) / n,
-                "avg_wall_s": sum(r["wall_s"] for r in rs) / n,
-                "parse_failures": sum(1 for r in rs if not r["parse_ok"]),
-            }
-        )
-
-    def sort_key(t):
-        c = t["cost_per_solved"]
-        return (c is None, c if c is not None else 0, -t["pass_rate"])
-
-    table.sort(key=sort_key)
-    return table
+    """Per harness x model entries from legacy rows (the work is done over contract trials)."""
+    return report.aggregate(trials_from_rows(rows), cost_source)
 
 
 def cmd_report(args, cfg, base):
@@ -1081,62 +1097,14 @@ def cmd_report(args, cfg, base):
     if not results_path.exists():
         sys.exit(f"no results at {results_path}")
     rows = list(json_lines(results_path.read_text()))
+    if not rows:
+        sys.exit(f"no results in {results_path}")
     cost_source = getattr(args, "cost_source", None) or cfg.get("cost_source", "auto")
-    table = aggregate(rows, cost_source)
-
-    with (out_dir / "summary.csv").open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(table[0].keys()))
-        w.writeheader()
-        w.writerows(table)
-
-    head = (
-        "| # | Harness | Model | Solved | Pass rate | Cost/solved | Cost/run "
-        "| Cost/1M tokens | Tokens/solved | Tokens/run | Cache hit | Turns | Time (s) "
-        "| Cost source |"
-    )
-    lines = [
-        f"# Harness x model — {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-        "",
-        f"Cost source: `{cost_source}` (auto = litellm > computed > reported). Sorted by cost per solved task.",
-        "",
-        head,
-        "|" + "---|" * 14,
-    ]
-    for i, t in enumerate(table, 1):
-        lines.append(
-            f"| {i} | {t['harness']} | {t['model']} | {t['solved']}/{t['runs']} "
-            f"| {t['pass_rate']:.0%} | {fmt_money(t['cost_per_solved'])} | {fmt_money(t['cost_per_run'])} "
-            f"| {fmt_money(t['cost_per_1m_tokens'])} | {fmt_int(t['tokens_per_solved'])} "
-            f"| {fmt_int(t['tokens_per_run'])} | {t['cache_hit']:.0%} | {t['avg_turns']:.1f} "
-            f"| {t['avg_wall_s']:.0f} | {t['cost_source']} |"
-        )
-    bad = [t for t in table if t["parse_failures"]]
-    if bad:
-        lines += [
-            "",
-            "**Warning:** no token data from the harness for: "
-            + ", ".join(f"{t['harness']}/{t['model']} ({t['parse_failures']})" for t in bad)
-            + ". See `results/logs/*.agent.jsonl`.",
-        ]
-
-    # per-task pass matrix
-    tasks = sorted({r["task"] for r in rows})
-    pairs = [(t["harness"], t["model"]) for t in table]
-    lines += [
-        "",
-        "## Per task (solved/runs)",
-        "",
-        "| Task | " + " | ".join(f"{h}<br>{m}" for h, m in pairs) + " |",
-        "|---|" + "---|" * len(pairs),
-    ]
-    for task in tasks:
-        cells = []
-        for h, m in pairs:
-            rs = [r for r in rows if r["task"] == task and r["harness"] == h and r["model"] == m]
-            cells.append(f"{sum(r['passed'] for r in rs)}/{len(rs)}" if rs else "-")
-        lines.append(f"| {task} | " + " | ".join(cells) + " |")
-
-    md = "\n".join(lines) + "\n"
+    check_cost_source(cost_source)
+    trials = trials_from_rows(rows, warn=print)
+    table = report.aggregate(trials, cost_source)
+    report.write_csv(table, out_dir / "summary.csv")
+    md = report.render_markdown(table, trials, cost_source, datetime.now())
     (out_dir / "summary.md").write_text(md)
     print("\n" + md)
     print(f"saved {out_dir / 'summary.md'} and {out_dir / 'summary.csv'}")
@@ -1146,28 +1114,8 @@ def cmd_report(args, cfg, base):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    r = sub.add_parser("run")
-    r.add_argument("--config", required=True)
-    r.add_argument("--reps", type=int)
-    r.add_argument("--only", nargs="*", help="only these harness names")
-    r.add_argument("--keep", action="store_true", help="keep work directories")
-    r.add_argument("--dry-run", action="store_true", help="print commands only")
-    r.add_argument(
-        "--allow-unsandboxed", action="store_true", help="run without sandbox.prefix (only inside a disposable VM)"
-    )
-    p = sub.add_parser("report")
-    p.add_argument("--config", required=True)
-    p.add_argument("--cost-source", choices=["auto", "litellm", "computed", "reported"])
-    c = sub.add_parser("reconcile", help="fetch real spend per run from LiteLLM")
-    c.add_argument("--config", required=True)
-    args = ap.parse_args()
-
-    cfg_path = Path(args.config).resolve()
-    cfg = json.loads(cfg_path.read_text())
-    base = cfg_path.parent
-    {"run": cmd_run, "report": cmd_report, "reconcile": cmd_reconcile}[args.cmd](args, cfg, base)
+    """Entry point: the single CLI in `hbench.cli` (same commands and flags as before)."""
+    cli.main()
 
 
 if __name__ == "__main__":
@@ -1190,80 +1138,1344 @@ Usage:
   python3 harness_bench_litellm.py run       --config config.litellm.json [--reps 3] [--only pi codex] [--settle 60]
   python3 harness_bench_litellm.py reconcile --config config.litellm.json
   python3 harness_bench_litellm.py report    --config config.litellm.json
+
+This is a shim over `python3 -m hbench <command> --litellm ...`.
 """
 
-import argparse
 import json
 import sys
-import time
 from pathlib import Path
 
 if sys.version_info < (3, 12):
     sys.exit("Python 3.12+ required")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import harness_bench as hb  # noqa: E402
+from hbench import cli  # noqa: E402
+from hbench.profiles import apply_litellm_profile  # noqa: E402
 
-EXCLUDED_PARSERS = {"cursor"}
+LITELLM_COMMANDS = {"run", "report", "reconcile"}
+EPILOG = "The LiteLLM profile is applied automatically to run, report and reconcile (same as passing --litellm)."
 
 
 def load_config(path):
+    """The config with the LiteLLM profile applied, and its directory."""
     cfg_path = Path(path).resolve()
-    cfg = json.loads(cfg_path.read_text())
-    if not cfg.get("litellm"):
-        sys.exit("config needs a 'litellm' section (base_url, api_key)")
-    excluded = {name for name, h in cfg["harnesses"].items() if h.get("parser") in EXCLUDED_PARSERS}
-    cfg["harnesses"] = {k: v for k, v in cfg["harnesses"].items() if k not in excluded}
-    dropped = [m for m in cfg["matrix"] if m["harness"] in excluded]
-    cfg["matrix"] = [m for m in cfg["matrix"] if m["harness"] not in excluded]
-    if dropped:
-        print(f"ignored {len(dropped)} matrix entries for non-LiteLLM harnesses: {sorted(excluded)}")
-    unknown = {m["harness"] for m in cfg["matrix"]} - set(cfg["harnesses"])
-    if unknown:
-        sys.exit(f"matrix uses undefined harnesses: {sorted(unknown)}")
-    cfg.setdefault("output_dir", "results-litellm")
-    cfg["cost_source"] = "litellm"
-    return cfg, cfg_path.parent
+    return apply_litellm_profile(json.loads(cfg_path.read_text())), cfg_path.parent
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    argv = sys.argv[1:]
+    if argv and argv[0] in LITELLM_COMMANDS:
+        argv = [argv[0], "--litellm", *argv[1:]]
+    cli.main(argv, epilog=EPILOG)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+## `hbench/` package
+
+New code lives in the `hbench/` package ([ADR 0005](docs/adr/0005-data-contract-and-package.md)); the two scripts above call into it.
+
+`hbench/__init__.py`:
+
+```python
+"""harness-bench package: versioned data contract, report, and single CLI (ADR 0005)."""
+```
+
+`hbench/core/__init__.py`:
+
+```python
+"""The data contract: models, identifiers, JSON Schema and legacy-row conversion."""
+```
+
+`hbench/core/ids.py`:
+
+```python
+"""Identifiers and content hashes for runs and trials."""
+
+import hashlib
+import json
+import uuid
+
+
+def new_run_id() -> str:
+    """A fresh run identifier: UUID4, 32 lowercase hex characters."""
+    return uuid.uuid4().hex
+
+
+def trial_id(run_id: str, task_id: str, target_id: str, rep: int) -> str:
+    """Deterministic trial identifier: first 16 hex characters of sha256 over the four parts."""
+    key = "|".join((run_id, task_id, target_id, str(rep)))
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+def sha256_json(obj: object) -> str:
+    """sha256 hex of the canonical JSON form (sorted keys, no whitespace)."""
+    canonical = json.dumps(obj, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+```
+
+`hbench/core/models.py`:
+
+```python
+"""Versioned data contract: frozen dataclasses that validate themselves and round-trip through dicts.
+
+`to_dict()` gives a JSON-ready dict (enums as values, datetimes as ISO 8601, tuples as lists).
+`from_dict()` rejects unknown and missing fields and any `schema_version` with another major version.
+Unknown cost is `None`, never 0.
+"""
+
+import dataclasses
+import math
+import re
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, fields
+from datetime import datetime
+from enum import Enum, StrEnum
+from types import MappingProxyType, UnionType
+from typing import Any, ClassVar, Self, get_args, get_origin, get_type_hints
+
+SCHEMA_VERSION = "1.0.0"
+_VERSION_RE = re.compile(r"^(\d+)\.\d+\.\d+$")
+_MAJOR = SCHEMA_VERSION.split(".")[0]
+
+
+class ContractError(ValueError):
+    """Data does not satisfy the contract."""
+
+
+class CostSource(StrEnum):
+    GATEWAY = "gateway"
+    PRICE_TABLE = "price_table"
+    HARNESS = "harness"
+    UNKNOWN = "unknown"
+
+
+class TrialStatus(StrEnum):
+    PASSED = "passed"
+    FAILED = "failed"
+    ERROR = "error"
+    TIMEOUT = "timeout"
+
+
+# ---------------------------------------------------------------- helpers
+
+
+def _plain(value: object) -> Any:
+    """JSON-ready form of a contract value."""
+    if isinstance(value, _Model):
+        return value.to_dict()
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, tuple | list):
+        return [_plain(v) for v in value]
+    if isinstance(value, Mapping):
+        return {k: _plain(v) for k, v in value.items()}
+    return value
+
+
+def _identity(value: Any) -> Any:
+    return value
+
+
+def _parse_datetime(value: Any) -> datetime:
+    if not isinstance(value, str):
+        raise ContractError(f"expected an ISO 8601 string, got {describe_value(value)}")
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError as e:
+        raise ContractError(f"invalid ISO 8601 timestamp ({describe_value(value)})") from e
+
+
+def _optional(decode: Callable[[Any], Any]) -> Callable[[Any], Any]:
+    return lambda value: None if value is None else decode(value)
+
+
+def _tuple_of(decode: Callable[[Any], Any]) -> Callable[[Any], tuple[Any, ...]]:
+    def decode_all(value: Any) -> tuple[Any, ...]:
+        if not isinstance(value, list):
+            raise ContractError(f"expected a list, got {describe_value(value)}")
+        return tuple(decode(v) for v in value)
+
+    return decode_all
+
+
+def _require_aware(name: str, value: datetime) -> None:
+    if value.utcoffset() is None:
+        raise ContractError(f"{name} must be timezone-aware")
+
+
+def _check_schema_version(version: str) -> None:
+    match = _VERSION_RE.match(version)
+    if match is None:
+        raise ContractError(f"invalid schema_version {version!r}")
+    if match.group(1) != _MAJOR:
+        raise ContractError(f"unsupported schema_version {version!r}: this reader understands {_MAJOR}.x.y")
+
+
+def _check_non_negative(name: str, value: float | None) -> None:
+    """Known numbers must be finite and >= 0 (types are checked before, so bool and str never get here)."""
+    if value is not None and not (math.isfinite(value) and value >= 0):
+        raise ContractError(f"{name} must be a finite number >= 0, got {value}")
+
+
+def describe_value(value: object) -> str:
+    """A value for an error message: numbers as they are, anything else (it may be long or hold content) by type."""
+    if isinstance(value, int | float):
+        return repr(value)
+    return f"a {type(value).__name__}"
+
+
+def _matches(value: object, expected: Any) -> bool:
+    """Whether `value` fits the annotation `expected`: the shapes the contract models use, bool never an int."""
+    if expected is type(None):
+        return value is None
+    if expected is bool:
+        return isinstance(value, bool)
+    if expected is int:
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected is float:
+        return isinstance(value, int | float) and not isinstance(value, bool)
+    origin, args = get_origin(expected), get_args(expected)
+    if origin is UnionType:
+        return any(_matches(value, option) for option in args)
+    if origin is tuple:
+        return isinstance(value, tuple) and all(_matches(v, args[0]) for v in value)
+    if origin is Mapping:
+        return isinstance(value, Mapping) and all(
+            _matches(k, args[0]) and _matches(v, args[1]) for k, v in value.items()
+        )
+    return isinstance(value, expected)
+
+
+@dataclass(frozen=True, kw_only=True)
+class _Model:
+    """Base of every contract model: dict conversion and strict field checking."""
+
+    # Keys that `to_dict` adds and `from_dict` accepts but derives again (never stored on the instance).
+    DERIVED_KEYS: ClassVar[tuple[str, ...]] = ()
+    # Per-field decoders applied by `from_dict`; fields not listed are taken as they are.
+    DECODERS: ClassVar[Mapping[str, Callable[[Any], Any]]] = {}
+
+    def __post_init__(self) -> None:
+        """Every field must fit its annotation; models with more checks call this first."""
+        hints = get_type_hints(type(self))
+        for f in fields(self):
+            value = getattr(self, f.name)
+            if not _matches(value, hints[f.name]):
+                raise ContractError(
+                    f"{type(self).__name__}.{f.name}: expected {hints[f.name]}, got {describe_value(value)}"
+                )
+
+    @classmethod
+    def required_keys(cls) -> frozenset[str]:
+        """Keys a serialized form must carry: fields without a default, `schema_version` and derived keys."""
+        plain = {f.name for f in fields(cls) if f.default is dataclasses.MISSING}
+        versioned = {"schema_version"} & {f.name for f in fields(cls)}
+        return frozenset(plain | versioned | set(cls.DERIVED_KEYS))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {f.name: _plain(getattr(self, f.name)) for f in fields(self)}
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, Any]) -> Self:
+        names = {f.name for f in fields(cls)}
+        extra = set(d) - names - set(cls.DERIVED_KEYS)
+        missing = cls.required_keys() - set(d) - set(cls.DERIVED_KEYS)
+        if extra or missing:
+            raise ContractError(f"{cls.__name__}: unknown fields {sorted(extra)}, missing fields {sorted(missing)}")
+        try:
+            obj = cls(**{k: cls.DECODERS.get(k, _identity)(v) for k, v in d.items() if k in names})
+        except ContractError:
+            raise
+        except (ValueError, TypeError) as e:
+            raise ContractError(f"{cls.__name__}: {e}") from e
+        obj._check_derived(d)
+        return obj
+
+    def _check_derived(self, d: Mapping[str, Any]) -> None:
+        """Hook for models with derived keys: the stored values must agree with the recomputed ones."""
+
+
+# ---------------------------------------------------------------- models
+
+
+@dataclass(frozen=True, kw_only=True)
+class Target(_Model):
+    """What is being measured: a harness at a version driving a model with parameters."""
+
+    harness: str
+    harness_version: str
+    model: str
+    params: Mapping[str, str | int | float | bool]
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        # A private read-only copy: the caller's dict cannot change a frozen model afterwards.
+        object.__setattr__(self, "params", MappingProxyType(dict(self.params)))
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        # MappingProxyType cannot be pickled or deep-copied: rebuild from a plain dict instead.
+        return (_make_target, (self.harness, self.harness_version, self.model, dict(self.params)))
+
+    def __hash__(self) -> int:
+        return hash((self.harness, self.harness_version, self.model, tuple(sorted(self.params.items()))))
+
+    @property
+    def target_id(self) -> str:
+        return f"{self.harness}@{self.harness_version}:{self.model}"
+
+
+def _make_target(harness: str, harness_version: str, model: str, params: dict[str, Any]) -> Target:
+    return Target(harness=harness, harness_version=harness_version, model=model, params=params)
+
+
+@dataclass(frozen=True, kw_only=True)
+class GraderResult(_Model):
+    grader: str
+    grader_version: str
+    passed: bool
+    score: float | None = None
+    timed_out: bool = False
+    details_uri: str | None = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.score is not None and not 0 <= self.score <= 1:
+            raise ContractError(f"score must be in [0, 1], got {self.score}")
+
+
+@dataclass(frozen=True, kw_only=True)
+class Costs(_Model):
+    """Every known cost of a trial in USD; `None` means unknown (never 0)."""
+
+    gateway: float | None = None
+    price_table: float | None = None
+    harness: float | None = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        for name in ("gateway", "price_table", "harness"):
+            _check_non_negative(f"cost {name}", getattr(self, name))
+
+    def pick(self, source: CostSource | None = None) -> tuple[float | None, CostSource]:
+        """The cost and its source: the forced `source`, or by order gateway > price_table > harness."""
+        by_source = {
+            CostSource.GATEWAY: self.gateway,
+            CostSource.PRICE_TABLE: self.price_table,
+            CostSource.HARNESS: self.harness,
+        }
+        order = tuple(by_source) if source is None else (source,)
+        for candidate in order:
+            value = by_source.get(candidate)
+            if value is not None:
+                return value, candidate
+        return None, CostSource.UNKNOWN
+
+
+_COUNT_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "turns",
+)
+
+
+@dataclass(frozen=True, kw_only=True)
+class Usage(_Model):
+    input_tokens: int
+    output_tokens: int
+    reasoning_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    turns: int = 0
+    parsed: bool
+    costs: Costs
+
+    DERIVED_KEYS: ClassVar[tuple[str, ...]] = ("cost_usd", "cost_source")
+    DECODERS: ClassVar[Mapping[str, Callable[[Any], Any]]] = {"costs": Costs.from_dict}
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        for name in _COUNT_FIELDS:
+            _check_non_negative(name, getattr(self, name))
+
+    @property
+    def total_tokens(self) -> int:
+        return (
+            self.input_tokens
+            + self.output_tokens
+            + self.reasoning_tokens
+            + self.cache_read_tokens
+            + self.cache_write_tokens
+        )
+
+    @property
+    def cost_usd(self) -> float | None:
+        return self.costs.pick()[0]
+
+    @property
+    def cost_source(self) -> CostSource:
+        return self.costs.pick()[1]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**super().to_dict(), "cost_usd": self.cost_usd, "cost_source": self.cost_source.value}
+
+    def _check_derived(self, d: Mapping[str, Any]) -> None:
+        stored = {k: d[k] for k in self.DERIVED_KEYS if k in d}
+        if stored and stored != {k: v for k, v in self.to_dict().items() if k in stored}:
+            raise ContractError(f"Usage: {stored} disagrees with the costs {self.costs}")
+
+
+@dataclass(frozen=True, kw_only=True)
+class TrialResult(_Model):
+    """One attempt of one task by one target. Holds references only: no prompts, stdout or diffs."""
+
+    schema_version: str = SCHEMA_VERSION
+    run_id: str
+    trial_id: str
+    task_id: str
+    suite_version: str
+    target: Target
+    rep: int
+    status: TrialStatus
+    graders: tuple[GraderResult, ...]
+    usage: Usage
+    latency_s: float
+    started_at: datetime
+    agent_exit_code: int | None
+    sandboxed: bool
+    image_digest: str | None = None
+    trace_id: str | None = None
+    artifact_uri: str | None = None
+
+    DECODERS: ClassVar[Mapping[str, Callable[[Any], Any]]] = {
+        "target": Target.from_dict,
+        "status": TrialStatus,
+        "graders": _tuple_of(GraderResult.from_dict),
+        "usage": Usage.from_dict,
+        "started_at": _parse_datetime,
+    }
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _check_schema_version(self.schema_version)
+        if self.rep < 1:
+            raise ContractError(f"rep must be >= 1, got {self.rep}")
+        _check_non_negative("latency_s", self.latency_s)
+        _require_aware("started_at", self.started_at)
+
+    @property
+    def passed(self) -> bool:
+        return self.status is TrialStatus.PASSED
+
+
+@dataclass(frozen=True, kw_only=True)
+class RunInfo(_Model):
+    """Metadata of one `run` invocation (`run.json`)."""
+
+    schema_version: str = SCHEMA_VERSION
+    run_id: str
+    started_at: datetime
+    finished_at: datetime | None
+    harness_bench_version: str
+    config_sha256: str
+    suite_version: str
+    python: str
+    platform: str
+    sandboxed: bool
+    targets: tuple[Target, ...]
+
+    DECODERS: ClassVar[Mapping[str, Callable[[Any], Any]]] = {
+        "started_at": _parse_datetime,
+        "finished_at": _optional(_parse_datetime),
+        "targets": _tuple_of(Target.from_dict),
+    }
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _check_schema_version(self.schema_version)
+        _require_aware("started_at", self.started_at)
+        if self.finished_at is not None:
+            _require_aware("finished_at", self.finished_at)
+```
+
+`hbench/core/schema.py`:
+
+```python
+"""JSON Schema (draft 2020-12) for `trials.jsonl` lines and `run.json`, plus a small stdlib validator.
+
+The schema is written by hand. `validate` supports only the keywords the schema uses and raises
+`ValueError` on any other, so the schema cannot silently rely on something that is not checked.
+`tests/test_core_schema.py` fails when the schema and the dataclass fields drift apart.
+"""
+
+import math
+from collections.abc import Mapping
+from typing import Any
+
+from hbench.core.models import SCHEMA_VERSION, CostSource, TrialStatus
+
+_ID_BASE = "https://harness-bench.local/schema"
+_DIALECT = "https://json-schema.org/draft/2020-12/schema"
+
+_STRING: dict[str, Any] = {"type": "string"}
+_NULLABLE_STRING: dict[str, Any] = {"type": ["string", "null"]}
+_BOOLEAN: dict[str, Any] = {"type": "boolean"}
+_COUNT: dict[str, Any] = {"type": "integer", "minimum": 0}
+_COST: dict[str, Any] = {"type": ["number", "null"], "minimum": 0}
+
+
+def _object(properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
+    return {"type": "object", "properties": properties, "required": sorted(required), "additionalProperties": False}
+
+
+_TARGET = _object(
+    {
+        "harness": _STRING,
+        "harness_version": _STRING,
+        "model": _STRING,
+        # Free-form map of scalar settings: keys are not known in advance.
+        "params": {"type": "object"},
+    },
+    ["harness", "harness_version", "model", "params"],
+)
+
+_GRADER_RESULT = _object(
+    {
+        "grader": _STRING,
+        "grader_version": _STRING,
+        "passed": _BOOLEAN,
+        "score": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "timed_out": _BOOLEAN,
+        "details_uri": _NULLABLE_STRING,
+    },
+    ["grader", "grader_version", "passed"],
+)
+
+_COSTS = _object({"gateway": _COST, "price_table": _COST, "harness": _COST}, [])
+
+_USAGE = _object(
+    {
+        "input_tokens": _COUNT,
+        "output_tokens": _COUNT,
+        "reasoning_tokens": _COUNT,
+        "cache_read_tokens": _COUNT,
+        "cache_write_tokens": _COUNT,
+        "turns": _COUNT,
+        "parsed": _BOOLEAN,
+        "costs": {"$ref": "#/$defs/costs"},
+        "cost_usd": _COST,
+        "cost_source": {"enum": [s.value for s in CostSource]},
+    },
+    ["input_tokens", "output_tokens", "parsed", "costs", "cost_usd", "cost_source"],
+)
+
+TRIAL_SCHEMA: dict[str, Any] = {
+    "$schema": _DIALECT,
+    "$id": f"{_ID_BASE}/trial/{SCHEMA_VERSION}",
+    "title": "Trial result",
+    "$defs": {"target": _TARGET, "grader_result": _GRADER_RESULT, "costs": _COSTS, "usage": _USAGE},
+    **_object(
+        {
+            "schema_version": _STRING,
+            "run_id": _STRING,
+            "trial_id": _STRING,
+            "task_id": _STRING,
+            "suite_version": _STRING,
+            "target": {"$ref": "#/$defs/target"},
+            "rep": {"type": "integer", "minimum": 1},
+            "status": {"enum": [s.value for s in TrialStatus]},
+            "graders": {"type": "array", "items": {"$ref": "#/$defs/grader_result"}},
+            "usage": {"$ref": "#/$defs/usage"},
+            "latency_s": {"type": "number", "minimum": 0},
+            "started_at": _STRING,
+            "agent_exit_code": {"type": ["integer", "null"]},
+            "sandboxed": _BOOLEAN,
+            "image_digest": _NULLABLE_STRING,
+            "trace_id": _NULLABLE_STRING,
+            "artifact_uri": _NULLABLE_STRING,
+        },
+        [
+            "schema_version",
+            "run_id",
+            "trial_id",
+            "task_id",
+            "suite_version",
+            "target",
+            "rep",
+            "status",
+            "graders",
+            "usage",
+            "latency_s",
+            "started_at",
+            "agent_exit_code",
+            "sandboxed",
+        ],
+    ),
+}
+
+RUN_SCHEMA: dict[str, Any] = {
+    "$schema": _DIALECT,
+    "$id": f"{_ID_BASE}/run/{SCHEMA_VERSION}",
+    "title": "Run info",
+    "$defs": {"target": _TARGET},
+    **_object(
+        {
+            "schema_version": _STRING,
+            "run_id": _STRING,
+            "started_at": _STRING,
+            "finished_at": _NULLABLE_STRING,
+            "harness_bench_version": _STRING,
+            "config_sha256": _STRING,
+            "suite_version": _STRING,
+            "python": _STRING,
+            "platform": _STRING,
+            "sandboxed": _BOOLEAN,
+            "targets": {"type": "array", "items": {"$ref": "#/$defs/target"}},
+        },
+        [
+            "schema_version",
+            "run_id",
+            "started_at",
+            "finished_at",
+            "harness_bench_version",
+            "config_sha256",
+            "suite_version",
+            "python",
+            "platform",
+            "sandboxed",
+            "targets",
+        ],
+    ),
+}
+
+
+def schema_document() -> dict[str, Any]:
+    """Both schemas in one document, as `schema export` prints it."""
+    return {"trial": TRIAL_SCHEMA, "run": RUN_SCHEMA}
+
+
+# ---------------------------------------------------------------- validator
+
+_ANNOTATIONS = {"$schema", "$id", "title", "description"}
+_KEYWORDS = {
+    "type",
+    "properties",
+    "required",
+    "additionalProperties",
+    "items",
+    "enum",
+    "minimum",
+    "maximum",
+    "$defs",
+    "$ref",
+} | _ANNOTATIONS
+
+_TYPE_CHECKS = {
+    "object": lambda v: isinstance(v, dict),
+    "array": lambda v: isinstance(v, list),
+    "string": lambda v: isinstance(v, str),
+    "boolean": lambda v: isinstance(v, bool),
+    "null": lambda v: v is None,
+    # bool is a subclass of int in Python but is not a JSON number.
+    "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+    # JSON has no NaN or Infinity.
+    "number": lambda v: (
+        isinstance(v, int | float) and not isinstance(v, bool) and (isinstance(v, int) or math.isfinite(v))
+    ),
+}
+
+
+def validate(instance: object, schema: Mapping[str, Any]) -> list[str]:
+    """Errors found in `instance` (empty when it conforms), as `"$.path: message"` strings."""
+    errors: list[str] = []
+    _check(instance, schema, schema, "$", errors)
+    return errors
+
+
+def _resolve(ref: str, root: Mapping[str, Any]) -> Mapping[str, Any]:
+    prefix = "#/$defs/"
+    defs: Mapping[str, Any] = root.get("$defs", {})
+    name = ref[len(prefix) :]
+    if not ref.startswith(prefix) or name not in defs:
+        raise ValueError(f"unresolvable $ref {ref!r}")
+    resolved: Mapping[str, Any] = defs[name]
+    return resolved
+
+
+def _type_names(schema: Mapping[str, Any]) -> list[str]:
+    declared = schema["type"]
+    names: list[str] = [declared] if isinstance(declared, str) else list(declared)
+    unknown = [n for n in names if n not in _TYPE_CHECKS]
+    if unknown:
+        raise ValueError(f"unsupported type {unknown[0]!r}")
+    return names
+
+
+def _check(instance: object, schema: Mapping[str, Any], root: Mapping[str, Any], path: str, errors: list[str]) -> None:
+    unsupported = set(schema) - _KEYWORDS
+    if unsupported:
+        raise ValueError(f"unsupported schema keyword {sorted(unsupported)[0]!r}")
+    if "$ref" in schema:
+        _check(instance, _resolve(schema["$ref"], root), root, path, errors)
+        return
+    if "type" in schema:
+        names = _type_names(schema)
+        if not any(_TYPE_CHECKS[n](instance) for n in names):
+            errors.append(f"{path}: expected {' or '.join(names)}")
+            return
+    if "enum" in schema and instance not in schema["enum"]:
+        errors.append(f"{path}: expected one of {schema['enum']}")
+    _check_bounds(instance, schema, path, errors)
+    if isinstance(instance, dict):
+        _check_object(instance, schema, root, path, errors)
+    if isinstance(instance, list) and "items" in schema:
+        for i, item in enumerate(instance):
+            _check(item, schema["items"], root, f"{path}[{i}]", errors)
+
+
+def _check_bounds(instance: object, schema: Mapping[str, Any], path: str, errors: list[str]) -> None:
+    if isinstance(instance, bool) or not isinstance(instance, int | float):
+        return
+    if "minimum" in schema and instance < schema["minimum"]:
+        errors.append(f"{path}: must be >= {schema['minimum']}")
+    if "maximum" in schema and instance > schema["maximum"]:
+        errors.append(f"{path}: must be <= {schema['maximum']}")
+
+
+def _check_object(
+    instance: dict[str, Any], schema: Mapping[str, Any], root: Mapping[str, Any], path: str, errors: list[str]
+) -> None:
+    properties: Mapping[str, Any] = schema.get("properties", {})
+    for key in schema.get("required", []):
+        if key not in instance:
+            errors.append(f"{path}: missing required property {key!r}")
+    for key, value in instance.items():
+        if key in properties:
+            _check(value, properties[key], root, f"{path}.{key}", errors)
+        elif schema.get("additionalProperties") is False:
+            errors.append(f"{path}.{key}: unexpected property")
+```
+
+`hbench/core/convert.py`:
+
+```python
+"""Convert a legacy `results.jsonl` row into a contract `TrialResult`.
+
+The legacy row stays the resume/reconcile record; the contract is derived from it. Rows written before
+Phase 1 lack some keys (`parse_ok`, `sandboxed`, `cost_*`), so every optional key has a documented default.
+"""
+
+import math
+import re
+from collections.abc import Callable, Iterable, Mapping
+from datetime import UTC, datetime
+from typing import Any
+
+from hbench.core.ids import trial_id
+from hbench.core.models import (
+    ContractError,
+    Costs,
+    describe_value,
+    GraderResult,
+    Target,
+    TrialResult,
+    TrialStatus,
+    Usage,
+)
+
+_TAG_RE = re.compile(r"^bench-\d{14}-(.+)$")
+_EPOCH = datetime.fromtimestamp(0, UTC)
+# Run id of trials rebuilt from `results.jsonl` for reporting: they belong to no `run.json`.
+LEGACY_RUN_ID = "legacy"
+_NUMBER_KEYS = ("input", "output", "reasoning", "cache_read", "cache_write", "turns")
+_COST_KEYS = ("cost_litellm", "cost_computed", "cost_reported")
+
+
+def _started_at(row: Mapping[str, Any]) -> datetime:
+    """`ts` (ISO 8601; naive means UTC), else `t_start` (epoch seconds), else the epoch."""
+    try:
+        ts = datetime.fromisoformat(row["ts"])
+        return ts if ts.utcoffset() is not None else ts.replace(tzinfo=UTC)
+    except (KeyError, TypeError, ValueError):
+        pass
+    if isinstance(row.get("t_start"), int | float):
+        return datetime.fromtimestamp(row["t_start"], UTC)
+    return _EPOCH
+
+
+def _status(passed: bool, timed_out: bool) -> TrialStatus:
+    if passed:
+        return TrialStatus.PASSED
+    return TrialStatus.TIMEOUT if timed_out else TrialStatus.FAILED
+
+
+def _count(name: str, value: Any) -> int:
+    """A token or turn count from untrusted parser output: a whole number >= 0 (a float is fine if integral)."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ContractError(f"{name} must be a whole number, got {describe_value(value)}")
+    if isinstance(value, float) and not (math.isfinite(value) and value.is_integer()):
+        raise ContractError(f"{name} must be a whole number, got {value!r}")
+    if value < 0:
+        raise ContractError(f"{name} must be a whole number >= 0, got {value!r}")
+    return int(value)
+
+
+def _artifact_uri(run_tag: str | None) -> str | None:
+    """Log path prefix relative to the output dir (`logs/<tag>`), or None for a tag of another shape."""
+    match = _TAG_RE.match(run_tag or "")
+    return f"logs/{match.group(1)}" if match else None
+
+
+def trial_from_row(
+    row: Mapping[str, Any],
+    *,
+    run_id: str,
+    suite_version: str,
+    harness_version: str = "unknown",
+    test_timed_out: bool = False,
+) -> TrialResult:
+    target = Target(harness=row["harness"], harness_version=harness_version, model=row["model"], params={})
+    passed = bool(row["passed"])
+    usage = Usage(
+        input_tokens=_count("input_tokens", row["input"]),
+        output_tokens=_count("output_tokens", row["output"]),
+        reasoning_tokens=_count("reasoning_tokens", row.get("reasoning", 0)),
+        cache_read_tokens=_count("cache_read_tokens", row["cache_read"]),
+        cache_write_tokens=_count("cache_write_tokens", row["cache_write"]),
+        turns=_count("turns", row["turns"]),
+        parsed=bool(row.get("parse_ok", True)),
+        costs=Costs(
+            gateway=row.get("cost_litellm"), price_table=row.get("cost_computed"), harness=row.get("cost_reported")
+        ),
+    )
+    return TrialResult(
+        run_id=run_id,
+        trial_id=trial_id(run_id, row["task"], target.target_id, row["rep"]),
+        task_id=row["task"],
+        suite_version=suite_version,
+        target=target,
+        rep=row["rep"],
+        status=_status(passed, bool(row.get("agent_timed_out")) or test_timed_out),
+        graders=(GraderResult(grader="test", grader_version="1", passed=passed, timed_out=test_timed_out),),
+        usage=usage,
+        latency_s=row["wall_s"],
+        started_at=_started_at(row),
+        agent_exit_code=row.get("agent_rc"),
+        sandboxed=bool(row.get("sandboxed", False)),
+        trace_id=row.get("run_tag"),
+        artifact_uri=_artifact_uri(row.get("run_tag")),
+    )
+
+
+def _label(row: Mapping[str, Any]) -> str:
+    return str(row.get("run_tag") or f"{row.get('task')}/{row.get('harness')}/{row.get('model')} rep {row.get('rep')}")
+
+
+def _sanitized(row: Mapping[str, Any], warn: Callable[[str], None] | None) -> dict[str, Any]:
+    """A copy of `row` without its bad fields. A bad cost becomes unknown (the other costs are kept); a bad
+    count zeroes all counts, drops the price-table cost computed from them and marks the row as unparsed.
+    Every bad field is reported with `warn`."""
+    clean = dict(row)
+    bad_count = False
+    for key in _NUMBER_KEYS:
+        try:
+            _count(key, row.get(key, 0))
+        except ContractError as e:
+            bad_count = True
+            if warn:
+                warn(f"warning: {_label(row)}: {e}; counts dropped, trial marked as unparsed")
+    if bad_count:
+        clean.update(dict.fromkeys(_NUMBER_KEYS, 0), parse_ok=False)
+        if clean.get("cost_computed") is not None:
+            # The price-table cost was derived from these counts, so it is as wrong as they are.
+            clean["cost_computed"] = None
+            if warn:
+                warn(f"warning: {_label(row)}: price-table cost dropped because the counts are invalid")
+    for key in _COST_KEYS:
+        try:
+            Costs(harness=clean.get(key))
+        except ContractError as e:
+            clean[key] = None
+            if warn:
+                warn(f"warning: {_label(row)}: {key}: {e}; cost treated as unknown")
+    return clean
+
+
+def trial_from_row_lenient(
+    row: Mapping[str, Any],
+    *,
+    run_id: str,
+    suite_version: str,
+    harness_version: str = "unknown",
+    test_timed_out: bool = False,
+    warn: Callable[[str], None] | None = None,
+) -> TrialResult:
+    """Like `trial_from_row`, but fields that break the contract (negative, NaN, bool, fractional: parser output
+    is untrusted) are dropped one by one instead of raising. See `_sanitized`."""
+    kwargs = {"run_id": run_id, "suite_version": suite_version, "harness_version": harness_version}
+    try:
+        return trial_from_row(row, test_timed_out=test_timed_out, **kwargs)
+    except ContractError:
+        return trial_from_row(_sanitized(row, warn), test_timed_out=test_timed_out, **kwargs)
+
+
+def trials_from_rows(rows: Iterable[Mapping[str, Any]], warn: Callable[[str], None] | None = None) -> list[TrialResult]:
+    """Trials for reporting over legacy rows. A hand-written row with rep 0 is read as rep 1."""
+    return [
+        trial_from_row_lenient(
+            {**row, "rep": max(row["rep"], 1)}, run_id=LEGACY_RUN_ID, suite_version="unknown", warn=warn
+        )
+        for row in rows
+    ]
+```
+
+`hbench/results.py`:
+
+```python
+"""Writing the contract output of a run: `<output_dir>/<run_id>/run.json` and `trials.jsonl`.
+
+Files hold references only (log path prefixes), never prompts, agent output or diffs.
+"""
+
+import dataclasses
+import json
+import os
+import shutil
+import tempfile
+from collections.abc import Mapping
+from datetime import datetime
+from pathlib import Path
+
+from hbench.core.models import ContractError, Costs, RunInfo, TrialResult
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Write via a private temp file in the same directory, then replace, so readers never see a partial file.
+
+    The file keeps the permissions of the one it replaces; a new file is 0644 like other result files."""
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        if path.exists():
+            shutil.copymode(path, tmp)
+        else:
+            tmp.chmod(0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+class RunWriter:
+    """Owns one run directory. `run.json` exists from construction; `close` adds the finish time."""
+
+    def __init__(self, out_dir: Path, info: RunInfo) -> None:
+        self.info = info
+        self.run_dir = out_dir / info.run_id
+        self.run_dir.mkdir(parents=True)
+        self.trials_path = self.run_dir / "trials.jsonl"
+        self.trials_path.touch()
+        self._write_info()
+
+    def append(self, trial: TrialResult) -> None:
+        with self.trials_path.open("a") as f:
+            f.write(json.dumps(trial.to_dict()) + "\n")
+            f.flush()
+
+    def close(self, finished_at: datetime) -> None:
+        self.info = dataclasses.replace(self.info, finished_at=finished_at)
+        self._write_info()
+
+    def _write_info(self) -> None:
+        _atomic_write(self.run_dir / "run.json", json.dumps(self.info.to_dict(), indent=2) + "\n")
+
+
+def _with_gateway_cost(trial: TrialResult, cost: float) -> TrialResult:
+    costs = dataclasses.replace(trial.usage.costs, gateway=cost)
+    return dataclasses.replace(trial, usage=dataclasses.replace(trial.usage, costs=costs))
+
+
+def _rewritten(path: Path, costs_by_tag: Mapping[str, float]) -> tuple[list[TrialResult], int]:
+    """The trials of `path` with gateway costs applied, and how many were updated."""
+    trials = [TrialResult.from_dict(json.loads(line)) for line in path.read_text().splitlines() if line.strip()]
+    rewritten, matched = [], 0
+    for trial in trials:
+        cost = costs_by_tag.get(trial.trace_id) if trial.trace_id else None
+        if cost is None:
+            rewritten.append(trial)
+        else:
+            rewritten.append(_with_gateway_cost(trial, cost))
+            matched += 1
+    return rewritten, matched
+
+
+def _valid_costs(costs_by_tag: Mapping[str, float]) -> dict[str, float]:
+    """The spends the contract accepts; a bad one (negative, NaN: it comes from the gateway) is skipped."""
+    valid = {}
+    for tag, cost in costs_by_tag.items():
+        try:
+            Costs(gateway=cost)
+        except ContractError as e:
+            print(f"warning: gateway spend for tag {tag!r} ignored: {e}")
+        else:
+            valid[tag] = cost
+    return valid
+
+
+def apply_gateway_costs(out_dir: Path, costs_by_tag: Mapping[str, float]) -> int:
+    """Set `usage.costs.gateway` on every trial whose `trace_id` is in `costs_by_tag`, in all run dirs.
+
+    Returns the number of trials updated. A file is rewritten only when it has a match. A file that is not valid
+    contract data (corrupt, or written by another tool) is left untouched with a warning."""
+    valid = _valid_costs(costs_by_tag)
+    updated = 0
+    for path in sorted(out_dir.glob("*/trials.jsonl")):
+        try:
+            trials, matched = _rewritten(path, valid)
+        except ValueError as e:  # ContractError and json.JSONDecodeError are both ValueErrors
+            print(f"warning: {path} skipped, not valid trial data: {e}")
+            continue
+        if matched:
+            _atomic_write(path, "".join(json.dumps(t.to_dict()) + "\n" for t in trials))
+            updated += matched
+    return updated
+```
+
+`hbench/report.py`:
+
+```python
+"""Report derived from the contract: aggregate `TrialResult`s per harness x model pair, render Markdown and CSV."""
+
+import csv
+import math
+from collections.abc import Mapping, Sequence
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from hbench.core.models import CostSource, TrialResult
+
+# The report keeps the names used by `cost_source` in configs and CLI flags.
+_SOURCE_BY_NAME: Mapping[str, CostSource | None] = {
+    "auto": None,
+    "litellm": CostSource.GATEWAY,
+    "computed": CostSource.PRICE_TABLE,
+    "reported": CostSource.HARNESS,
+}
+COST_SOURCES = tuple(_SOURCE_BY_NAME)
+_NAME_BY_SOURCE: Mapping[CostSource, str] = {s: n for n, s in _SOURCE_BY_NAME.items() if s is not None}
+
+
+def fmt_money(v: float | None) -> str:
+    if v is None:
+        return "n/a"
+    if math.isinf(v):
+        return "inf"
+    return f"${v:.4f}" if v < 1 else f"${v:.2f}"
+
+
+def fmt_int(v: float | None) -> str:
+    return "n/a" if v is None or math.isinf(v) else f"{v:,.0f}"
+
+
+def _pair_entry(harness: str, model: str, trials: Sequence[TrialResult], source: CostSource | None) -> dict[str, Any]:
+    n = len(trials)
+    solved = sum(1 for t in trials if t.passed)
+    tokens = sum(t.usage.total_tokens for t in trials)
+    fresh_in = sum(t.usage.input_tokens for t in trials)
+    cache_read = sum(t.usage.cache_read_tokens for t in trials)
+    picked = [t.usage.costs.pick(source) for t in trials]
+    costs = [c for c, _ in picked]
+    cost = None if any(c is None for c in costs) else sum(c for c in costs if c is not None)
+    names = sorted({_NAME_BY_SOURCE[s] for c, s in picked if c is not None})
+    return {
+        "harness": harness,
+        "model": model,
+        "cost_source": "+".join(names) or "n/a",
+        "runs": n,
+        "solved": solved,
+        "pass_rate": solved / n,
+        "tokens_total": tokens,
+        "tokens_per_run": tokens / n,
+        "tokens_per_solved": tokens / solved if solved else math.inf,
+        "cache_hit": cache_read / (cache_read + fresh_in) if cache_read + fresh_in else 0,
+        "cost_total": cost,
+        "cost_per_run": cost / n if cost is not None else None,
+        "cost_per_solved": (cost / solved if solved else math.inf) if cost is not None else None,
+        "cost_per_1m_tokens": cost / tokens * 1e6 if cost is not None and tokens else None,
+        "avg_turns": sum(t.usage.turns for t in trials) / n,
+        "avg_wall_s": sum(t.latency_s for t in trials) / n,
+        "parse_failures": sum(1 for t in trials if not t.usage.parsed),
+    }
+
+
+def aggregate(trials: Sequence[TrialResult], cost_source: str) -> list[dict[str, Any]]:
+    """One entry per harness x model pair, cheapest per solved task first (unknown costs last)."""
+    if cost_source not in _SOURCE_BY_NAME:
+        raise ValueError(f"unknown cost source {cost_source!r}: use one of {', '.join(COST_SOURCES)}")
+    source = _SOURCE_BY_NAME[cost_source]
+    groups: dict[tuple[str, str], list[TrialResult]] = {}
+    for t in trials:
+        groups.setdefault((t.target.harness, t.target.model), []).append(t)
+    table = [_pair_entry(h, m, ts, source) for (h, m), ts in groups.items()]
+
+    def sort_key(entry: dict[str, Any]) -> tuple[bool, float, float]:
+        c = entry["cost_per_solved"]
+        return (c is None, c if c is not None else 0, -entry["pass_rate"])
+
+    table.sort(key=sort_key)
+    return table
+
+
+def write_csv(table: Sequence[Mapping[str, Any]], path: Path) -> None:
+    with path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(table[0].keys()))
+        w.writeheader()
+        w.writerows(table)
+
+
+_HEAD = (
+    "| # | Harness | Model | Solved | Pass rate | Cost/solved | Cost/run "
+    "| Cost/1M tokens | Tokens/solved | Tokens/run | Cache hit | Turns | Time (s) "
+    "| Cost source |"
+)
+
+
+def _table_line(i: int, t: Mapping[str, Any]) -> str:
+    return (
+        f"| {i} | {t['harness']} | {t['model']} | {t['solved']}/{t['runs']} "
+        f"| {t['pass_rate']:.0%} | {fmt_money(t['cost_per_solved'])} | {fmt_money(t['cost_per_run'])} "
+        f"| {fmt_money(t['cost_per_1m_tokens'])} | {fmt_int(t['tokens_per_solved'])} "
+        f"| {fmt_int(t['tokens_per_run'])} | {t['cache_hit']:.0%} | {t['avg_turns']:.1f} "
+        f"| {t['avg_wall_s']:.0f} | {t['cost_source']} |"
+    )
+
+
+def _per_task_lines(table: Sequence[Mapping[str, Any]], trials: Sequence[TrialResult]) -> list[str]:
+    pairs = [(t["harness"], t["model"]) for t in table]
+    lines = [
+        "",
+        "## Per task (solved/runs)",
+        "",
+        "| Task | " + " | ".join(f"{h}<br>{m}" for h, m in pairs) + " |",
+        "|---|" + "---|" * len(pairs),
+    ]
+    for task in sorted({t.task_id for t in trials}):
+        cells = []
+        for h, m in pairs:
+            rs = [t for t in trials if t.task_id == task and t.target.harness == h and t.target.model == m]
+            cells.append(f"{sum(t.passed for t in rs)}/{len(rs)}" if rs else "-")
+        lines.append(f"| {task} | " + " | ".join(cells) + " |")
+    return lines
+
+
+def render_markdown(
+    table: Sequence[Mapping[str, Any]], trials: Sequence[TrialResult], cost_source: str, now: datetime
+) -> str:
+    lines = [
+        f"# Harness x model — {now.strftime('%Y-%m-%d %H:%M')}",
+        "",
+        f"Cost source: `{cost_source}` (auto = litellm > computed > reported). Sorted by cost per solved task.",
+        "",
+        _HEAD,
+        "|" + "---|" * 14,
+    ]
+    lines += [_table_line(i, t) for i, t in enumerate(table, 1)]
+    bad = [t for t in table if t["parse_failures"]]
+    if bad:
+        lines += [
+            "",
+            "**Warning:** no token data from the harness for: "
+            + ", ".join(f"{t['harness']}/{t['model']} ({t['parse_failures']})" for t in bad)
+            + ". See `results/logs/*.agent.jsonl`.",
+        ]
+    lines += _per_task_lines(table, trials)
+    return "\n".join(lines) + "\n"
+```
+
+`hbench/profiles.py`:
+
+```python
+"""Config profiles. The LiteLLM profile keeps only harnesses that bill through LiteLLM and forces its cost."""
+
+import sys
+from typing import Any
+
+# Parsers of harnesses that cannot send the LiteLLM tag header (no per-run spend to match).
+EXCLUDED_PARSERS = {"cursor"}
+
+
+def apply_litellm_profile(cfg: dict[str, Any]) -> dict[str, Any]:
+    """A new config for the LiteLLM-only benchmark: no excluded harnesses, cost from LiteLLM, own output dir."""
+    if not cfg.get("litellm"):
+        sys.exit("config needs a 'litellm' section (base_url, api_key)")
+    excluded = {name for name, h in cfg["harnesses"].items() if h.get("parser") in EXCLUDED_PARSERS}
+    harnesses = {k: v for k, v in cfg["harnesses"].items() if k not in excluded}
+    dropped = [m for m in cfg["matrix"] if m["harness"] in excluded]
+    matrix = [m for m in cfg["matrix"] if m["harness"] not in excluded]
+    if dropped:
+        print(f"ignored {len(dropped)} matrix entries for non-LiteLLM harnesses: {sorted(excluded)}")
+    unknown = {m["harness"] for m in matrix} - set(harnesses)
+    if unknown:
+        sys.exit(f"matrix uses undefined harnesses: {sorted(unknown)}")
+    return {
+        **cfg,
+        "harnesses": harnesses,
+        "matrix": matrix,
+        "output_dir": cfg.get("output_dir", "results-litellm"),
+        "cost_source": "litellm",
+    }
+```
+
+`hbench/cli.py`:
+
+```python
+"""The single command line: `python3 -m hbench {run,report,reconcile,schema export}`.
+
+`harness_bench.py` and `harness_bench_litellm.py` are shims over `main`. `--litellm` applies the LiteLLM
+profile (see `hbench.profiles`) and, for `run`, waits for the spend logs and reconciles afterwards.
+"""
+
+import argparse
+import importlib
+import json
+import sys
+import time
+from collections.abc import Sequence
+from pathlib import Path
+from types import ModuleType
+from typing import Any
+
+from hbench.core.schema import schema_document
+from hbench.profiles import apply_litellm_profile
+
+_DESCRIPTION = (
+    "harness-bench: compare coding-agent harness x model pairs. Main metric: cost per solved task.\n\n"
+    "  python3 -m hbench run       --config config.json [--reps 3] [--only HARNESS] [--keep] [--dry-run]\n"
+    "  python3 -m hbench reconcile --config config.json   # pull real spend from LiteLLM\n"
+    "  python3 -m hbench report    --config config.json\n"
+    "  python3 -m hbench schema export [--out PATH]       # JSON Schema of trials.jsonl and run.json\n\n"
+    "Add --litellm to run, report or reconcile for the LiteLLM-only benchmark."
+)
+
+
+def _add_config(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--config", required=True)
+    p.add_argument(
+        "--litellm",
+        action="store_true",
+        help="LiteLLM-only profile: drop harnesses without LiteLLM spend, cost always from LiteLLM",
+    )
+
+
+def _prog() -> str:
+    """The name the user typed: the script for the shims, `python3 -m hbench` for the module."""
+    name = Path(sys.argv[0]).name
+    return "python3 -m hbench" if name == "__main__.py" else name
+
+
+def build_parser(epilog: str | None = None) -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        prog=_prog(),
+        description=_DESCRIPTION,
+        epilog=epilog,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     sub = ap.add_subparsers(dest="cmd", required=True)
-    r = sub.add_parser("run")
-    r.add_argument("--config", required=True)
-    r.add_argument("--reps", type=int)
-    r.add_argument("--only", nargs="*", help="only these harness names")
-    r.add_argument("--keep", action="store_true", help="keep work directories")
-    r.add_argument("--dry-run", action="store_true", help="print commands only")
-    r.add_argument(
+    run = sub.add_parser("run", help="run the matrix and write results")
+    _add_config(run)
+    run.add_argument("--reps", type=int)
+    run.add_argument("--only", nargs="*", help="only these harness names")
+    run.add_argument("--keep", action="store_true", help="keep work directories")
+    run.add_argument("--dry-run", action="store_true", help="print commands only")
+    run.add_argument(
         "--allow-unsandboxed", action="store_true", help="run without sandbox.prefix (only inside a disposable VM)"
     )
-    r.add_argument(
-        "--settle", type=int, default=60, help="seconds to wait for LiteLLM to write spend logs before reconcile"
+    run.add_argument(
+        "--settle",
+        type=int,
+        default=60,
+        help="with --litellm: seconds to wait for LiteLLM to write spend logs before reconcile",
     )
-    for name in ("reconcile", "report"):
-        s = sub.add_parser(name)
-        s.add_argument("--config", required=True)
-    args = ap.parse_args()
-    args.cost_source = "litellm"
-    args.no_report = True  # report only after reconcile, when LiteLLM cost exists
+    report = sub.add_parser("report", help="write summary.md and summary.csv from the results")
+    _add_config(report)
+    report.add_argument("--cost-source", choices=["auto", "litellm", "computed", "reported"])
+    reconcile = sub.add_parser("reconcile", help="fetch real spend per run from LiteLLM")
+    _add_config(reconcile)
+    schema = sub.add_parser("schema", help="JSON Schema of the data contract")
+    schema_sub = schema.add_subparsers(dest="schema_cmd", required=True)
+    export = schema_sub.add_parser("export", help="print the schema document, or write it with --out")
+    export.add_argument("--out", help="write to this file instead of stdout")
+    return ap
 
-    cfg, base = load_config(args.config)
-    if args.cmd == "run":
-        hb.cmd_run(args, cfg, base)
-        if args.dry_run:
-            return
-        print(f"\nwaiting {args.settle}s for LiteLLM spend logs...", flush=True)
-        time.sleep(args.settle)
-        try:
-            hb.cmd_reconcile(args, cfg, base)
-        except Exception as e:  # noqa: BLE001
-            print(f"reconcile failed: {e}\nRun later: python3 {Path(__file__).name} reconcile --config {args.config}")
-    elif args.cmd == "reconcile":
-        hb.cmd_reconcile(args, cfg, base)
+
+def _engine() -> ModuleType:
+    """The engine module. Imported here, not at module level, because the engine imports this package."""
+    root = str(Path(__file__).resolve().parent.parent)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    return importlib.import_module("harness_bench")
+
+
+def _schema_export(out: str | None) -> None:
+    text = json.dumps(schema_document(), indent=2, sort_keys=True)
+    if out:
+        Path(out).write_text(text + "\n")
     else:
-        hb.cmd_report(args, cfg, base)
+        print(text)
 
+
+def _run_litellm(engine: ModuleType, args: argparse.Namespace, cfg: dict[str, Any], base: Path) -> None:
+    """`run` under the LiteLLM profile: report only after reconcile, when the gateway cost exists."""
+    engine.cmd_run(args, cfg, base)
+    if args.dry_run:
+        return
+    print(f"\nwaiting {args.settle}s for LiteLLM spend logs...", flush=True)
+    time.sleep(args.settle)
+    try:
+        engine.cmd_reconcile(args, cfg, base)
+    except Exception as e:  # noqa: BLE001
+        print(f"reconcile failed: {e}\nRun later: python3 -m hbench reconcile --litellm --config {args.config}")
+
+
+def main(argv: Sequence[str] | None = None, *, epilog: str | None = None) -> None:
+    parser = build_parser(epilog)
+    args = parser.parse_args(argv)
+    if args.cmd == "schema":
+        _schema_export(args.out)
+        return
+    engine = _engine()
+    cfg_path = Path(args.config).resolve()
+    cfg: dict[str, Any] = json.loads(cfg_path.read_text())
+    base = cfg_path.parent
+    if args.litellm:
+        if getattr(args, "cost_source", None):
+            parser.error("--cost-source cannot be combined with --litellm (the cost always comes from LiteLLM)")
+        cfg = apply_litellm_profile(cfg)  # sets cfg["cost_source"] = "litellm"
+        args.no_report = True
+        if args.cmd == "run":
+            _run_litellm(engine, args, cfg, base)
+            return
+    commands = {"run": engine.cmd_run, "report": engine.cmd_report, "reconcile": engine.cmd_reconcile}
+    commands[args.cmd](args, cfg, base)
+```
+
+`hbench/__main__.py`:
+
+```python
+"""`python3 -m hbench`."""
+
+from hbench.cli import main
 
 if __name__ == "__main__":
     main()
@@ -1803,8 +3015,7 @@ def make_git_task(tmp):
 def main():
     tmp = Path(tempfile.mkdtemp(prefix="hb-smoke-"))
     try:
-        for f in ("harness_bench.py", "harness_bench_litellm.py"):
-            shutil.copy(ROOT / f, tmp)
+        fixtures.copy_engine(tmp)
         shutil.copytree(ROOT / "tasks" / "fizzbuzz", tmp / "tasks" / "fizzbuzz")
         tags_file, probe_file = tmp / "tags.txt", tmp / "probe.jsonl"
         os.environ.update(
@@ -1852,6 +3063,10 @@ def main():
         stderr_logs = "".join(f.read_text() for f in logs.glob("*.agent.stderr"))
         check(API_KEY not in stderr_logs and "***REDACTED***" in stderr_logs, "logs: harness secrets redacted")
         check(any(f.read_text() for f in logs.glob("fizzbuzz__claude__*.diff")), "audit diff saved")
+        (run_dir,) = [p.parent for p in (tmp / "results").glob("*/trials.jsonl")]
+        trials_text = (run_dir / "trials.jsonl").read_text()
+        check(len(trials_text.splitlines()) == 5 and (run_dir / "run.json").exists(), "contract: run.json + 5 trials")
+        check(API_KEY not in trials_text and "fix it" not in trials_text, "contract: no secret or prompt in trials")
         probes = [json.loads(x) for x in probe_file.read_text().splitlines()]
         check(all(not Path(pr["cwd"]).is_relative_to(tmp) for pr in probes), "workdir outside benchmark repo")
         check(not (tmp / "work").exists(), "no work dir created inside repo")
@@ -2132,8 +3347,7 @@ PY = fixtures.PY
 def make_tmp(test: unittest.TestCase) -> Path:
     tmp = Path(tempfile.mkdtemp(prefix="hb-golden-"))
     test.addCleanup(shutil.rmtree, tmp, True)
-    for f in ("harness_bench.py", "harness_bench_litellm.py"):
-        shutil.copy(ROOT / f, tmp)
+    fixtures.copy_engine(tmp)
     (tmp / "results").mkdir()
     (tmp / "config.json").write_text('{"output_dir": "results"}')
     return tmp
@@ -2269,6 +3483,13 @@ def fake_config(extra_env: Mapping[str, str]) -> dict[str, Any]:
     }
 
 
+def copy_engine(dest: Path) -> None:
+    """Copy the engine scripts and the `hbench` package into `dest`, so they run as a standalone checkout."""
+    for name in ("harness_bench.py", "harness_bench_litellm.py"):
+        shutil.copy(ROOT / name, dest)
+    shutil.copytree(ROOT / "hbench", dest / "hbench", ignore=shutil.ignore_patterns("__pycache__"))
+
+
 def tmpdir(test: unittest.TestCase) -> Path:
     """A temp directory removed when `test` finishes."""
     path = Path(tempfile.mkdtemp(prefix="hb-unit-")).resolve()
@@ -2334,7 +3555,6 @@ Unit tests call the engine in-process (`python3 -m unittest discover -s tests -p
 """Unit tests for the output parsers, cost helpers and formatting. In-process, no subprocesses."""
 
 import json
-import math
 import unittest
 from typing import Any
 
@@ -2503,16 +3723,6 @@ class ComputedCostTests(unittest.TestCase):
         self.assertAlmostEqual(hb.computed_cost(self.USAGE, {"input": 1, "output": 2, "cache_read": 0.5}), 3.5)
 
 
-class FormatTests(unittest.TestCase):
-    def test_money_none_inf_small_and_large(self) -> None:
-        self.assertEqual(
-            [hb.fmt_money(v) for v in (None, math.inf, 0.12345, 12.345)], ["n/a", "inf", "$0.1235", "$12.35"]
-        )
-
-    def test_int_none_inf_and_grouping(self) -> None:
-        self.assertEqual([hb.fmt_int(v) for v in (None, math.inf, 1234567.4)], ["n/a", "n/a", "1,234,567"])
-
-
 class RowTagsTests(unittest.TestCase):
     def test_list_is_returned_as_is(self) -> None:
         self.assertEqual(hb.row_tags({"request_tags": ["a", "b"]}), ["a", "b"])
@@ -2593,6 +3803,9 @@ class ValidateConfigTests(unittest.TestCase):
         cfg = base_config()
         cfg["harnesses"]["bad name"] = cfg["harnesses"]["claude"]
         self.assert_rejected(cfg, "invalid harness name")
+
+    def test_unknown_cost_source_is_rejected_with_the_valid_names(self) -> None:
+        self.assert_rejected(base_config(cost_source="bogus"), "auto, litellm, computed, reported")
 
     def test_spend_key_in_env_passthrough_is_rejected(self) -> None:
         cfg = base_config(litellm={"base_url": "https://x", "api_key": "${SPEND}"}, env_passthrough=["SPEND"])
@@ -2759,6 +3972,17 @@ class PrepareWorkdirTests(unittest.TestCase):
         self.assertEqual(
             [hb.is_git_source(s) for s in ("a.git", "https://x/y", "git@h:r", "plain")], [True] * 3 + [False]
         )
+
+
+class GitBinTests(unittest.TestCase):
+    def test_resolves_the_git_executable(self) -> None:
+        with mock.patch("shutil.which", return_value="/usr/bin/git"):
+            self.assertEqual(hb.git_bin(), "/usr/bin/git")
+
+    def test_exits_when_git_is_missing(self) -> None:
+        with mock.patch("shutil.which", return_value=None), self.assertRaises(SystemExit) as cm:
+            hb.git_bin()
+        self.assertEqual(cm.exception.code, "git not found on PATH")
 
 
 class MakeBaselineTests(unittest.TestCase):
@@ -3027,11 +4251,17 @@ class CmdReportTests(unittest.TestCase):
             fixtures.call_quiet(hb.cmd_report, args(), {}, self.base)
         self.assertIn("no results at", str(cm.exception.code))
 
-    def test_empty_results_file_crashes_with_index_error(self) -> None:
-        # CURRENT BEHAVIOR (bug, reported in Phase 0, not fixed): table[0] fails on zero rows.
+    def test_empty_results_file_exits_with_no_results(self) -> None:
         fixtures.write_rows(self.base / "results" / "results.jsonl")
-        with self.assertRaises(IndexError):
+        with self.assertRaises(SystemExit) as cm:
             fixtures.call_quiet(hb.cmd_report, args(), {}, self.base)
+        self.assertIn("no results in", str(cm.exception.code))
+
+    def test_unknown_cost_source_exits_with_a_message_not_a_traceback(self) -> None:
+        fixtures.write_rows(self.base / "results" / "results.jsonl", fixtures.run_row())
+        with self.assertRaises(SystemExit) as cm:
+            fixtures.call_quiet(hb.cmd_report, args(cost_source="bogus"), {}, self.base)
+        self.assertIn("auto, litellm, computed, reported", str(cm.exception.code))
 
     def test_pairs_without_token_data_get_a_warning(self) -> None:
         fixtures.write_rows(self.base / "results" / "results.jsonl", fixtures.run_row(parse_ok=False))
@@ -3314,6 +4544,1352 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
+`tests/test_core_models.py`:
+
+```python
+"""Tests for the data contract models in `hbench.core`."""
+
+import copy
+import dataclasses
+import pickle
+import unittest
+from types import MappingProxyType
+from datetime import UTC, datetime
+from typing import Any
+
+import fixtures  # noqa: F401  (puts the repo root on sys.path)
+from hbench.core.ids import new_run_id, sha256_json, trial_id
+from hbench.core.models import (
+    SCHEMA_VERSION,
+    ContractError,
+    Costs,
+    CostSource,
+    GraderResult,
+    RunInfo,
+    Target,
+    TrialResult,
+    TrialStatus,
+    Usage,
+)
+
+T0 = datetime(2026, 11, 24, 12, 0, 0, tzinfo=UTC)
+
+
+def target(**overrides: Any) -> Target:
+    values: dict[str, Any] = {
+        "harness": "claude",
+        "harness_version": "1.2.3",
+        "model": "sonnet",
+        "params": {"effort": "high", "n": 2, "t": 0.5, "flag": True},
+    }
+    values.update(overrides)
+    return Target(**values)
+
+
+def usage(**overrides: Any) -> Usage:
+    values: dict[str, Any] = {
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "parsed": True,
+        "costs": Costs(price_table=0.5),
+    }
+    values.update(overrides)
+    return Usage(**values)
+
+
+def trial(**overrides: Any) -> TrialResult:
+    values: dict[str, Any] = {
+        "run_id": "r" * 32,
+        "trial_id": "t" * 16,
+        "task_id": "fizzbuzz",
+        "suite_version": "abc",
+        "target": target(),
+        "rep": 1,
+        "status": TrialStatus.PASSED,
+        "graders": (GraderResult(grader="test", grader_version="1", passed=True, score=1.0, details_uri="logs/x"),),
+        "usage": usage(),
+        "latency_s": 1.5,
+        "started_at": T0,
+        "agent_exit_code": 0,
+        "sandboxed": True,
+        "trace_id": "bench-1",
+        "artifact_uri": "logs/x",
+    }
+    values.update(overrides)
+    return TrialResult(**values)
+
+
+def run_info(**overrides: Any) -> RunInfo:
+    values: dict[str, Any] = {
+        "run_id": "r" * 32,
+        "started_at": T0,
+        "finished_at": None,
+        "harness_bench_version": "0.0.0",
+        "config_sha256": "c" * 64,
+        "suite_version": "abc",
+        "python": "3.12.0",
+        "platform": "linux",
+        "sandboxed": False,
+        "targets": (target(),),
+    }
+    values.update(overrides)
+    return RunInfo(**values)
+
+
+class RoundTripTests(unittest.TestCase):
+    def test_every_model_survives_to_dict_from_dict(self) -> None:
+        cases: list[Any] = [
+            target(),
+            GraderResult(grader="g", grader_version="1", passed=False, score=None, timed_out=True),
+            Costs(gateway=1.0, price_table=None, harness=0.0),
+            usage(),
+            trial(),
+            trial(status=TrialStatus.TIMEOUT, agent_exit_code=None, trace_id=None, artifact_uri=None),
+            run_info(),
+            run_info(finished_at=T0),
+        ]
+        for obj in cases:
+            with self.subTest(obj=type(obj).__name__):
+                self.assertEqual(type(obj).from_dict(obj.to_dict()), obj)
+
+    def test_to_dict_is_json_ready(self) -> None:
+        d = trial().to_dict()
+        self.assertEqual(
+            (d["status"], d["started_at"], type(d["graders"]), d["usage"]["costs"]["price_table"]),
+            ("passed", "2026-11-24T12:00:00+00:00", list, 0.5),
+        )
+
+    def test_usage_serialises_the_picked_cost(self) -> None:
+        d = usage(costs=Costs(gateway=2.0, harness=1.0)).to_dict()
+        self.assertEqual((d["cost_usd"], d["cost_source"]), (2.0, "gateway"))
+
+    def test_usage_rejects_a_picked_cost_that_disagrees(self) -> None:
+        d = usage().to_dict()
+        d["cost_usd"] = 99.0
+        with self.assertRaises(ContractError):
+            Usage.from_dict(d)
+
+
+class FromDictRejectionTests(unittest.TestCase):
+    def test_extra_key_is_rejected_and_named(self) -> None:
+        d = trial().to_dict()
+        d["surprise"] = 1
+        with self.assertRaises(ContractError) as cm:
+            TrialResult.from_dict(d)
+        self.assertIn("surprise", str(cm.exception))
+
+    def test_missing_key_is_rejected_and_named(self) -> None:
+        d = trial().to_dict()
+        del d["task_id"]
+        with self.assertRaises(ContractError) as cm:
+            TrialResult.from_dict(d)
+        self.assertIn("task_id", str(cm.exception))
+
+    def test_other_major_version_is_rejected_and_minor_accepted(self) -> None:
+        d = trial().to_dict()
+        d["schema_version"] = "1.4.0"
+        self.assertEqual(TrialResult.from_dict(d).schema_version, "1.4.0")
+        d["schema_version"] = "2.0.0"
+        with self.assertRaises(ContractError):
+            TrialResult.from_dict(d)
+
+    def test_malformed_version_is_rejected(self) -> None:
+        with self.assertRaises(ContractError):
+            trial(schema_version="one")
+
+    def test_unknown_enum_value_is_a_contract_error(self) -> None:
+        d = trial().to_dict()
+        d["status"] = "exploded"
+        with self.assertRaises(ContractError):
+            TrialResult.from_dict(d)
+
+    def test_wrong_type_is_a_contract_error(self) -> None:
+        d = trial().to_dict()
+        d["rep"] = "one"
+        with self.assertRaises(ContractError):
+            TrialResult.from_dict(d)
+
+    def test_list_field_must_be_a_list(self) -> None:
+        d = trial().to_dict()
+        d["graders"] = "nope"
+        with self.assertRaises(ContractError):
+            TrialResult.from_dict(d)
+
+    def test_bad_timestamp_is_a_contract_error(self) -> None:
+        for bad in ("yesterday", 12345):
+            d = trial().to_dict()
+            d["started_at"] = bad
+            with self.subTest(bad=bad), self.assertRaises(ContractError):
+                TrialResult.from_dict(d)
+
+
+class TypeCheckTests(unittest.TestCase):
+    def test_scalar_fields_are_type_checked(self) -> None:
+        bad: list[tuple[str, Any]] = [
+            ("task_id", 5),
+            ("sandboxed", 1),
+            ("rep", True),
+            ("rep", 1.0),
+            ("latency_s", True),
+            ("latency_s", "1"),
+            ("status", "passed"),
+            ("started_at", "2026-11-24T12:00:00+00:00"),
+            ("graders", [GraderResult(grader="g", grader_version="1", passed=True)]),
+            ("target", {"harness": "h"}),
+            ("agent_exit_code", "0"),
+            ("trace_id", 7),
+        ]
+        for name, value in bad:
+            with self.subTest(field=name, value=value), self.assertRaises(ContractError):
+                trial(**{name: value})
+
+    def test_nested_and_container_types_are_checked(self) -> None:
+        with self.assertRaises(ContractError):
+            target(model=["x"])
+        with self.assertRaises(ContractError):
+            target(params={"k": [1]})
+        with self.assertRaises(ContractError):
+            target(params={1: "v"})
+        with self.assertRaises(ContractError):
+            usage(parsed="yes")
+        with self.assertRaises(ContractError):
+            usage(input_tokens=1.5)
+        with self.assertRaises(ContractError):
+            usage(input_tokens=True)
+        with self.assertRaises(ContractError):
+            run_info(targets=[target()])
+
+    def test_from_dict_applies_the_same_checks(self) -> None:
+        d = trial().to_dict()
+        d["task_id"] = 5
+        with self.assertRaises(ContractError):
+            TrialResult.from_dict(d)
+
+    def test_non_finite_and_bool_costs_are_rejected(self) -> None:
+        bad_values: list[Any] = [float("nan"), float("inf"), True, "1"]
+        for bad in bad_values:
+            with self.subTest(bad=bad), self.assertRaises(ContractError):
+                Costs(**{"harness": bad})
+
+    def test_tuple_elements_are_type_checked(self) -> None:
+        with self.assertRaises(ContractError):
+            trial(graders=("x",))
+        with self.assertRaises(ContractError):
+            run_info(targets=(1,))
+
+    def test_non_finite_latency_is_rejected(self) -> None:
+        with self.assertRaises(ContractError):
+            trial(latency_s=float("nan"))
+
+    def test_missing_schema_version_is_rejected_although_it_has_a_default(self) -> None:
+        for model in (trial(), run_info()):
+            d = model.to_dict()
+            del d["schema_version"]
+            with self.subTest(model=type(model).__name__), self.assertRaises(ContractError) as cm:
+                type(model).from_dict(d)
+            self.assertIn("schema_version", str(cm.exception))
+
+
+class TargetParamsTests(unittest.TestCase):
+    def test_models_survive_deepcopy_and_pickle(self) -> None:
+        for model in (target(), trial(), run_info()):
+            for clone in (copy.deepcopy(model), pickle.loads(pickle.dumps(model))):
+                with self.subTest(model=type(model).__name__):
+                    self.assertEqual((clone, hash(clone)), (model, hash(model)))
+                    self.assertIsNot(clone, model)
+
+    def test_params_are_copied_and_read_only(self) -> None:
+        given = {"a": 1}
+        t = target(params=given)
+        given["a"] = 2
+        self.assertEqual((t.params["a"], isinstance(t.params, MappingProxyType)), (1, True))
+
+    def test_models_are_hashable_and_equal_targets_hash_equal(self) -> None:
+        self.assertEqual(hash(target(params={"a": 1, "b": 2})), hash(target(params={"b": 2, "a": 1})))
+        self.assertEqual(len({trial(), trial()}), 1)
+        self.assertNotEqual(hash(target(params={"a": 1})), hash(target(params={"a": 2})))
+
+
+class ValidationTests(unittest.TestCase):
+    def test_costs_pick_prefers_gateway_then_price_table_then_harness(self) -> None:
+        self.assertEqual(Costs(gateway=None, price_table=0.5, harness=0.7).pick(), (0.5, CostSource.PRICE_TABLE))
+        self.assertEqual(Costs(gateway=0.1, price_table=0.5, harness=0.7).pick(), (0.1, CostSource.GATEWAY))
+        self.assertEqual(Costs(harness=0.7).pick(), (0.7, CostSource.HARNESS))
+
+    def test_costs_pick_unknown_is_none_not_zero(self) -> None:
+        self.assertEqual(Costs().pick(), (None, CostSource.UNKNOWN))
+
+    def test_costs_pick_can_force_a_source(self) -> None:
+        costs = Costs(gateway=None, price_table=0.5)
+        self.assertEqual(costs.pick(CostSource.GATEWAY), (None, CostSource.UNKNOWN))
+        self.assertEqual(costs.pick(CostSource.PRICE_TABLE), (0.5, CostSource.PRICE_TABLE))
+        self.assertEqual(costs.pick(CostSource.UNKNOWN), (None, CostSource.UNKNOWN))
+
+    def test_zero_cost_is_a_known_cost(self) -> None:
+        self.assertEqual(Costs(gateway=0.0, harness=1.0).pick(), (0.0, CostSource.GATEWAY))
+
+    def test_negative_cost_is_rejected(self) -> None:
+        with self.assertRaises(ContractError):
+            Costs(harness=-1)
+
+    def test_negative_token_count_is_rejected(self) -> None:
+        with self.assertRaises(ContractError):
+            usage(cache_read_tokens=-1)
+
+    def test_usage_totals_and_picked_cost(self) -> None:
+        u = usage(reasoning_tokens=3, cache_read_tokens=4, cache_write_tokens=5, costs=Costs(gateway=2.0))
+        self.assertEqual((u.total_tokens, u.cost_usd, u.cost_source), (27, 2.0, CostSource.GATEWAY))
+
+    def test_trial_id_is_stable_and_depends_on_rep(self) -> None:
+        a = trial_id("run", "task", "h@v:m", 1)
+        self.assertEqual(a, trial_id("run", "task", "h@v:m", 1))
+        self.assertNotEqual(a, trial_id("run", "task", "h@v:m", 2))
+        self.assertEqual(len(a), 16)
+
+    def test_run_ids_are_unique_hex(self) -> None:
+        a, b = new_run_id(), new_run_id()
+        self.assertEqual((len(a), a == b, int(a, 16) >= 0), (32, False, True))
+
+    def test_sha256_json_ignores_key_order(self) -> None:
+        self.assertEqual(sha256_json({"a": 1, "b": 2}), sha256_json({"b": 2, "a": 1}))
+        self.assertEqual(len(sha256_json([])), 64)
+
+    def test_target_id(self) -> None:
+        self.assertEqual(target().target_id, "claude@1.2.3:sonnet")
+
+    def test_naive_datetime_is_rejected(self) -> None:
+        with self.assertRaises(ContractError):
+            trial(started_at=datetime(2026, 1, 1))
+        with self.assertRaises(ContractError):
+            run_info(finished_at=datetime(2026, 1, 1))
+
+    def test_grader_score_must_be_in_unit_interval(self) -> None:
+        for bad in (1.5, -0.1):
+            with self.assertRaises(ContractError):
+                GraderResult(grader="g", grader_version="1", passed=True, score=bad)
+
+    def test_trial_rep_and_latency_bounds(self) -> None:
+        with self.assertRaises(ContractError):
+            trial(rep=0)
+        with self.assertRaises(ContractError):
+            trial(latency_s=-0.1)
+
+    def test_passed_property_follows_status(self) -> None:
+        self.assertEqual((trial().passed, trial(status=TrialStatus.FAILED).passed), (True, False))
+
+    def test_models_are_frozen(self) -> None:
+        field = "rep"
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            setattr(trial(), field, 2)
+
+    def test_schema_version_default(self) -> None:
+        self.assertEqual(trial().schema_version, SCHEMA_VERSION)
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+`tests/test_core_schema.py`:
+
+```python
+"""Tests for the hand-written JSON Schema and its small validator."""
+
+import copy
+import unittest
+from dataclasses import fields
+from collections.abc import Mapping
+from typing import Any
+
+import fixtures  # noqa: F401  (puts the repo root on sys.path)
+from hbench.core import models
+from hbench.core.schema import RUN_SCHEMA, TRIAL_SCHEMA, schema_document, validate
+from test_core_models import run_info, trial
+
+
+class ValidateContractTests(unittest.TestCase):
+    def test_a_valid_trial_and_run_have_no_errors(self) -> None:
+        self.assertEqual(validate(trial().to_dict(), TRIAL_SCHEMA), [])
+        self.assertEqual(validate(run_info().to_dict(), RUN_SCHEMA), [])
+        self.assertEqual(validate(run_info(finished_at=trial().started_at).to_dict(), RUN_SCHEMA), [])
+
+    def test_wrong_type_names_the_path(self) -> None:
+        d = trial().to_dict()
+        d["usage"]["input_tokens"] = "ten"
+        self.assertEqual(validate(d, TRIAL_SCHEMA), ["$.usage.input_tokens: expected integer"])
+
+    def test_missing_required_property(self) -> None:
+        d = trial().to_dict()
+        del d["usage"]["costs"]
+        self.assertEqual(validate(d, TRIAL_SCHEMA), ["$.usage: missing required property 'costs'"])
+
+    def test_extra_property_is_rejected(self) -> None:
+        d = trial().to_dict()
+        d["target"]["surprise"] = 1
+        self.assertEqual(validate(d, TRIAL_SCHEMA), ["$.target.surprise: unexpected property"])
+
+    def test_bad_enum_value(self) -> None:
+        d = trial().to_dict()
+        d["status"] = "exploded"
+        self.assertEqual(len(validate(d, TRIAL_SCHEMA)), 1)
+        self.assertIn("$.status: expected one of", validate(d, TRIAL_SCHEMA)[0])
+
+    def test_rep_zero_violates_the_minimum(self) -> None:
+        d = trial().to_dict()
+        d["rep"] = 0
+        self.assertEqual(validate(d, TRIAL_SCHEMA), ["$.rep: must be >= 1"])
+
+    def test_score_above_one_violates_the_maximum(self) -> None:
+        d = trial().to_dict()
+        d["graders"][0]["score"] = 1.5
+        self.assertEqual(validate(d, TRIAL_SCHEMA), ["$.graders[0].score: must be <= 1"])
+
+    def test_null_is_accepted_only_where_the_type_allows_it(self) -> None:
+        d = trial(agent_exit_code=None).to_dict()
+        d["task_id"] = None
+        self.assertEqual(validate(d, TRIAL_SCHEMA), ["$.task_id: expected string"])
+
+    def test_bool_is_not_an_integer_or_a_number(self) -> None:
+        d = trial().to_dict()
+        d["rep"] = True
+        d["latency_s"] = False
+        self.assertEqual(validate(d, TRIAL_SCHEMA), ["$.rep: expected integer", "$.latency_s: expected number"])
+
+    def test_non_finite_numbers_are_not_numbers(self) -> None:
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            self.assertEqual(validate(bad, {"type": "number"}), ["$: expected number"])
+        self.assertEqual(validate(10**400, {"type": "integer"}), [])
+
+    def test_non_dict_and_non_list_instances(self) -> None:
+        self.assertEqual(validate([], TRIAL_SCHEMA), ["$: expected object"])
+        d = trial().to_dict()
+        d["graders"] = {}
+        self.assertEqual(validate(d, TRIAL_SCHEMA), ["$.graders: expected array"])
+
+    def test_params_accept_free_keys(self) -> None:
+        d = trial().to_dict()
+        d["target"]["params"] = {"anything": 1}
+        self.assertEqual(validate(d, TRIAL_SCHEMA), [])
+
+    def test_schema_document_holds_both_schemas_with_ids(self) -> None:
+        doc = schema_document()
+        self.assertEqual((doc["trial"], doc["run"]), (TRIAL_SCHEMA, RUN_SCHEMA))
+        self.assertTrue(TRIAL_SCHEMA["$id"].endswith("/trial/1.0.0"))
+        self.assertTrue(RUN_SCHEMA["$id"].endswith("/run/1.0.0"))
+
+
+class ValidatorKeywordTests(unittest.TestCase):
+    def test_unknown_keyword_raises(self) -> None:
+        with self.assertRaises(ValueError) as cm:
+            validate(1, {"type": "integer", "pattern": "x"})
+        self.assertIn("pattern", str(cm.exception))
+
+    def test_ref_resolves_against_defs(self) -> None:
+        schema = {"$defs": {"n": {"type": "integer", "minimum": 2}}, "type": "array", "items": {"$ref": "#/$defs/n"}}
+        self.assertEqual(validate([2, 1], schema), ["$[1]: must be >= 2"])
+
+    def test_unresolvable_ref_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            validate(1, {"$ref": "#/$defs/missing"})
+        with self.assertRaises(ValueError):
+            validate(1, {"$ref": "http://elsewhere/x"})
+
+    def test_type_list_with_null(self) -> None:
+        schema = {"type": ["string", "null"]}
+        self.assertEqual(validate(None, schema), [])
+        self.assertEqual(validate("a", schema), [])
+        self.assertEqual(validate(1, schema), ["$: expected string or null"])
+
+    def test_unknown_type_name_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            validate(1, {"type": "color"})
+
+
+def _node(schema: Mapping[str, Any], name: str | None) -> Mapping[str, Any]:
+    node: Mapping[str, Any] = schema if name is None else schema["$defs"][name]
+    return node
+
+
+class SchemaMatchesModelsTests(unittest.TestCase):
+    """The schema is hand written: fail when a dataclass field is added or removed on one side only."""
+
+    CASES: tuple[tuple[type[models._Model], Mapping[str, Any], str | None], ...] = (
+        (models.TrialResult, TRIAL_SCHEMA, None),
+        (models.Target, TRIAL_SCHEMA, "target"),
+        (models.GraderResult, TRIAL_SCHEMA, "grader_result"),
+        (models.Usage, TRIAL_SCHEMA, "usage"),
+        (models.Costs, TRIAL_SCHEMA, "costs"),
+        (models.RunInfo, RUN_SCHEMA, None),
+        (models.Target, RUN_SCHEMA, "target"),
+    )
+
+    def test_properties_and_required_keys_match_the_dataclasses(self) -> None:
+        for cls, schema, name in self.CASES:
+            with self.subTest(model=cls.__name__, node=name):
+                node = _node(schema, name)
+                expected = {f.name for f in fields(cls)} | set(cls.DERIVED_KEYS)
+                self.assertEqual(set(node["properties"]), expected)
+                self.assertEqual(set(node["required"]), set(cls.required_keys()))
+                self.assertIs(node["additionalProperties"], False)
+
+    def test_schema_is_not_mutated_by_validation(self) -> None:
+        before = copy.deepcopy(TRIAL_SCHEMA)
+        validate(trial().to_dict(), TRIAL_SCHEMA)
+        self.assertEqual(TRIAL_SCHEMA, before)
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+`tests/test_contract_output.py`:
+
+```python
+"""Tests for the contract output: `trial_from_row`, `RunWriter`, `apply_gateway_costs`, and `run`/`reconcile` files."""
+
+import json
+import os
+import shutil
+import unittest
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+from unittest import mock
+
+import fixtures
+import harness_bench as hb
+from hbench.core.convert import trial_from_row, trial_from_row_lenient, trials_from_rows
+from hbench.core.models import ContractError, Costs, CostSource, RunInfo, TrialResult, TrialStatus
+from hbench.core.schema import RUN_SCHEMA, TRIAL_SCHEMA, validate
+from hbench.results import RunWriter, apply_gateway_costs
+from test_core_models import run_info, trial
+from test_litellm import ScriptedServer, ok
+from test_run import RunTestCase, args
+
+API_KEY = "sk-test-agent-key-0123456789"
+PROMPT = "PROMPT-CANARY-do-not-store"
+MINIMAL_ROW: dict[str, Any] = {
+    "task": "t1",
+    "harness": "h",
+    "model": "m",
+    "rep": 1,
+    "passed": True,
+    "input": 100,
+    "output": 10,
+    "cache_read": 5,
+    "cache_write": 2,
+    "turns": 3,
+    "wall_s": 1.5,
+}
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    return fixtures.read_rows(path)
+
+
+def convert(row: dict[str, Any], **kw: Any) -> TrialResult:
+    return trial_from_row(row, run_id="r" * 32, suite_version="s1", **kw)
+
+
+class TrialFromRowTests(unittest.TestCase):
+    def test_minimal_pre_phase_1_row_converts(self) -> None:
+        t = convert(MINIMAL_ROW)
+        self.assertEqual(
+            (t.status, t.target.target_id, t.usage.total_tokens, t.usage.parsed, t.sandboxed, t.usage.cost_usd),
+            (TrialStatus.PASSED, "h@unknown:m", 117, True, False, None),
+        )
+        self.assertEqual(
+            (t.usage.cost_source, t.started_at, t.trace_id, t.artifact_uri),
+            (CostSource.UNKNOWN, datetime.fromtimestamp(0, UTC), None, None),
+        )
+        self.assertEqual(validate(t.to_dict(), TRIAL_SCHEMA), [])
+
+    def test_full_row_maps_every_field(self) -> None:
+        row = dict(
+            MINIMAL_ROW,
+            ts="2026-11-24T10:00:00+00:00",
+            reasoning=7,
+            parse_ok=False,
+            cost_litellm=0.3,
+            cost_computed=0.2,
+            cost_reported=0.1,
+            run_tag="bench-20261124100000-fizz__claude__a-b__r1",
+            agent_rc=2,
+            sandboxed=True,
+            passed=False,
+        )
+        t = convert(row, harness_version="9.9")
+        self.assertEqual(
+            (t.status, t.usage.reasoning_tokens, t.usage.parsed, t.usage.costs, t.agent_exit_code, t.sandboxed),
+            (TrialStatus.FAILED, 7, False, Costs(gateway=0.3, price_table=0.2, harness=0.1), 2, True),
+        )
+        self.assertEqual(
+            (
+                t.trace_id,
+                t.artifact_uri,
+                t.target.harness_version,
+                t.started_at.isoformat(),
+                t.latency_s,
+                t.suite_version,
+            ),
+            (row["run_tag"], "logs/fizz__claude__a-b__r1", "9.9", "2026-11-24T10:00:00+00:00", 1.5, "s1"),
+        )
+
+    def test_trial_from_row_stays_strict_about_rep(self) -> None:
+        with self.assertRaises(ContractError):
+            convert(dict(MINIMAL_ROW, rep=0))
+
+    def test_report_path_reads_a_hand_written_rep_zero_as_rep_one(self) -> None:
+        (t,) = trials_from_rows([dict(MINIMAL_ROW, rep=0)])
+        self.assertEqual(t.rep, 1)
+
+    def test_bad_numbers_from_a_parser_are_contract_errors(self) -> None:
+        for key, bad in (("input", -1), ("input", float("nan")), ("output", float("inf")), ("cache_read", True)):
+            with self.subTest(key=key, bad=bad), self.assertRaises(ContractError):
+                convert(dict(MINIMAL_ROW, **{key: bad}))
+        for key, bad in (("cost_reported", True), ("cost_computed", float("nan")), ("cost_litellm", -0.5)):
+            with self.subTest(key=key, bad=bad), self.assertRaises(ContractError):
+                convert(dict(MINIMAL_ROW, **{key: bad}))
+
+    def test_lenient_conversion_keeps_the_trial_but_drops_the_bad_numbers(self) -> None:
+        warnings: list[str] = []
+        row = dict(MINIMAL_ROW, cost_reported=True, input=-4)
+        t = trial_from_row_lenient(row, run_id="r" * 32, suite_version="s1", warn=warnings.append)
+        self.assertEqual(
+            (t.usage.parsed, t.usage.total_tokens, t.usage.cost_usd, t.passed, t.latency_s, len(warnings)),
+            (False, 0, None, True, 1.5, 2),
+        )
+        self.assertTrue(all("t1" in w for w in warnings))
+        self.assertTrue(any("input" in w for w in warnings) and any("cost_reported" in w for w in warnings))
+
+    def test_a_valid_gateway_cost_survives_a_bad_harness_cost(self) -> None:
+        warnings: list[str] = []
+        row = dict(MINIMAL_ROW, cost_litellm=0.5, cost_computed=0.2, cost_reported=True)
+        t = trial_from_row_lenient(row, run_id="r" * 32, suite_version="s1", warn=warnings.append)
+        self.assertEqual(
+            (t.usage.costs, t.usage.parsed, t.usage.total_tokens, len(warnings)),
+            (Costs(gateway=0.5, price_table=0.2, harness=None), True, 117, 1),
+        )
+        self.assertIn("cost_reported", warnings[0])
+
+    def test_a_bad_count_does_not_wipe_valid_costs(self) -> None:
+        row = dict(MINIMAL_ROW, cost_litellm=0.5, cost_computed=2.0, output=float("nan"))
+        t = trial_from_row_lenient(row, run_id="r" * 32, suite_version="s1")
+        self.assertEqual((t.usage.costs.gateway, t.usage.parsed, t.usage.total_tokens), (0.5, False, 0))
+
+    def test_a_bad_count_drops_the_price_table_cost_but_keeps_the_others(self) -> None:
+        warnings: list[str] = []
+        row = dict(MINIMAL_ROW, input=-1, cost_computed=1.0, cost_litellm=0.5, cost_reported=0.25)
+        t = trial_from_row_lenient(row, run_id="r" * 32, suite_version="s1", warn=warnings.append)
+        self.assertEqual(t.usage.costs, Costs(gateway=0.5, price_table=None, harness=0.25))
+        self.assertTrue(any("price-table cost dropped" in w for w in warnings))
+
+    def test_a_good_price_table_cost_is_kept_when_only_a_cost_is_bad(self) -> None:
+        row = dict(MINIMAL_ROW, cost_computed=1.0, cost_reported=True)
+        t = trial_from_row_lenient(row, run_id="r" * 32, suite_version="s1")
+        self.assertEqual(t.usage.costs.price_table, 1.0)
+
+    def test_a_long_non_numeric_value_is_not_echoed(self) -> None:
+        secret = "SECRET-" + "x" * 300
+        bad_value: Any = secret
+        warnings: list[str] = []
+        trial_from_row_lenient(
+            dict(MINIMAL_ROW, input=secret, cost_reported=secret),
+            run_id="r" * 32,
+            suite_version="s1",
+            warn=warnings.append,
+        )
+        with self.assertRaises(ContractError) as cm:
+            convert(dict(MINIMAL_ROW, cache_read=secret))
+        with self.assertRaises(ContractError) as cm2:
+            Costs(**{"harness": bad_value})
+        self.assertEqual(len(warnings), 2)
+        self.assertFalse(any("SECRET" in m for m in [*warnings, str(cm.exception), str(cm2.exception)]))
+
+    def test_every_bad_field_gets_its_own_warning(self) -> None:
+        warnings: list[str] = []
+        row = dict(MINIMAL_ROW, cost_litellm=-1.0, cost_computed=float("inf"), turns=True)
+        trial_from_row_lenient(row, run_id="r" * 32, suite_version="s1", warn=warnings.append)
+        self.assertEqual(len(warnings), 3)
+
+    def test_integral_floats_are_counts_but_fractions_are_not(self) -> None:
+        self.assertEqual(convert(dict(MINIMAL_ROW, input=2.0)).usage.input_tokens, 2)
+        with self.assertRaises(ContractError):
+            convert(dict(MINIMAL_ROW, input=1.9))
+        t = trial_from_row_lenient(dict(MINIMAL_ROW, input=1.9), run_id="r" * 32, suite_version="s1")
+        self.assertEqual((t.usage.parsed, t.usage.total_tokens), (False, 0))
+
+    def test_report_path_warns_about_sanitized_rows_when_asked(self) -> None:
+        warnings: list[str] = []
+        trials_from_rows([dict(MINIMAL_ROW, cost_computed=float("nan"))], warn=warnings.append)
+        self.assertEqual(len(warnings), 1)
+
+    def test_report_path_survives_bad_rows(self) -> None:
+        (t,) = trials_from_rows([dict(MINIMAL_ROW, cost_computed=float("nan"))])
+        self.assertEqual((t.usage.parsed, t.usage.cost_usd), (True, None))
+
+    def test_trial_id_depends_on_the_row_identity(self) -> None:
+        self.assertNotEqual(convert(MINIMAL_ROW).trial_id, convert(dict(MINIMAL_ROW, rep=2)).trial_id)
+
+    def test_timeout_mapping(self) -> None:
+        failed = dict(MINIMAL_ROW, passed=False)
+        self.assertEqual(convert(dict(failed, agent_timed_out=True)).status, TrialStatus.TIMEOUT)
+        self.assertEqual(convert(failed, test_timed_out=True).status, TrialStatus.TIMEOUT)
+        self.assertEqual(convert(failed).status, TrialStatus.FAILED)
+        self.assertEqual(convert(dict(MINIMAL_ROW, agent_timed_out=True)).status, TrialStatus.PASSED)
+
+    def test_test_timeout_is_recorded_on_the_grader(self) -> None:
+        t = convert(dict(MINIMAL_ROW, passed=False), test_timed_out=True)
+        self.assertEqual((t.graders[0].passed, t.graders[0].timed_out), (False, True))
+
+    def test_started_at_falls_back_from_ts_to_t_start(self) -> None:
+        row = dict(MINIMAL_ROW, ts="not a time", t_start=1_700_000_000.0)
+        self.assertEqual(convert(row).started_at, datetime.fromtimestamp(1_700_000_000, UTC))
+
+    def test_naive_ts_is_taken_as_utc(self) -> None:
+        self.assertEqual(
+            convert(dict(MINIMAL_ROW, ts="2026-01-02T03:04:05")).started_at, datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+        )
+
+    def test_run_tag_without_the_bench_prefix_gives_no_artifact_uri(self) -> None:
+        t = convert(dict(MINIMAL_ROW, run_tag="tag-1"))
+        self.assertEqual((t.trace_id, t.artifact_uri), ("tag-1", None))
+
+
+class RunWriterTests(unittest.TestCase):
+    def test_writes_run_json_at_construction_and_appends_trials(self) -> None:
+        out = fixtures.tmpdir(self)
+        info = run_info()
+        writer = RunWriter(out, info)
+        run_dir = out / info.run_id
+        self.assertEqual(RunInfo.from_dict(json.loads((run_dir / "run.json").read_text())), info)
+        writer.append(trial())
+        writer.append(trial(rep=2))
+        lines = read_jsonl(run_dir / "trials.jsonl")
+        self.assertEqual([line["rep"] for line in lines], [1, 2])
+
+    def test_close_records_the_finish_time(self) -> None:
+        out = fixtures.tmpdir(self)
+        info = run_info()
+        writer = RunWriter(out, info)
+        finished = datetime(2026, 11, 24, 13, 0, tzinfo=UTC)
+        writer.close(finished)
+        stored = RunInfo.from_dict(json.loads((out / info.run_id / "run.json").read_text()))
+        self.assertEqual(stored.finished_at, finished)
+        self.assertEqual((out / info.run_id / "trials.jsonl").read_text(), "")
+
+
+class ApplyGatewayCostsTests(unittest.TestCase):
+    def make(self, out: Path, run_id: str, *traces: str | None) -> Path:
+        writer = RunWriter(out, run_info(run_id=run_id))
+        for rep, trace in enumerate(traces, 1):
+            writer.append(trial(run_id=run_id, trace_id=trace, rep=rep))
+        return out / run_id / "trials.jsonl"
+
+    def test_sets_gateway_cost_on_matching_trials_across_run_dirs(self) -> None:
+        out = fixtures.tmpdir(self)
+        first = self.make(out, "a" * 32, "t1", "t2", None)
+        second = self.make(out, "b" * 32, "t1")
+        updated = apply_gateway_costs(out, {"t1": 0.25})
+        costs = [[line["usage"]["costs"]["gateway"] for line in read_jsonl(p)] for p in (first, second)]
+        self.assertEqual((updated, costs), (2, [[0.25, None, None], [0.25]]))
+        self.assertEqual(read_jsonl(first)[0]["usage"]["cost_source"], "gateway")
+
+    def test_other_cost_fields_are_kept(self) -> None:
+        out = fixtures.tmpdir(self)
+        path = self.make(out, "a" * 32, "t1")
+        apply_gateway_costs(out, {"t1": 0.25})
+        self.assertEqual(read_jsonl(path)[0]["usage"]["costs"], {"gateway": 0.25, "price_table": 0.5, "harness": None})
+
+    def test_output_without_run_dirs_updates_nothing(self) -> None:
+        out = fixtures.tmpdir(self)
+        (out / "logs").mkdir()
+        self.assertEqual(apply_gateway_costs(out, {"t1": 1.0}), 0)
+
+    def test_no_match_leaves_files_untouched(self) -> None:
+        out = fixtures.tmpdir(self)
+        path = self.make(out, "a" * 32, "t1")
+        before = path.read_text()
+        self.assertEqual(apply_gateway_costs(out, {"zzz": 1.0}), 0)
+        self.assertEqual(path.read_text(), before)
+
+    def test_a_foreign_or_corrupt_file_is_skipped_with_a_warning_and_others_are_updated(self) -> None:
+        out = fixtures.tmpdir(self)
+        bad = self.make(out, "a" * 32, "t1")
+        bad.write_text(bad.read_text() + '{"nope": 1}\n')
+        broken = self.make(out, "b" * 32, "t1")
+        broken.write_text("not json\n")
+        good = self.make(out, "c" * 32, "t1")
+        before = (bad.read_text(), broken.read_text())
+        with fixtures.quiet() as buf:
+            updated = apply_gateway_costs(out, {"t1": 1.0})
+        self.assertEqual(updated, 1)
+        self.assertEqual((bad.read_text(), broken.read_text()), before)
+        self.assertEqual(read_jsonl(good)[0]["usage"]["costs"]["gateway"], 1.0)
+        self.assertIn(str(bad), buf.getvalue())
+        self.assertIn(str(broken), buf.getvalue())
+
+    def test_a_bad_spend_skips_only_that_tag_with_a_warning(self) -> None:
+        out = fixtures.tmpdir(self)
+        path = self.make(out, "a" * 32, "t1", "t2", "t3")
+        with fixtures.quiet() as buf:
+            updated = apply_gateway_costs(out, {"t1": float("nan"), "t2": -2.0, "t3": 0.25})
+        gateways = [line["usage"]["costs"]["gateway"] for line in read_jsonl(path)]
+        self.assertEqual((updated, gateways), (1, [None, None, 0.25]))
+        self.assertIn("t1", buf.getvalue())
+        self.assertIn("t2", buf.getvalue())
+
+    def test_a_zero_gateway_cost_is_known_and_applied(self) -> None:
+        out = fixtures.tmpdir(self)
+        path = self.make(out, "a" * 32, "t1")
+        self.assertEqual(apply_gateway_costs(out, {"t1": 0.0}), 1)
+        usage = read_jsonl(path)[0]["usage"]
+        self.assertEqual((usage["costs"]["gateway"], usage["cost_usd"], usage["cost_source"]), (0.0, 0.0, "gateway"))
+
+    def test_the_count_is_trials_not_files(self) -> None:
+        out = fixtures.tmpdir(self)
+        self.make(out, "a" * 32, "t1", "t1", "t2")
+        self.assertEqual(apply_gateway_costs(out, {"t1": 0.5}), 2)
+
+    def test_a_failed_replace_leaves_no_temp_file_and_the_original(self) -> None:
+        out = fixtures.tmpdir(self)
+        path = self.make(out, "a" * 32, "t1")
+        before = path.read_text()
+        with mock.patch("os.replace", side_effect=OSError("disk")), self.assertRaises(OSError):
+            apply_gateway_costs(out, {"t1": 1.0})
+        self.assertEqual(
+            (path.read_text(), sorted(p.name for p in path.parent.iterdir())), (before, ["run.json", "trials.jsonl"])
+        )
+
+    def test_rewritten_files_keep_their_permissions(self) -> None:
+        out = fixtures.tmpdir(self)
+        path = self.make(out, "a" * 32, "t1")
+        path.chmod(0o640)
+        apply_gateway_costs(out, {"t1": 1.0})
+        self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+
+    def test_new_files_are_world_readable_like_other_results(self) -> None:
+        out = fixtures.tmpdir(self)
+        RunWriter(out, run_info(run_id="d" * 32))
+        self.assertEqual((out / ("d" * 32) / "run.json").stat().st_mode & 0o777, 0o644)
+
+
+class RunOutputTests(RunTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.cfg["tasks"][0]["prompt"] = PROMPT
+        for h in self.cfg["harnesses"].values():
+            h["env"]["FAKE_API_KEY"] = "${FAKE_API_KEY}"
+        patcher = mock.patch.dict(os.environ, {"FAKE_API_KEY": API_KEY})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.out = self.base / "results"
+
+    def run_dirs(self) -> list[Path]:
+        """Run directories, oldest first (their names are random)."""
+        dirs = [p for p in self.out.iterdir() if (p / "run.json").exists()]
+        return sorted(dirs, key=lambda p: json.loads((p / "run.json").read_text())["started_at"])
+
+    def test_one_run_dir_with_valid_run_json_and_trials(self) -> None:
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        (run_dir,) = self.run_dirs()
+        info = json.loads((run_dir / "run.json").read_text())
+        trials = read_jsonl(run_dir / "trials.jsonl")
+        legacy = fixtures.read_rows(self.out / "results.jsonl")
+        self.assertEqual(validate(info, RUN_SCHEMA), [])
+        self.assertEqual([validate(t, TRIAL_SCHEMA) for t in trials], [[], []])
+        self.assertEqual((len(trials), len({t["trial_id"] for t in trials})), (len(legacy), len(legacy)))
+        self.assertEqual({t["run_id"] for t in trials} | {info["run_id"]}, {run_dir.name})
+        self.assertIsNotNone(info["finished_at"])
+        self.assertEqual([t["status"] for t in trials], ["passed", "failed"])
+
+    def test_run_info_describes_the_run(self) -> None:
+        self.cfg["harnesses"]["claude"]["version"] = "2.0.1"
+        fixtures.call_quiet(hb.cmd_run, args(only=["claude"]), self.cfg, self.base)
+        (run_dir,) = self.run_dirs()
+        info = RunInfo.from_dict(json.loads((run_dir / "run.json").read_text()))
+        self.assertEqual([t.target_id for t in info.targets], ["claude@2.0.1:fix"])
+        self.assertEqual(
+            (info.sandboxed, len(info.config_sha256), len(info.suite_version), info.harness_bench_version),
+            (False, 64, 12, hb.VERSION),
+        )
+
+    def test_trials_hold_no_secret_prompt_or_agent_output(self) -> None:
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        (run_dir,) = self.run_dirs()
+        text = (run_dir / "trials.jsonl").read_text() + (run_dir / "run.json").read_text()
+        self.assertEqual((API_KEY in text, PROMPT in text), (False, False))
+
+    def test_artifact_uri_points_at_the_logs_of_the_trial(self) -> None:
+        fixtures.call_quiet(hb.cmd_run, args(only=["claude"]), self.cfg, self.base)
+        (run_dir,) = self.run_dirs()
+        uri = read_jsonl(run_dir / "trials.jsonl")[0]["artifact_uri"]
+        self.assertEqual(uri, "logs/fizzbuzz__claude__fix__r1")
+        self.assertTrue((self.out / f"{uri}.agent.jsonl").exists())
+
+    def test_legacy_row_is_unchanged_by_the_contract(self) -> None:
+        fixtures.call_quiet(hb.cmd_run, args(only=["claude"]), self.cfg, self.base)
+        row = fixtures.read_rows(self.out / "results.jsonl")[0]
+        self.assertEqual(
+            sorted(row),
+            sorted(
+                "ts task harness model rep passed agent_rc agent_timed_out wall_s parse_ok run_tag t_start t_end "
+                "sandboxed input output reasoning cache_read cache_write cost_reported turns cost_computed".split()
+            ),
+        )
+
+    def test_resume_writes_a_new_run_dir_with_no_trials(self) -> None:
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        first, second = self.run_dirs()
+        info = json.loads((second / "run.json").read_text())
+        self.assertEqual(
+            (
+                len(read_jsonl(first / "trials.jsonl")),
+                (second / "trials.jsonl").read_text(),
+                info["finished_at"] is None,
+            ),
+            (2, "", False),
+        )
+
+    def test_interrupted_run_is_resumed_into_a_new_run_dir(self) -> None:
+        fixtures.call_quiet(hb.cmd_run, args(only=["claude"]), self.cfg, self.base)
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        first, second = self.run_dirs()
+        self.assertEqual(
+            (
+                [t["target"]["harness"] for t in read_jsonl(first / "trials.jsonl")],
+                [t["target"]["harness"] for t in read_jsonl(second / "trials.jsonl")],
+            ),
+            (["claude"], ["pi"]),
+        )
+
+    def test_dry_run_writes_no_run_dir(self) -> None:
+        fixtures.call_quiet(hb.cmd_run, args(dry_run=True), self.cfg, self.base)
+        self.assertEqual([p.name for p in self.out.iterdir()], ["logs"])
+
+    def test_trials_record_a_test_timeout(self) -> None:
+        self.cfg["tasks"][0]["test"] = f"{fixtures.PY} -c 'import time; time.sleep(60)'"
+        self.cfg["tasks"][0]["test_timeout"] = 1
+        fixtures.call_quiet(hb.cmd_run, args(only=["claude"]), self.cfg, self.base)
+        (run_dir,) = self.run_dirs()
+        (line,) = read_jsonl(run_dir / "trials.jsonl")
+        self.assertEqual((line["status"], line["graders"][0]["timed_out"]), ("timeout", True))
+
+
+class HostileAgentOutputTests(RunTestCase):
+    """Parser output is untrusted: bad numbers must not abort the matrix or split the two result files."""
+
+    CASES = {
+        "nan cost": ('{"type":"result","total_cost_usd":NaN,"usage":{"input_tokens":5},"num_turns":1}', True),
+        "bool cost": ('{"type":"result","total_cost_usd":true,"usage":{"input_tokens":5},"num_turns":1}', True),
+        "negative tokens": ('{"type":"result","usage":{"input_tokens":-5,"output_tokens":3},"num_turns":1}', False),
+    }
+
+    def set_agent(self, output: str) -> None:
+        """Claude harness that prints `output` (a script file: command parts go through str.format)."""
+        script = self.base / "agent_output.py"
+        script.write_text(f"print({output!r})\n")
+        self.cfg["harnesses"]["claude"]["command"] = [fixtures.PY, str(script)]
+
+    def test_bad_numbers_keep_both_files_aligned(self) -> None:
+        for name, (output, parsed) in self.CASES.items():
+            with self.subTest(case=name):
+                shutil.rmtree(self.base / "results", ignore_errors=True)
+                self.set_agent(output)
+                out = fixtures.call_quiet(hb.cmd_run, args(only=["claude"]), self.cfg, self.base)
+                (run_dir,) = [p for p in (self.base / "results").iterdir() if (p / "run.json").exists()]
+                lines = read_jsonl(run_dir / "trials.jsonl")
+                self.assertEqual(len(fixtures.read_rows(self.base / "results" / "results.jsonl")), len(lines))
+                self.assertEqual([validate(t, TRIAL_SCHEMA) for t in lines], [[]])
+                self.assertEqual((lines[0]["usage"]["parsed"], lines[0]["usage"]["cost_usd"]), (parsed, None))
+                tokens = lines[0]["usage"]
+                kept = tokens["input_tokens"] + tokens["output_tokens"] if parsed else 0
+                self.assertEqual(kept, 5 if parsed else 0)
+                self.assertIn(lines[0]["trace_id"], out)  # the warning names the trial by its run tag
+                self.assertIsNotNone(json.loads((run_dir / "run.json").read_text())["finished_at"])
+                self.assertIn("warning", out)
+
+    def test_the_matrix_continues_after_a_bad_trial(self) -> None:
+        self.set_agent(self.CASES["bool cost"][0])
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        self.assertEqual(
+            [r["harness"] for r in fixtures.read_rows(self.base / "results" / "results.jsonl")], ["claude", "pi"]
+        )
+
+    def test_report_prints_a_warning_naming_the_sanitized_field(self) -> None:
+        self.set_agent(self.CASES["nan cost"][0])
+        fixtures.call_quiet(hb.cmd_run, args(only=["claude"]), self.cfg, self.base)
+        out = fixtures.call_quiet(hb.cmd_report, args(), self.cfg, self.base)
+        self.assertIn("warning: ", out)
+        self.assertIn("cost_reported", out)
+
+    def test_report_still_works_over_the_bad_legacy_row(self) -> None:
+        self.set_agent(self.CASES["negative tokens"][0])
+        fixtures.call_quiet(hb.cmd_run, args(only=["claude"]), self.cfg, self.base)
+        out = fixtures.call_quiet(hb.cmd_report, args(), self.cfg, self.base)
+        self.assertIn("no token data from the harness for: claude/fix (1)", out)
+
+
+class ReconcileContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.base = fixtures.tmpdir(self)
+        shutil.copytree(fixtures.ROOT / "tasks" / "fizzbuzz", self.base / "tasks" / "fizzbuzz")
+        self.server = ScriptedServer()
+        self.addCleanup(self.server.close)
+        patcher = mock.patch.dict(os.environ, {"HB_TEST_KEY": "k-test"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.cfg = fixtures.fake_config({})
+        self.cfg["matrix"] = [{"harness": "claude", "model": "fix"}]
+        self.cfg["litellm"] = {"base_url": self.server.url, "api_key": "${HB_TEST_KEY}"}
+
+    def test_gateway_cost_is_written_into_trials_by_trace_id(self) -> None:
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        tag = fixtures.read_rows(self.base / "results" / "results.jsonl")[0]["run_tag"]
+        self.server.route(
+            "/spend/logs/v2",
+            ok({"data": [{"request_tags": [tag], "spend": 0.25}, {"request_tags": [tag], "spend": 0.5}]}),
+        )
+        out = fixtures.call_quiet(hb.cmd_reconcile, mock.Mock(cost_source=None), self.cfg, self.base)
+        (trials_path,) = (self.base / "results").glob("*/trials.jsonl")
+        usage = read_jsonl(trials_path)[0]["usage"]
+        self.assertEqual((usage["costs"]["gateway"], usage["cost_usd"], usage["cost_source"]), (0.75, 0.75, "gateway"))
+        self.assertIn("contract: 1 trials updated", out)
+
+    def test_pre_phase_1_output_without_run_dirs_still_reconciles(self) -> None:
+        results = self.base / "results"
+        results.mkdir()
+        fixtures.write_rows(results / "results.jsonl", fixtures.run_row())
+        self.server.route("/spend/logs/v2", ok({"data": [{"request_tags": ["tag-1"], "spend": 0.4}]}))
+        out = fixtures.call_quiet(hb.cmd_reconcile, mock.Mock(cost_source=None), self.cfg, self.base)
+        self.assertEqual(
+            (fixtures.read_rows(results / "results.jsonl")[0]["cost_litellm"], "contract: 0 trials updated" in out),
+            (0.4, True),
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+`tests/test_report.py`:
+
+```python
+"""Tests for the report derived from the contract (`hbench.report`)."""
+
+import math
+import unittest
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import fixtures
+from hbench.core.convert import trials_from_rows
+from hbench.report import aggregate, fmt_int, fmt_money, render_markdown, write_csv
+from test_golden import GOLDEN, mask_summary
+
+NOW = datetime(2026, 11, 24, 12, 30)
+
+
+def golden_trials() -> list[Any]:
+    return trials_from_rows(fixtures.read_rows(GOLDEN / "results.jsonl"))
+
+
+class GoldenOutputTests(unittest.TestCase):
+    def test_markdown_matches_the_golden_summary(self) -> None:
+        trials = golden_trials()
+        md = render_markdown(aggregate(trials, "auto"), trials, "auto", NOW)
+        self.assertEqual(md.split("\n", 1)[0], "# Harness x model — 2026-11-24 12:30")
+        self.assertEqual(mask_summary(md), (GOLDEN / "summary.md").read_text())
+
+    def test_csv_matches_the_golden_summary(self) -> None:
+        path = fixtures.tmpdir(self) / "summary.csv"
+        write_csv(aggregate(golden_trials(), "auto"), path)
+        self.assertEqual(path.read_text(), (GOLDEN / "summary.csv").read_text())
+
+
+class AggregateTests(unittest.TestCase):
+    def test_legacy_rows_without_parse_ok_or_costs_aggregate(self) -> None:
+        row = {
+            "task": "t",
+            "harness": "h",
+            "model": "m",
+            "rep": 1,
+            "passed": True,
+            "input": 100,
+            "output": 10,
+            "cache_read": 0,
+            "cache_write": 0,
+            "turns": 2,
+            "wall_s": 3.0,
+        }
+        (entry,) = aggregate(trials_from_rows([row]), "auto")
+        self.assertEqual(
+            (entry["cost_total"], entry["cost_source"], entry["parse_failures"], entry["tokens_total"]),
+            (None, "n/a", 0, 110),
+        )
+
+    def test_forced_gateway_cost_without_data_gives_none_not_zero(self) -> None:
+        trials = trials_from_rows([fixtures.run_row(cost_computed=1.0)])
+        (entry,) = aggregate(trials, "litellm")
+        self.assertEqual((entry["cost_total"], entry["cost_per_solved"], entry["cost_source"]), (None, None, "n/a"))
+
+    def test_forced_source_keeps_the_legacy_name(self) -> None:
+        trials = trials_from_rows([fixtures.run_row(cost_computed=1.0)])
+        (entry,) = aggregate(trials, "computed")
+        self.assertEqual((entry["cost_total"], entry["cost_source"]), (1.0, "computed"))
+
+    def test_unknown_cost_source_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            aggregate(trials_from_rows([fixtures.run_row()]), "bogus")
+
+    def test_unsolved_pair_has_infinite_cost_per_solved(self) -> None:
+        trials = trials_from_rows([fixtures.run_row(passed=False, cost_computed=1.0)])
+        (entry,) = aggregate(trials, "auto")
+        self.assertEqual((entry["cost_per_solved"], entry["tokens_per_solved"]), (float("inf"), float("inf")))
+
+
+class FormatTests(unittest.TestCase):
+    def test_money_none_inf_small_and_large(self) -> None:
+        self.assertEqual([fmt_money(v) for v in (None, math.inf, 0.12345, 12.345)], ["n/a", "inf", "$0.1235", "$12.35"])
+
+    def test_int_none_inf_and_grouping(self) -> None:
+        self.assertEqual([fmt_int(v) for v in (None, math.inf, 1234567.4)], ["n/a", "n/a", "1,234,567"])
+
+
+class WriteCsvTests(unittest.TestCase):
+    def test_writes_header_and_one_line_per_pair(self) -> None:
+        path: Path = fixtures.tmpdir(self) / "s.csv"
+        write_csv(aggregate(trials_from_rows([fixtures.run_row()]), "auto"), path)
+        self.assertEqual(len(path.read_text().splitlines()), 2)
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+`tests/test_cli.py`:
+
+```python
+"""Tests for the single CLI (`python3 -m hbench`), the LiteLLM profile and the two shims."""
+
+import copy
+import importlib
+import json
+import shutil
+import subprocess
+import sys
+import unittest
+from typing import Any
+from unittest import mock
+
+import fixtures
+from hbench import cli
+from hbench.core.schema import schema_document
+from hbench.profiles import apply_litellm_profile
+from test_litellm import ScriptedServer, ok
+
+ROOT = fixtures.ROOT
+PY = fixtures.PY
+
+
+def run_script(*argv: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([PY, *argv], cwd=ROOT, capture_output=True, text=True)
+
+
+class SchemaExportTests(unittest.TestCase):
+    def test_module_entry_point_prints_the_schema_document(self) -> None:
+        p = run_script("-m", "hbench", "schema", "export")
+        self.assertEqual((p.returncode, json.loads(p.stdout)), (0, schema_document()))
+
+    def test_out_writes_the_same_document_to_a_file(self) -> None:
+        path = fixtures.tmpdir(self) / "schema.json"
+        with fixtures.quiet() as out:
+            cli.main(["schema", "export", "--out", str(path)])
+        self.assertEqual((json.loads(path.read_text()), out.getvalue()), (schema_document(), ""))
+
+    def test_output_is_stable_and_indented(self) -> None:
+        with fixtures.quiet() as out:
+            cli.main(["schema", "export"])
+        self.assertEqual(out.getvalue(), json.dumps(schema_document(), indent=2, sort_keys=True) + "\n")
+
+
+class EntryPointTests(unittest.TestCase):
+    def test_importing_the_main_module_does_not_run_the_cli(self) -> None:
+        with mock.patch.object(sys, "argv", ["hbench"]):  # a run would fail on the missing subcommand
+            importlib.import_module("hbench.__main__")
+
+    def test_engine_lookup_puts_the_repo_root_on_the_path(self) -> None:
+        with mock.patch.object(sys, "path", ["/nonexistent"]):
+            engine = cli._engine()
+            self.assertEqual(sys.path[0], str(ROOT))
+        self.assertTrue(hasattr(engine, "cmd_run"))
+
+
+class ProgNameTests(unittest.TestCase):
+    def test_usage_names_the_script_that_was_run(self) -> None:
+        for script in ("harness_bench.py", "harness_bench_litellm.py"):
+            with self.subTest(script=script):
+                self.assertIn(f"usage: {script}", run_script(script, "--help").stdout)
+
+    def test_module_invocation_is_shown_as_python_dash_m(self) -> None:
+        self.assertIn("usage: python3 -m hbench", run_script("-m", "hbench", "--help").stdout)
+
+    def test_litellm_shim_help_says_the_profile_is_applied_automatically(self) -> None:
+        out = run_script("harness_bench_litellm.py", "--help").stdout
+        self.assertIn("LiteLLM profile is applied automatically", out)
+
+    def test_plain_help_has_no_litellm_epilog(self) -> None:
+        self.assertNotIn("applied automatically", run_script("harness_bench.py", "--help").stdout)
+
+
+class ShimHelpTests(unittest.TestCase):
+    def test_both_shims_list_the_three_commands(self) -> None:
+        for script in ("harness_bench.py", "harness_bench_litellm.py"):
+            with self.subTest(script=script):
+                p = run_script(script, "--help")
+                self.assertEqual(p.returncode, 0, p.stderr)
+                for command in ("run", "report", "reconcile"):
+                    self.assertIn(command, p.stdout)
+
+    def test_missing_subcommand_is_a_usage_error(self) -> None:
+        for script in ("harness_bench.py", "harness_bench_litellm.py"):
+            with self.subTest(script=script):
+                self.assertEqual(run_script(script).returncode, 2)
+
+    def test_litellm_shim_does_not_inject_the_profile_into_other_commands(self) -> None:
+        p = run_script("harness_bench_litellm.py", "schema", "export")
+        self.assertEqual((p.returncode, json.loads(p.stdout)), (0, schema_document()))
+
+
+class LitellmProfileTests(unittest.TestCase):
+    def config(self) -> dict[str, Any]:
+        cfg = fixtures.fake_config({})
+        cfg["litellm"] = {"base_url": "https://x", "api_key": "${K}"}
+        return cfg
+
+    def test_does_not_mutate_its_input(self) -> None:
+        cfg = self.config()
+        before = copy.deepcopy(cfg)
+        with fixtures.quiet():
+            result = apply_litellm_profile(cfg)
+        self.assertEqual(cfg, before)
+        self.assertIsNot(result, cfg)
+
+    def test_drops_cursor_and_forces_litellm_cost(self) -> None:
+        with fixtures.quiet() as out:
+            result = apply_litellm_profile(self.config())
+        self.assertEqual(
+            ("cursor" in result["harnesses"], len(result["matrix"]), result["cost_source"], result["output_dir"]),
+            (False, 4, "litellm", "results-litellm"),
+        )
+        self.assertIn("ignored 1 matrix entries", out.getvalue())
+
+    def test_an_explicit_output_dir_is_kept(self) -> None:
+        cfg = self.config()
+        cfg["output_dir"] = "mine"
+        with fixtures.quiet():
+            self.assertEqual(apply_litellm_profile(cfg)["output_dir"], "mine")
+
+    def test_missing_litellm_section_exits(self) -> None:
+        with self.assertRaises(SystemExit) as cm:
+            apply_litellm_profile(fixtures.fake_config({}))
+        self.assertIn("needs a 'litellm' section", str(cm.exception.code))
+
+    def test_matrix_entry_for_an_undefined_harness_exits(self) -> None:
+        cfg = self.config()
+        cfg["matrix"].append({"harness": "ghost", "model": "m"})
+        with fixtures.quiet(), self.assertRaises(SystemExit) as cm:
+            apply_litellm_profile(cfg)
+        self.assertIn("undefined harnesses", str(cm.exception.code))
+
+
+class CliDispatchTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server = ScriptedServer()
+        self.addCleanup(self.server.close)
+        self.base = fixtures.tmpdir(self)
+        shutil.copytree(ROOT / "tasks" / "fizzbuzz", self.base / "tasks" / "fizzbuzz")
+        self.cfg = fixtures.fake_config({})
+        self.cfg["litellm"] = {"base_url": self.server.url, "api_key": "k-test"}
+        self.cfg_path = self.base / "config.json"
+        self.cfg_path.write_text(json.dumps(self.cfg))
+        self.server.route("/spend/logs/v2", ok({"data": [], "total_pages": 1}))
+
+    def cli(self, *argv: str) -> str:
+        with fixtures.quiet() as out:
+            cli.main([*argv, "--config", str(self.cfg_path)])
+        return out.getvalue()
+
+    def rows(self, out_dir: str) -> list[dict[str, Any]]:
+        return fixtures.read_rows(self.base / out_dir / "results.jsonl")
+
+    def test_run_with_litellm_profile_drops_cursor_and_forces_gateway_cost(self) -> None:
+        with mock.patch("time.sleep") as sleep:
+            out = self.cli("run", "--litellm", "--settle", "0", "--allow-unsandboxed")
+        sleep.assert_called_once_with(0)
+        self.assertEqual(out.count("# Harness x model"), 1)  # one report, printed by reconcile after the wait
+        self.assertGreater(out.index("# Harness x model"), out.index("waiting"))
+        harnesses = {r["harness"] for r in self.rows("results-litellm")}
+        self.assertEqual(harnesses, {"claude", "opencode", "pi", "codex"})
+        summary = (self.base / "results-litellm" / "summary.md").read_text()
+        self.assertEqual(("Cost source: `litellm`" in summary, "waiting 0s" in out), (True, True))
+
+    def test_run_without_the_profile_keeps_every_harness_and_reports_directly(self) -> None:
+        out = self.cli("run", "--allow-unsandboxed")
+        self.assertEqual(
+            (
+                {r["harness"] for r in self.rows("results")} >= {"cursor"},
+                "waiting" in out,
+                "Cost source: `auto`" in out,
+            ),
+            (True, False, True),
+        )
+
+    def test_report_and_reconcile_commands_dispatch_to_the_engine(self) -> None:
+        self.cli("run", "--allow-unsandboxed", "--only", "claude")
+        self.assertIn("Cost source: `auto`", self.cli("report"))
+        self.assertIn("runs matched by tag", self.cli("reconcile"))
+
+    def test_cost_source_flag_conflicts_with_the_profile(self) -> None:
+        with fixtures.quiet(), self.assertRaises(SystemExit) as cm:
+            self.cli("report", "--litellm", "--cost-source", "computed")
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_report_with_the_profile_forces_the_gateway_cost(self) -> None:
+        self.cli("run", "--allow-unsandboxed", "--only", "claude")
+        shutil.copytree(self.base / "results", self.base / "results-litellm")
+        self.assertIn("Cost source: `litellm`", self.cli("report", "--litellm"))
+
+
+class ShimMainTests(unittest.TestCase):
+    def test_engine_main_delegates_to_the_cli(self) -> None:
+        import harness_bench as hb
+
+        with mock.patch.object(sys, "argv", ["harness_bench.py", "schema", "export"]), fixtures.quiet() as out:
+            hb.main()
+        self.assertEqual(json.loads(out.getvalue()), schema_document())
+
+    def test_litellm_shim_adds_the_profile_flag_after_the_subcommand(self) -> None:
+        import harness_bench_litellm as hbl
+
+        with mock.patch.object(cli, "main") as cli_main, mock.patch.object(sys, "argv", ["x", "run", "--config", "c"]):
+            hbl.main()
+        cli_main.assert_called_once_with(["run", "--litellm", "--config", "c"], epilog=mock.ANY)
+
+    def test_litellm_shim_passes_flags_without_a_subcommand_through(self) -> None:
+        import harness_bench_litellm as hbl
+
+        with mock.patch.object(cli, "main") as cli_main, mock.patch.object(sys, "argv", ["x", "--help"]):
+            hbl.main()
+        cli_main.assert_called_once_with(["--help"], epilog=mock.ANY)
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
 ## Sandbox
 
 `sandbox/Dockerfile`:
@@ -3454,8 +6030,8 @@ def main():
     shared = tmp / "shared"  # probe/tag files written from inside the container
     shared.mkdir()
     try:
-        for f in ("harness_bench.py",):
-            shutil.copy(ROOT / f, tmp)
+        shutil.copy(ROOT / "harness_bench.py", tmp)
+        shutil.copytree(ROOT / "hbench", tmp / "hbench", ignore=shutil.ignore_patterns("__pycache__"))
         shutil.copytree(ROOT / "tasks" / "fizzbuzz", tmp / "tasks" / "fizzbuzz")
         env = dict(
             os.environ,

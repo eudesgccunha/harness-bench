@@ -7,9 +7,9 @@ current name in the existing config and results format until Phase 1 migrates it
 | Plan term | Current name | Meaning |
 |---|---|---|
 | Target | pair, matrix entry (`{"harness", "model"}`) | One candidate: harness × model. |
-| Trial | run, one `results.jsonl` row | One attempt of one target on one task, keyed by `(task, harness, model, rep)`. |
+| Trial | run, one `results.jsonl` row; contract model `TrialResult` (`trials.jsonl`) | One attempt of one target on one task, keyed by `(task, harness, model, rep)`. |
 | Rep | `rep` | Index of a repeated trial, from 1. |
-| Run | one `harness_bench.py run` call | All trials of one invocation. No `run_id` today. |
+| Run | one `harness_bench.py run` call; contract model `RunInfo` (`run.json`) | All trials of one invocation, identified by `run_id`. |
 | Suite | `tasks` in the config | The list of tasks a run uses. |
 | Task | task (`id`, `repo`, `ref`, `prompt`, `test`, `hidden_tests`, `protected_paths`) | One problem with a starting repo and a way to grade it. |
 | Grader | `test` command + `hidden_tests` | Decides pass or fail. Today: exit code 0 without timeout means pass. |

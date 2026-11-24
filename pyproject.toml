@@ -28,26 +28,22 @@ line-length = 120
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "B", "UP"]
-# Disabled so Phase 0 changes no engine behavior (revisit when the engine is split):
-# B023: `step()` in cmd_run is a closure called inside the same loop iteration, never deferred.
 # UP036: the explicit `sys.version_info < (3, 12)` guard gives a clear error message on old Pythons.
-ignore = ["B023", "UP036"]
+ignore = ["UP036"]
 
 [tool.ruff.lint.per-file-ignores]
 # E731: short lambda helper in the doc generator.
 "scripts/build_md.py" = ["E731", "E501"]
-# E501: existing long lines that `ruff format` cannot wrap (prose strings, docstrings).
-# Listed per file so every new file still gets E501.
-"harness_bench.py" = ["E501"]
+# E501: long prose strings in the fake agent.
 "tests/fake_agent.py" = ["E501"]
 
 [tool.mypy]
 python_version = "3.12"
-files = ["harness_bench.py", "harness_bench_litellm.py", "tests/fixtures.py", "tests/test_golden.py", "tests/test_parsers.py", "tests/test_workspace.py", "tests/test_run.py", "tests/test_litellm.py", "scripts/docs_check.py"]
+files = ["harness_bench.py", "harness_bench_litellm.py", "tests/fixtures.py", "tests/test_golden.py", "tests/test_parsers.py", "tests/test_workspace.py", "tests/test_run.py", "tests/test_litellm.py", "scripts/docs_check.py", "hbench", "tests/test_core_models.py", "tests/test_core_schema.py", "tests/test_contract_output.py", "tests/test_report.py", "tests/test_cli.py"]
 # Non-strict for the legacy engine. New modules are strict and listed below.
 
 [[tool.mypy.overrides]]
-module = ["fixtures", "test_golden", "docs_check"]
+module = ["fixtures", "test_golden", "docs_check", "hbench.*", "test_core_models", "test_core_schema"]
 # `strict = true` is not honored per module, so the strict flags are spelled out.
 disallow_any_generics = true
 disallow_subclassing_any = true
@@ -63,7 +59,7 @@ strict_equality = true
 
 [[tool.mypy.overrides]]
 # Same strict flags, except these tests call the untyped legacy engine (disallow_untyped_calls off).
-module = ["test_parsers", "test_workspace", "test_run", "test_litellm"]
+module = ["test_parsers", "test_workspace", "test_run", "test_litellm", "test_contract_output", "test_report", "test_cli"]
 disallow_any_generics = true
 disallow_subclassing_any = true
 disallow_untyped_defs = true
@@ -79,9 +75,8 @@ strict_equality = true
 # B404: importing subprocess is the engine's job.
 # B603: subprocess calls use list argv without a shell.
 # B310: urllib only talks to the configured LiteLLM, https enforced by check_litellm_url.
-# B607: only `git` is flagged (harness_bench.py: git called by name). PATH is controlled by the operator, not the agent.
 # B602 (shell=True) is deliberately NOT skipped.
-skips = ["B404", "B603", "B310", "B607"]
+skips = ["B404", "B603", "B310"]
 
 [tool.coverage.run]
 branch = true
@@ -92,7 +87,7 @@ patch = ["subprocess"]
 # `harness_bench.py` there combines with the repo file of the same name.
 relative_files = true
 # `include` (not `source`) so the temp-dir copies match.
-include = ["*/harness_bench.py", "*/harness_bench_litellm.py", "*/tests/fixtures.py"]
+include = ["*/harness_bench.py", "*/harness_bench_litellm.py", "*/hbench/**/*.py", "*/tests/fixtures.py"]
 omit = ["*/tests/fake_*.py", "*/tests/test_*.py", "*/tests/smoke.py"]
 
 [tool.coverage.report]

@@ -31,8 +31,8 @@ def main():
     shared = tmp / "shared"  # probe/tag files written from inside the container
     shared.mkdir()
     try:
-        for f in ("harness_bench.py",):
-            shutil.copy(ROOT / f, tmp)
+        shutil.copy(ROOT / "harness_bench.py", tmp)
+        shutil.copytree(ROOT / "hbench", tmp / "hbench", ignore=shutil.ignore_patterns("__pycache__"))
         shutil.copytree(ROOT / "tasks" / "fizzbuzz", tmp / "tasks" / "fizzbuzz")
         env = dict(
             os.environ,

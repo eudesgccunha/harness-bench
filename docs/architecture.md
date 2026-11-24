@@ -62,3 +62,27 @@ This table maps the code as it was at `e44c25c`. The test suite and tooling adde
 - `summary.md` and `summary.csv` from a fixed `results.jsonl` (first line masked).
 - `results.jsonl` from a fake run, with `ts`, `wall_s`, `run_tag`, `t_start` and `t_end`
   masked.
+
+## Phase 1: data contract and `hbench/`
+
+New code lives in the `hbench/` package ([ADR 0005](adr/0005-data-contract-and-package.md)); the
+engine stays in `harness_bench.py` and calls into it.
+
+| Module | Role |
+|---|---|
+| `hbench/core/models.py` | Frozen contract models (`Target`, `GraderResult`, `Costs`, `Usage`, `TrialResult`, `RunInfo`), `SCHEMA_VERSION`, `to_dict`/`from_dict` that reject unknown fields. |
+| `hbench/core/ids.py` | `new_run_id`, `trial_id`, `sha256_json`. |
+| `hbench/core/schema.py` | Hand-written JSON Schema for `trials.jsonl` and `run.json`, and a small stdlib validator. |
+| `hbench/core/convert.py` | Legacy `results.jsonl` row to `TrialResult` (`trial_from_row`, `trials_from_rows`). |
+| `hbench/results.py` | `RunWriter` (`run.json` and `trials.jsonl` per run) and `apply_gateway_costs` (used by `reconcile`). |
+| `hbench/report.py` | `aggregate`, `render_markdown`, `write_csv` over `TrialResult`s; `harness_bench.cmd_report` calls it. |
+| `hbench/profiles.py` | `apply_litellm_profile`: the LiteLLM-only config profile. |
+| `hbench/cli.py` | The single CLI (`python3 -m hbench`); both scripts are shims over it. |
+
+Output per `run`: the legacy `results.jsonl` is still appended (resume, `reconcile` and old
+folders depend on it), and each invocation also writes `<run_id>/run.json` and
+`<run_id>/trials.jsonl`. Trials hold references only (`artifact_uri` is `logs/<tag>`).
+
+Couplings 2 (implicit row schema), 3 (status, partly: `timeout` exists, `error` has no
+producer yet), 5 (report mixed with stats) and 6 (wrapper depends on internals) are addressed.
+`cmd_run` still does everything else; it is split in later phases.

@@ -37,6 +37,35 @@ smoke, fagent, flite, tgold, tfix, tpars, twork, trun, tlite, dock, entry, de2e,
         ".dockerignore",
     ],
 )
+HBENCH_SOURCES = [
+    "hbench/__init__.py",
+    "hbench/core/__init__.py",
+    "hbench/core/ids.py",
+    "hbench/core/models.py",
+    "hbench/core/schema.py",
+    "hbench/core/convert.py",
+    "hbench/results.py",
+    "hbench/report.py",
+    "hbench/profiles.py",
+    "hbench/cli.py",
+    "hbench/__main__.py",
+]
+HBENCH_TESTS = [
+    "tests/test_core_models.py",
+    "tests/test_core_schema.py",
+    "tests/test_contract_output.py",
+    "tests/test_report.py",
+    "tests/test_cli.py",
+]
+
+
+def file_blocks(paths):
+    """One heading-less `path` + fenced Python block per file."""
+    return "".join(f"`{p}`:\n\n```python\n{R(p)}```\n\n" for p in paths)
+
+
+hbench_md = file_blocks(HBENCH_SOURCES)
+hbench_tests_md = file_blocks(HBENCH_TESTS)
 md = f"""# harness-bench: cost per solved task (harness × model)
 
 A script to compare **harness × model** pairs on real tasks from your own code. It measures pass rate, tokens and **cost per solved task**.
@@ -93,6 +122,7 @@ If a run shows cost `n/a`, its tag did not reach LiteLLM. See the "LiteLLM: what
 harness-bench/
 ├── harness_bench.py
 ├── harness_bench_litellm.py     # LiteLLM-only variant (no Cursor)
+├── hbench/                      # data contract, report and single CLI (ADR 0005)
 ├── README.md / AGENTS.md
 ├── scripts/build_md.py          # generates this HARNESS_BENCH.md
 ├── sandbox/Dockerfile           # sandbox image with the CLIs
@@ -313,7 +343,11 @@ In `sandbox.prefix`: `{{workdir}}` and `{{env_file}}`.
 ```python
 {pyl}```
 
-## `config.litellm.example.json`
+## `hbench/` package
+
+New code lives in the `hbench/` package ([ADR 0005](docs/adr/0005-data-contract-and-package.md)); the two scripts above call into it.
+
+{hbench_md}## `config.litellm.example.json`
 
 ```json
 {cfgl}```
@@ -386,7 +420,7 @@ Unit tests call the engine in-process (`python3 -m unittest discover -s tests -p
 ```python
 {tlite}```
 
-## Sandbox
+{hbench_tests_md}## Sandbox
 
 `sandbox/Dockerfile`:
 

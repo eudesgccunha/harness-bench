@@ -69,6 +69,13 @@ def fake_config(extra_env: Mapping[str, str]) -> dict[str, Any]:
     }
 
 
+def copy_engine(dest: Path) -> None:
+    """Copy the engine scripts and the `hbench` package into `dest`, so they run as a standalone checkout."""
+    for name in ("harness_bench.py", "harness_bench_litellm.py"):
+        shutil.copy(ROOT / name, dest)
+    shutil.copytree(ROOT / "hbench", dest / "hbench", ignore=shutil.ignore_patterns("__pycache__"))
+
+
 def tmpdir(test: unittest.TestCase) -> Path:
     """A temp directory removed when `test` finishes."""
     path = Path(tempfile.mkdtemp(prefix="hb-unit-")).resolve()

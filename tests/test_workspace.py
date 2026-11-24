@@ -58,6 +58,9 @@ class ValidateConfigTests(unittest.TestCase):
         cfg["harnesses"]["bad name"] = cfg["harnesses"]["claude"]
         self.assert_rejected(cfg, "invalid harness name")
 
+    def test_unknown_cost_source_is_rejected_with_the_valid_names(self) -> None:
+        self.assert_rejected(base_config(cost_source="bogus"), "auto, litellm, computed, reported")
+
     def test_spend_key_in_env_passthrough_is_rejected(self) -> None:
         cfg = base_config(litellm={"base_url": "https://x", "api_key": "${SPEND}"}, env_passthrough=["SPEND"])
         self.assert_rejected(cfg, "spend key")
@@ -223,6 +226,17 @@ class PrepareWorkdirTests(unittest.TestCase):
         self.assertEqual(
             [hb.is_git_source(s) for s in ("a.git", "https://x/y", "git@h:r", "plain")], [True] * 3 + [False]
         )
+
+
+class GitBinTests(unittest.TestCase):
+    def test_resolves_the_git_executable(self) -> None:
+        with mock.patch("shutil.which", return_value="/usr/bin/git"):
+            self.assertEqual(hb.git_bin(), "/usr/bin/git")
+
+    def test_exits_when_git_is_missing(self) -> None:
+        with mock.patch("shutil.which", return_value=None), self.assertRaises(SystemExit) as cm:
+            hb.git_bin()
+        self.assertEqual(cm.exception.code, "git not found on PATH")
 
 
 class MakeBaselineTests(unittest.TestCase):

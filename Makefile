@@ -4,7 +4,7 @@ PYTHON ?= python3
 UV ?= uv
 UV_RUN = $(UV) run --locked
 UNITTEST = -m unittest discover -s tests -p 'test_*.py'
-BANDIT_TARGETS = harness_bench.py harness_bench_litellm.py scripts
+BANDIT_TARGETS = harness_bench.py harness_bench_litellm.py hbench scripts
 
 .DEFAULT_GOAL := help
 

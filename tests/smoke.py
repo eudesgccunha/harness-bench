@@ -68,8 +68,7 @@ def make_git_task(tmp):
 def main():
     tmp = Path(tempfile.mkdtemp(prefix="hb-smoke-"))
     try:
-        for f in ("harness_bench.py", "harness_bench_litellm.py"):
-            shutil.copy(ROOT / f, tmp)
+        fixtures.copy_engine(tmp)
         shutil.copytree(ROOT / "tasks" / "fizzbuzz", tmp / "tasks" / "fizzbuzz")
         tags_file, probe_file = tmp / "tags.txt", tmp / "probe.jsonl"
         os.environ.update(
@@ -117,6 +116,10 @@ def main():
         stderr_logs = "".join(f.read_text() for f in logs.glob("*.agent.stderr"))
         check(API_KEY not in stderr_logs and "***REDACTED***" in stderr_logs, "logs: harness secrets redacted")
         check(any(f.read_text() for f in logs.glob("fizzbuzz__claude__*.diff")), "audit diff saved")
+        (run_dir,) = [p.parent for p in (tmp / "results").glob("*/trials.jsonl")]
+        trials_text = (run_dir / "trials.jsonl").read_text()
+        check(len(trials_text.splitlines()) == 5 and (run_dir / "run.json").exists(), "contract: run.json + 5 trials")
+        check(API_KEY not in trials_text and "fix it" not in trials_text, "contract: no secret or prompt in trials")
         probes = [json.loads(x) for x in probe_file.read_text().splitlines()]
         check(all(not Path(pr["cwd"]).is_relative_to(tmp) for pr in probes), "workdir outside benchmark repo")
         check(not (tmp / "work").exists(), "no work dir created inside repo")

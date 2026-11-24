@@ -7,8 +7,9 @@
 | [Roadmap](roadmap.md) | Proposed improvements, based on OpenBench, LiteLLM Lens and the Hugging Face harness adapters study |
 | [Evolution plan](evolution-plan.md) | Phases 0–9 to turn the scripts into a model selection eval with a versioned data contract |
 | [Architecture](architecture.md) | Current engine structure and the couplings to break |
-| [Decisions](adr/) | ADRs: stdlib runtime, incremental extraction, unittest, uv dev tooling |
+| [Decisions](adr/) | ADRs: stdlib runtime, incremental extraction, unittest, uv dev tooling, data contract and package |
 | [Phase 0 plan](superpowers/plans/2026-11-23-phase-0-safety-net.md) | Task-by-task plan for golden tests, CI and secret scanning |
+| [Phase 1 plan](superpowers/plans/2026-11-24-phase-1-data-contract.md) | Task-by-task plan for the data contract, structured output, report from the contract and the single CLI |
 
 Terms are defined in [`CONTEXT.md`](../CONTEXT.md).
 

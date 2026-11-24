@@ -25,8 +25,7 @@ PY = fixtures.PY
 def make_tmp(test: unittest.TestCase) -> Path:
     tmp = Path(tempfile.mkdtemp(prefix="hb-golden-"))
     test.addCleanup(shutil.rmtree, tmp, True)
-    for f in ("harness_bench.py", "harness_bench_litellm.py"):
-        shutil.copy(ROOT / f, tmp)
+    fixtures.copy_engine(tmp)
     (tmp / "results").mkdir()
     (tmp / "config.json").write_text('{"output_dir": "results"}')
     return tmp
