@@ -44,3 +44,4 @@ current name in the existing config and results format until Phase 1 migrates it
 | Tie | `tie_with` (report), `Tie` column | A target whose cost per solved task interval overlaps the interval of its group leader; the ranking cannot separate them. |
 | Pareto frontier | `pareto` (report) | Targets no other target beats on both cost per run and pass rate. |
 | Negative control | `null` harness (`parser: null`) | A harness that calls no model. If it solves a task, the hidden tests are too lenient. |
+| TrialSpec | `hbench.core.models.TrialSpec`, one line of `plan` output | Names one trial (`run_id`, `trial_id`, task, harness, model, `rep`, `config_sha256`) so any worker can run it with `run-trial`. Carries no command, prompt, path, env or secret: the worker resolves everything from its own copy of the config, and a spec that does not match it is refused. |

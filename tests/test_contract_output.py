@@ -238,8 +238,8 @@ class RunWriterTests(unittest.TestCase):
         writer = RunWriter(out, info)
         run_dir = out / info.run_id
         self.assertEqual(RunInfo.from_dict(json.loads((run_dir / "run.json").read_text())), info)
-        writer.append(trial())
-        writer.append(trial(rep=2))
+        writer.append_once(trial(trial_id="1" * 16))
+        writer.append_once(trial(trial_id="2" * 16, rep=2))
         lines = read_jsonl(run_dir / "trials.jsonl")
         self.assertEqual([line["rep"] for line in lines], [1, 2])
 
@@ -258,7 +258,7 @@ class ApplyGatewayCostsTests(unittest.TestCase):
     def make(self, out: Path, run_id: str, *traces: str | None) -> Path:
         writer = RunWriter(out, run_info(run_id=run_id))
         for rep, trace in enumerate(traces, 1):
-            writer.append(trial(run_id=run_id, trace_id=trace, rep=rep))
+            writer.append_once(trial(run_id=run_id, trace_id=trace, rep=rep, trial_id=f"{rep:016x}"))
         return out / run_id / "trials.jsonl"
 
     def test_sets_gateway_cost_on_matching_trials_across_run_dirs(self) -> None:

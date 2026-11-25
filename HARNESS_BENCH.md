@@ -54,7 +54,8 @@ If a run shows cost `n/a`, its tag did not reach LiteLLM. See the "LiteLLM: what
 harness-bench/
 ├── harness_bench.py
 ├── harness_bench_litellm.py     # LiteLLM-only variant (no Cursor)
-├── hbench/                      # data contract, report, suites, sinks and single CLI (ADR 0005, 0008, 0011)
+├── hbench/                      # data contract, report, suites, sinks, orchestrator API and single CLI (ADR 0005, 0008, 0011, 0012)
+├── adapters/                    # shell, GitHub Actions, Kubernetes and Python examples over plan / run-trial / finish (ADR 0012)
 ├── docs/sql/                    # reference schema and scorecard queries of the sqlite sink (ADR 0011)
 ├── docs/dashboards/             # example Grafana dashboard; scripts/synthetic_db.py writes demo data
 ├── README.md / AGENTS.md
@@ -117,6 +118,8 @@ Outputs in `results/`:
 - `logs/`: each agent's JSON output, stderr, setup, tests, and the `.diff` of everything the agent changed. Known secrets show as `***REDACTED***`.
 
 To also send each trial to a SQLite database and OTLP traces, add a `sinks` list to the config (see `docs/running-a-benchmark.md` and `config.example.json`): `{"type": "sqlite", "path": "results/bench.sqlite"}` and `{"type": "otlp", "endpoint": "https://collector:4318", "headers": {"x-key": "${OTLP_KEY}"}}`. `trials.jsonl` is written first and stays the source of truth; a sink that fails is warned about once and left out for that run, and `python3 -m hbench export --config config.json --run results/<run_id>` sends a run again (idempotent by `trial_id`). Spans hold ids, status, model, tokens and cost, never a prompt, response or log. The agent gets `BENCH_RUN_ID` and `BENCH_TRIAL_ID` in its environment.
+
+To run the trials of one run on several workers (processes, CI jobs, pods), use the three orchestrator commands: `python3 -m hbench plan --config config.json > specs.jsonl` starts the run and prints one `TrialSpec` JSON per line, `python3 -m hbench run-trial --config config.json --spec -` runs the spec on its stdin and prints the `TrialResult`, and `python3 -m hbench finish --config config.json --run RUN_ID` closes the run and writes the report. A spec names a trial and carries no command, prompt, path, env or secret: each worker resolves everything from its own copy of the config, and a spec that does not match it is refused before anything runs. Running a spec twice is safe (the second returns the first result). Workers on one run directory need a shared filesystem with working `flock`. The Python API is `hbench/api.py` (`load_config`, `start_run`, `plan`, `run_trial`, `finish_run`); examples are in `adapters/` and the guide is `docs/orchestrator-integration.md` ([ADR 0012](docs/adr/0012-plan-and-run-trial-api.md)).
 
 `run` only starts with a sandbox configured (`sandbox.type` `docker`, or a `sandbox.prefix`; see [Security](#security)). Inside a disposable VM, add `--allow-unsandboxed`. To continue a run that was killed, use `run --resume RUN_ID` (see [Sandbox types, limits, resume and doctor](#sandbox-types-limits-resume-and-doctor)).
 
@@ -494,9 +497,10 @@ from hbench import runners as _runners  # noqa: E402
 from hbench.calibration import Calibration, read_calibration  # noqa: E402
 from hbench.core.convert import row_from_trial, trial_from_row_lenient, trials_from_rows  # noqa: E402
 from hbench.core.ids import new_run_id, sha256_json, trial_id  # noqa: E402
-from hbench.core.models import GraderResult, RunInfo, Target  # noqa: E402
+from hbench.core.models import GraderResult, RunInfo, Target, TrialResult  # noqa: E402
 from hbench.graders import GRADERS as GRADERS, Change, GradeContext, GradePlan, compose, grade_plan  # noqa: E402
 from hbench.results import HEARTBEAT_FILE, Heartbeat, ResumeError, RunWriter, apply_gateway_costs  # noqa: E402
+from hbench.results import locked_append  # noqa: E402
 from hbench.results import heartbeat_is_live, read_heartbeat, read_trials  # noqa: E402
 from hbench.runners import PARSERS as PARSERS, empty_usage as empty_usage, json_lines as json_lines  # noqa: E402
 from hbench.runners import num as num, runner_for  # noqa: E402
@@ -1467,7 +1471,9 @@ def validate_task_behavior(cfg: Mapping[str, Any], task: Mapping[str, Any], base
     return TaskCheck(task_id=task["id"], untouched_passed=untouched, solution_passed=solved)
 
 
-def make_run_info(cfg: Mapping[str, Any], only: Sequence[str] | None, sandbox: Sandbox) -> RunInfo:
+def make_run_info(
+    cfg: Mapping[str, Any], only: Sequence[str] | None, sandbox: Sandbox, reps: int | None = None
+) -> RunInfo:
     """Metadata of this `run`. The config hash covers `${VAR}` references, never expanded values, and the
     config as written: the tasks that came from suites are not part of it."""
     targets = tuple(
@@ -1491,6 +1497,7 @@ def make_run_info(cfg: Mapping[str, Any], only: Sequence[str] | None, sandbox: S
         platform=platform.platform(),
         sandboxed=sandbox.isolated,
         sandbox=sandbox.describe(),
+        reps=reps,
         targets=targets,
     )
 
@@ -1537,18 +1544,22 @@ class _Planned:
     price: Mapping[str, Any] | None
 
 
-def _planned_trials(cfg: Mapping[str, Any], only: Sequence[str] | None, reps: int) -> Iterator[_Planned]:
+def planned_trials(cfg: Mapping[str, Any], only: Sequence[str] | None, reps: int) -> Iterator[_Planned]:
     """Every trial of the matrix in run order: pairs, then tasks, then repetitions."""
-    prices = cfg.get("prices", {})
     for pair in cfg["matrix"]:
-        hname, model = pair["harness"], pair["model"]
-        if only and hname not in only:
+        if only and pair["harness"] not in only:
             continue
         for task in cfg["tasks"]:
             for rep in range(1, reps + 1):
-                harness = cfg["harnesses"][hname]
-                price = prices.get(pair.get("price", model))
-                yield _Planned(task, harness, hname, model, rep, runner_for(harness), price)
+                yield planned_trial(cfg, pair, task, rep)
+
+
+def planned_trial(cfg: Mapping[str, Any], pair: Mapping[str, Any], task: Mapping[str, Any], rep: int) -> _Planned:
+    """The trial of one matrix pair, one task and one repetition."""
+    hname, model = pair["harness"], pair["model"]
+    harness = cfg["harnesses"][hname]
+    price = cfg.get("prices", {}).get(pair.get("price", model))
+    return _Planned(task, harness, hname, model, rep, runner_for(harness), price)
 
 
 def planned_trial_id(run_id: str, planned: _Planned) -> str:
@@ -1596,8 +1607,7 @@ def restore_legacy_rows(writer: RunWriter, results_path: Path) -> None:
     done = done_keys(results_path)
     for trial in writer.trials():
         if (trial.task_id, trial.target.harness, trial.target.model, trial.rep) not in done:
-            with results_path.open("a") as f:
-                f.write(json.dumps(row_from_trial(trial)) + "\n")
+            locked_append(results_path, json.dumps(row_from_trial(trial)) + "\n")
 
 
 def _run_matrix(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path, git_root: Path) -> None:
@@ -1624,7 +1634,7 @@ def _run_matrix(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path, gi
     if work_root:
         print(f"work dir: {work_root}")
     if not (args.dry_run or resume_id):
-        writer = RunWriter(out_dir, make_run_info(cfg, args.only, sandbox))
+        writer = RunWriter(out_dir, make_run_info(cfg, args.only, sandbox, reps))
     finished = done_keys(results_path)
     finished_ids = writer.finished_trial_ids() if writer else set()
     shared = None
@@ -1659,7 +1669,7 @@ def _run_matrix(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path, gi
     try:
         try:
             with shared.heartbeat if shared else contextlib.nullcontext():
-                for planned in _planned_trials(cfg, args.only, reps):
+                for planned in planned_trials(cfg, args.only, reps):
                     task, hname, model, rep = planned.task, planned.hname, planned.model, planned.rep
                     key = (task["id"], hname, model, rep)
                     tid = planned_trial_id(writer.info.run_id, planned) if writer else ""
@@ -1682,7 +1692,56 @@ def _run_matrix(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path, gi
         cmd_report(args, cfg, base)
 
 
-def _run_trial(m: _Matrix, planned: _Planned, tid: str) -> None:
+def sink_feed(cfg: Mapping[str, Any], base: Path) -> SinkFeed:
+    """The sinks of the config behind a feed that reports a failing sink (with secrets redacted) and never raises."""
+    secrets = [os.environ.get(v, "") for v in spend_key_vars(cfg)]
+    return SinkFeed(make_sinks(cfg, base), lambda message: print(redact(message, secrets), file=sys.stderr))
+
+
+def run_trial_isolated(
+    cfg: Mapping[str, Any], base: Path, writer: RunWriter, planned: _Planned, tid: str
+) -> TrialResult:
+    """One trial of a run that other workers share (ADR 0012): its own private work dir (unless `work_dir` is set),
+    its own private baseline git dir, its own sandbox session and its own sink feed, all gone when it returns or
+    raises. It is `_run_trial`, so every defense of `run` applies. The caller has validated the trial and checked the
+    sandbox rule."""
+    logs_dir = base / cfg.get("output_dir", "results") / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    secrets = [os.environ.get(v, "") for v in spend_key_vars(cfg)]
+    with tempfile.TemporaryDirectory(prefix="harness-bench-git-") as git_root:
+        plant_token(Path(git_root))
+        work_root = resolve_work_root(cfg, base)
+        try:
+            shared = _Matrix(
+                cfg=cfg,
+                base=base,
+                work_root=work_root,
+                git_root=Path(git_root),
+                logs_dir=logs_dir,
+                results_path=logs_dir.parent / "results.jsonl",
+                writer=writer,
+                # Nobody reads a worker's heartbeat (the run heartbeat belongs to `run`): its file stays in the
+                # private git dir and is never started as a thread.
+                heartbeat=Heartbeat(Path(git_root) / HEARTBEAT_FILE),
+                sandbox=make_sandbox(cfg),
+                plans={planned.task["id"]: grade_plan(planned.task)},
+                redactor=load_redactor(cfg["judge"]) if uses_judge(cfg) else None,
+                secrets=secrets,
+                keep=False,
+                resuming=True,  # a retry may follow a worker that was killed: reclaim what it left for this trial
+                sinks=sink_feed(cfg, base),
+            )
+            shared.sinks.open(writer.info)
+            try:
+                return _run_trial(shared, planned, tid)
+            finally:
+                shared.sinks.close(writer.info)
+        finally:
+            if not cfg.get("work_dir"):
+                shutil.rmtree(work_root, ignore_errors=True)
+
+
+def _run_trial(m: _Matrix, planned: _Planned, tid: str) -> TrialResult:
     """One trial: workdir, setup, baseline, agent, audit diff, protected paths, graders; then its two result rows
     (`trials.jsonl` first, flushed to disk, so a crash between the two can only lose the legacy row). The trial's
     sandbox session is always destroyed."""
@@ -1813,18 +1872,21 @@ def _run_trial(m: _Matrix, planned: _Planned, tid: str) -> None:
         ),
         image_digest=m.sandbox.image_digest(),
     )
-    m.writer.append(trial)
-    m.sinks.write(trial)  # after `trials.jsonl`, which is the source of truth; a failing sink never stops the run
-    with m.results_path.open("a") as f:
-        f.write(json.dumps(row) + "\n")
-    tokens = sum(usage[k] for k in ("input", "output", "reasoning", "cache_read", "cache_write"))
-    print(
-        f"done  {tag} passed={row['passed']} tokens={tokens}"
-        f" cost={row['cost_computed'] if row['cost_computed'] is not None else usage['cost_reported']}",
-        flush=True,
-    )
+    stored = m.writer.append_once(trial)
+    if stored is trial:
+        m.sinks.write(trial)  # after `trials.jsonl`, which is the source of truth; a failing sink never stops the run
+        locked_append(m.results_path, json.dumps(row) + "\n")
+        tokens = sum(usage[k] for k in ("input", "output", "reasoning", "cache_read", "cache_write"))
+        print(
+            f"done  {tag} passed={row['passed']} tokens={tokens}"
+            f" cost={row['cost_computed'] if row['cost_computed'] is not None else usage['cost_reported']}",
+            flush=True,
+        )
+    else:  # another worker recorded this very trial first (an orchestrator retry): its record counts
+        print(f"skip  {tag} (already recorded)", flush=True)
     if not m.keep:
         rmtree_inside(workdir, m.work_root)
+    return stored
 
 
 # ---------------------------------------------------------------- LiteLLM
@@ -2132,8 +2194,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hbench import cli  # noqa: E402
 from hbench.profiles import apply_litellm_profile  # noqa: E402
 
-LITELLM_COMMANDS = {"run", "report", "reconcile"}
-EPILOG = "The LiteLLM profile is applied automatically to run, report and reconcile (same as passing --litellm)."
+LITELLM_COMMANDS = {"run", "report", "reconcile", "plan", "run-trial", "finish"}
+EPILOG = (
+    "The LiteLLM profile is applied automatically to run, report, reconcile, plan, run-trial and finish "
+    "(same as passing --litellm)."
+)
 
 
 def load_config(path: str | Path) -> tuple[dict[str, Any], Path]:
@@ -2155,7 +2220,7 @@ if __name__ == "__main__":
 
 ## `hbench/` package
 
-New code lives in the `hbench/` package ([ADR 0005](docs/adr/0005-data-contract-and-package.md)); the two scripts above call into it. `hbench/sandboxes/` holds the sandboxes and `hbench/doctor.py` the `doctor` checks.
+New code lives in the `hbench/` package ([ADR 0005](docs/adr/0005-data-contract-and-package.md)); the two scripts above call into it. `hbench/sandboxes/` holds the sandboxes, `hbench/doctor.py` the `doctor` checks and `hbench/api.py` the API for orchestrators.
 
 `hbench/__init__.py`:
 
@@ -2216,9 +2281,12 @@ from enum import Enum, StrEnum
 from types import MappingProxyType, UnionType
 from typing import Any, ClassVar, Self, get_args, get_origin, get_type_hints
 
-SCHEMA_VERSION = "1.3.0"
+SCHEMA_VERSION = "1.4.0"
 _VERSION_RE = re.compile(r"^(\d+)\.\d+\.\d+$")
 _MAJOR = SCHEMA_VERSION.split(".")[0]
+_RUN_ID_RE = re.compile(r"[0-9a-f]{32}")  # `new_run_id()`: a UUID4 in hex
+_TRIAL_ID_RE = re.compile(r"[0-9a-f]{16}")  # `trial_id()`: 16 hex characters
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 class ContractError(ValueError):
@@ -2574,6 +2642,7 @@ class RunInfo(_Model):
     sandboxed: bool
     targets: tuple[Target, ...]
     sandbox: str = "unknown"  # what ran the commands: `docker:<image>`, `prefix`, `local-tmp`, a plugin's name
+    reps: int | None = None  # repetitions per task and pair the run plans; None: not recorded (the config says)
 
     DECODERS: ClassVar[Mapping[str, Callable[[Any], Any]]] = {
         "started_at": _parse_datetime,
@@ -2587,6 +2656,39 @@ class RunInfo(_Model):
         _require_aware("started_at", self.started_at)
         if self.finished_at is not None:
             _require_aware("finished_at", self.finished_at)
+        if self.reps is not None and self.reps < 1:
+            raise ContractError(f"reps must be >= 1, got {self.reps}")
+
+
+@dataclass(frozen=True, kw_only=True)
+class TrialSpec(_Model):
+    """Names one trial of a run so any worker can run it (ADR 0012). It carries no command, prompt, path, env or
+    secret: the worker resolves everything from its own copy of the config, which `config_sha256` must match."""
+
+    schema_version: str = SCHEMA_VERSION
+    run_id: str
+    trial_id: str
+    task_id: str
+    harness: str
+    model: str
+    rep: int
+    config_sha256: str
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _check_schema_version(self.schema_version)
+        for name, pattern in (
+            ("run_id", _RUN_ID_RE),
+            ("trial_id", _TRIAL_ID_RE),
+            ("config_sha256", _SHA256_RE),
+        ):
+            if pattern.fullmatch(getattr(self, name)) is None:
+                raise ContractError(f"TrialSpec.{name} must match {pattern.pattern}")
+        for name in ("task_id", "harness", "model"):
+            if not getattr(self, name):
+                raise ContractError(f"TrialSpec.{name} must not be empty")
+        if self.rep < 1:
+            raise ContractError(f"rep must be >= 1, got {self.rep}")
 ```
 
 `hbench/core/schema.py`:
@@ -2724,6 +2826,7 @@ RUN_SCHEMA: dict[str, Any] = {
             "platform": _STRING,
             "sandboxed": _BOOLEAN,
             "sandbox": _STRING,
+            "reps": {"type": ["integer", "null"], "minimum": 1},
             "targets": {"type": "array", "items": {"$ref": "#/$defs/target"}},
         },
         [
@@ -2743,9 +2846,29 @@ RUN_SCHEMA: dict[str, Any] = {
 }
 
 
+TRIAL_SPEC_SCHEMA: dict[str, Any] = {
+    "$schema": _DIALECT,
+    "$id": f"{_ID_BASE}/trial_spec/{SCHEMA_VERSION}",
+    "title": "Trial spec",
+    **_object(
+        {
+            "schema_version": _STRING,
+            "run_id": _STRING,
+            "trial_id": _STRING,
+            "task_id": _STRING,
+            "harness": _STRING,
+            "model": _STRING,
+            "rep": {"type": "integer", "minimum": 1},
+            "config_sha256": _STRING,
+        },
+        ["schema_version", "run_id", "trial_id", "task_id", "harness", "model", "rep", "config_sha256"],
+    ),
+}
+
+
 def schema_document() -> dict[str, Any]:
-    """Both schemas in one document, as `schema export` prints it."""
-    return {"trial": TRIAL_SCHEMA, "run": RUN_SCHEMA}
+    """All schemas in one document, as `schema export` prints it."""
+    return {"trial": TRIAL_SCHEMA, "run": RUN_SCHEMA, "trial_spec": TRIAL_SPEC_SCHEMA}
 
 
 # ---------------------------------------------------------------- validator
@@ -5262,6 +5385,7 @@ from hbench.core.models import RunInfo, TrialResult
 from hbench.sinks.base import SinkError
 
 SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
+BUSY_TIMEOUT_S = 60.0  # workers of one run share the database: a writer waits for the lock instead of failing
 
 _UPSERT_RUN = """
 INSERT INTO runs (run_id, started_at, finished_at, harness_bench_version, config_sha256, suite_version, sandbox,
@@ -5417,7 +5541,7 @@ class SqliteSink:
         except OSError as e:
             raise SinkError(f"cannot read the schema {SCHEMA_PATH}: {e}") from e
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        db = sqlite3.connect(self.path)
+        db = sqlite3.connect(self.path, timeout=BUSY_TIMEOUT_S)
         self._db = db
         db.executescript(schema)
         with db:
@@ -5464,6 +5588,7 @@ from typing import Any, Self
 
 from hbench.core.models import RunInfo, TrialResult, TrialStatus
 from hbench.net import NetError, post_bounded, url_allowed
+from hbench.results import LogCursor, locked_log
 from hbench.sinks.base import SinkError
 
 TRACES_FILE = "traces.otlp.jsonl"
@@ -5592,8 +5717,7 @@ class OtlpSink:
         self.headers = dict(headers)
         self.timeout = timeout
         self._opened: tuple[RunInfo, Path] | None = None
-        self._known: set[str] = set()  # the span ids already in the file
-        self._glue = ""  # a newline when the file ends in a line cut short by a crash
+        self._cursor = LogCursor()
         self._post_failed = False  # after one failed POST the file is still written but nothing is sent again
 
     @classmethod
@@ -5612,17 +5736,9 @@ class OtlpSink:
     def open(self, info: RunInfo) -> None:
         run_dir = self.out_dir / info.run_id
         run_dir.mkdir(parents=True, exist_ok=True)
-        path = run_dir / TRACES_FILE
-        text = path.read_text() if path.exists() else ""
-        self._known = set()
-        for line in text.splitlines():
-            try:
-                self._known |= _span_ids(json.loads(line))
-            except ValueError:  # a line cut short by a crash holds no span
-                continue
-        self._glue = "\n" if text and not text.endswith("\n") else ""
         self._post_failed = False
-        self._opened = (info, path)
+        self._cursor = LogCursor()  # the span ids already in the file: each append reads only what was added
+        self._opened = (info, run_dir / TRACES_FILE)
 
     def _state(self) -> tuple[RunInfo, Path]:
         if self._opened is None:
@@ -5630,13 +5746,21 @@ class OtlpSink:
         return self._opened
 
     def _append(self, span_id: str, request: Mapping[str, Any]) -> None:
-        """Add the request to the file unless its span is already there (one `write` call: one line)."""
-        if span_id in self._known:
-            return
-        with self._state()[1].open("a") as f:
-            f.write(f"{self._glue}{json.dumps(request)}\n")
-        self._glue = ""
-        self._known.add(span_id)
+        """Add the request to the file unless its span is already there (one `write` call: one line). Workers share the
+        file (ADR 0012), so what is there is read again under the lock: a span another worker wrote is not repeated, and
+        a line cut short by a crash is dropped."""
+        with locked_log(self._state()[1], self._cursor) as (f, complete):
+            for line in complete.splitlines():  # only the lines added since the last append
+                try:
+                    self._cursor.ids |= _span_ids(json.loads(line))
+                except ValueError:  # a line that is no JSON holds no span
+                    continue
+            if span_id in self._cursor.ids:
+                return
+            f.write(f"{json.dumps(request)}\n")
+            f.flush()
+            os.fsync(f.fileno())
+            self._cursor.ids.add(span_id)
 
     def _send(self, request: Mapping[str, Any]) -> None:
         """POST the request when there is an endpoint. A failure raises a `SinkError` that holds no header."""
@@ -6498,7 +6622,9 @@ needs: reopening a run directory and the heartbeat that says whether a run is st
 Files hold references only (log path prefixes), never prompts, agent output or diffs.
 """
 
+import contextlib
 import dataclasses
+import fcntl
 import json
 import os
 import re
@@ -6507,11 +6633,12 @@ import socket
 import sys
 import tempfile
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Self
+from typing import IO, Any, Self, TextIO
 
 from hbench.core.models import ContractError, Costs, RunInfo, TrialResult
 
@@ -6535,6 +6662,82 @@ def _atomic_write(path: Path, text: str) -> None:
         raise
 
 
+@contextlib.contextmanager
+def _exclusive(f: IO[Any]) -> Iterator[None]:
+    """An exclusive `flock` on the open file, released when the block ends."""
+    fcntl.flock(f, fcntl.LOCK_EX)
+    try:
+        yield
+    finally:
+        fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def locked_append(path: Path, text: str) -> None:
+    """Append `text` to `path` under an exclusive `flock`: write, flush, `fsync`, unlock. Workers on one run directory
+    take turns, so no line is ever torn or interleaved (ADR 0012; it needs a filesystem where `flock` works). Under the
+    lock no live writer is mid-write, so a last line without its newline was cut short by a crash: it is dropped."""
+    with path.open("a+b") as f, _exclusive(f):
+        size = os.fstat(f.fileno()).st_size
+        if size:
+            f.seek(size - 1)
+            if f.read(1) != b"\n":
+                f.seek(0)
+                data = f.read()
+                f.truncate(data.rfind(b"\n") + 1)
+        f.write(text.encode())
+        f.flush()
+        os.fsync(f.fileno())
+
+
+@dataclass
+class LogCursor:
+    """What a reader of a line file keeps between calls of `locked_log`: where it stopped, which file that was, and
+    what the caller learned from the lines (`ids`). `fresh` says the last read began at the start of the file."""
+
+    inode: int | None = None
+    offset: int = 0
+    fresh: bool = True
+    ids: set[str] = field(default_factory=set)
+
+
+@contextlib.contextmanager
+def locked_log(path: Path, cursor: LogCursor) -> Iterator[tuple[TextIO, str]]:
+    """Open the line file `path` for reading and appending under an exclusive `flock` and yield it with its complete
+    lines. Under the lock no live writer is mid-write, so anything after the last newline was cut short by a crash and
+    is dropped first. The caller writes its line (one `write`, then `flush` and `fsync`).
+
+    Only the lines added since the `cursor`'s last read come back, so a long file is not read again for every line.
+    A file that shrank or was replaced (another inode) is read from the start: `cursor.fresh` is True and
+    `cursor.ids` is emptied; the caller refills it from the lines it gets."""
+    with path.open("a+") as f, _exclusive(f):
+        stat = os.fstat(f.fileno())
+        start = cursor.offset if cursor.inode == stat.st_ino and cursor.offset <= stat.st_size else 0
+        f.seek(start)
+        text = f.read()
+        complete = text[: text.rfind("\n") + 1]
+        end = start + len(complete.encode())
+        if len(complete) != len(text):
+            f.truncate(end)
+        if start == 0:
+            cursor.ids.clear()
+        cursor.fresh, cursor.inode, cursor.offset = start == 0, stat.st_ino, end
+        yield f, complete
+
+
+@contextlib.contextmanager
+def trial_lock(run_dir: Path, trial_id: str) -> Iterator[None]:
+    """An exclusive `flock` on `<run_dir>/.locks/<trial_id>.lock`, held for the whole trial: two workers given the same
+    spec never run it at once (the second waits). The lock goes when its holder dies, however it dies."""
+    lock_dir = run_dir / ".locks"
+    lock_dir.mkdir(exist_ok=True)
+    with (lock_dir / f"{trial_id}.lock").open("a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
 RUN_ID = re.compile(r"[0-9a-f]{32}")  # `new_run_id()`: a UUID4 in hex
 
 
@@ -6551,16 +6754,19 @@ class RunWriter:
         self.info = info
         self.run_dir = out_dir / info.run_id
         self.trials_path = self.run_dir / "trials.jsonl"
+        self._cursor = LogCursor()  # the `trial_id`s `append_once` has seen, so it reads only what was added since
         if not existing:
             self.run_dir.mkdir(parents=True)
             self.trials_path.touch()
             self._write_info()
 
     @classmethod
-    def open_existing(cls, out_dir: Path, run_id: str) -> Self:
-        """The writer of the run `run_id` in `out_dir`, appending to its `trials.jsonl`. A last line cut short by a
-        crash is dropped, so the next trial starts on a line of its own. Raises `ResumeError` for an id that is
-        not a run id, a run that does not exist, or files that are not valid."""
+    def open_existing(cls, out_dir: Path, run_id: str, *, repair: bool = True) -> Self:
+        """The writer of the run `run_id` in `out_dir`, appending to its `trials.jsonl`. With `repair`, a last line
+        cut short by a crash is dropped, so the next trial starts on a line of its own; a worker that shares the run
+        with others passes `repair=False` (a line that looks cut short may be another worker's write in progress:
+        `append_once` repairs it under the lock). Raises `ResumeError` for an id that is not a run id, a run that
+        does not exist, or files that are not valid."""
         if RUN_ID.fullmatch(run_id) is None:
             raise ResumeError(f"{run_id!r} is not a run id (32 lowercase hex characters, the name of a run directory)")
         info_path = out_dir / run_id / "run.json"
@@ -6571,7 +6777,8 @@ class RunWriter:
         except ValueError as e:  # ContractError and json.JSONDecodeError are both ValueErrors
             raise ResumeError(f"{info_path} is not valid run data: {e}") from e
         writer = cls(out_dir, info, existing=True)
-        writer._drop_partial_last_line()
+        if repair:
+            writer._drop_partial_last_line()
         return writer
 
     def _drop_partial_last_line(self) -> None:
@@ -6590,12 +6797,26 @@ class RunWriter:
     def finished_trial_ids(self) -> set[str]:
         return {trial.trial_id for trial in self.trials()}
 
-    def append(self, trial: TrialResult) -> None:
-        """Add a trial and make it durable before returning: `fsync`, so a crash right after cannot lose it."""
-        with self.trials_path.open("a") as f:
+    def append_once(self, trial: TrialResult) -> TrialResult:
+        """Add a trial and make it durable before returning (`fsync`), unless a trial with this `trial_id` is already in
+        the file: then nothing is written and the stored trial is returned (`trial` itself when it was written). Check
+        and write happen under one lock, so two workers that ran the same trial (an orchestrator retry) leave one line.
+        Under the lock no other writer is mid-write, so a last line cut short belongs to a crashed one and is dropped
+        first. Only the lines added since the last call are read."""
+        with locked_log(self.trials_path, self._cursor) as (f, complete):
+            self._cursor.ids |= {i for i in map(_line_trial_id, complete.splitlines()) if isinstance(i, str)}
+            if trial.trial_id in self._cursor.ids:
+                f.seek(0)
+                return next(
+                    TrialResult.from_dict(json.loads(line))
+                    for line in f.read().splitlines()
+                    if _line_trial_id(line) == trial.trial_id
+                )
             f.write(json.dumps(trial.to_dict()) + "\n")
             f.flush()
             os.fsync(f.fileno())
+            self._cursor.ids.add(trial.trial_id)
+            return trial
 
     def close(self, finished_at: datetime) -> None:
         self.info = dataclasses.replace(self.info, finished_at=finished_at)
@@ -6603,6 +6824,15 @@ class RunWriter:
 
     def _write_info(self) -> None:
         _atomic_write(self.run_dir / "run.json", json.dumps(self.info.to_dict(), indent=2) + "\n")
+
+
+def _line_trial_id(line: str) -> object:
+    """The `trial_id` of one line of `trials.jsonl`, or None for a line that holds no JSON object with one."""
+    try:
+        data = json.loads(line)
+    except ValueError:
+        return None
+    return data.get("trial_id") if isinstance(data, dict) else None
 
 
 def read_run(run_dir: Path) -> tuple[RunInfo, list[TrialResult]]:
@@ -7780,6 +8010,278 @@ def suite_tasks(suite: Suite) -> list[dict[str, Any]]:
     return tasks
 ```
 
+`hbench/api.py`:
+
+```python
+"""The stable surface for orchestrators (ADR 0012): `load_config`, `start_run`, `plan`, `run_trial`, `finish_run`.
+
+An orchestrator plans a run once, runs each `TrialSpec` anywhere (a process, a CI job, a pod) and finishes the run:
+
+    config = load_config(path)
+    run = start_run(config)
+    for spec in plan(config, run):
+        run_trial(config, spec)  # the specs are independent: run them in parallel, on any worker
+    finish_run(config, run.run_id)
+
+A `TrialSpec` names a trial and carries no command, prompt, path, env or secret: the worker resolves everything from
+its own copy of the config, and `run_trial` refuses a spec that does not match it (`SpecError`) before anything runs.
+Every defense of `run` applies to `run_trial`: it is the same `_run_trial` of the engine, in its own private dirs.
+"""
+
+import argparse
+import contextlib
+import json
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from types import ModuleType
+from typing import Any
+
+from hbench.core.models import RunInfo, TrialResult, TrialSpec
+from hbench.profiles import apply_litellm_profile
+from hbench.results import ResumeError, RunWriter, read_run, trial_lock
+
+
+class ApiError(Exception):
+    """Base of every error of this module; the message is safe to show (it holds no secret)."""
+
+
+class ConfigError(ApiError):
+    """The config cannot be read, is not valid, or an argument (`reps`) is not."""
+
+
+class SpecError(ApiError):
+    """A `TrialSpec` is malformed, or does not match this config or run. Nothing ran and nothing was written."""
+
+
+class RunError(ApiError):
+    """A run directory is missing or invalid, was started with another config, or its report could not be written."""
+
+
+class SandboxRequiredError(ApiError):
+    """No sandbox is configured and the caller did not accept running without one."""
+
+
+def _engine() -> ModuleType:
+    """The engine module. Imported here, not at the top: the CLI imports this module."""
+    from hbench.cli import _engine as engine_module
+
+    return engine_module()
+
+
+@dataclass(frozen=True)
+class Config:
+    """The expanded, validated config (the tasks of its suites included) and the directory its paths resolve from."""
+
+    cfg: Mapping[str, Any]
+    base: Path
+
+    @property
+    def out_dir(self) -> Path:
+        return self.base / str(self.cfg.get("output_dir", "results"))
+
+
+@contextlib.contextmanager
+def _exits_as(error: type[ApiError]) -> Iterator[None]:
+    """The engine reports a bad config or a refusal by exiting with a message; a library raises instead."""
+    try:
+        yield
+    except SystemExit as e:
+        raise error(str(e.code)) from None
+
+
+def config_from(raw: Mapping[str, Any], base: Path) -> Config:
+    """The `Config` of an already parsed config file living in `base`."""
+    engine = _engine()
+    with _exits_as(ConfigError):
+        expanded: Mapping[str, Any] = engine.expand_suites(raw, base)
+        engine.validate_config(expanded)
+    return Config(cfg=expanded, base=base)
+
+
+def load_config(path: Path | str, *, litellm: bool = False) -> Config:
+    """Read, expand (suites) and validate the config file at `path`. With `litellm`, the LiteLLM profile applies."""
+    cfg_path = Path(path).resolve()
+    try:
+        raw = json.loads(cfg_path.read_text())
+    except (OSError, ValueError) as e:
+        raise ConfigError(f"cannot read the config {cfg_path}: {e}") from e
+    if not isinstance(raw, dict):
+        raise ConfigError(f"the config {cfg_path} must be a JSON object")
+    if litellm:
+        with _exits_as(ConfigError):
+            raw = apply_litellm_profile(raw)
+    return config_from(raw, cfg_path.parent)
+
+
+def _reps(config: Config, reps: int | None) -> int:
+    count = config.cfg.get("reps", 1) if reps is None else reps
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        raise ConfigError(f"reps must be a whole number of at least 1, got {count!r}")
+    return count
+
+
+def _config_hash(config: Config) -> str:
+    result: str = _engine().config_hash(config.cfg)
+    return result
+
+
+def start_run(config: Config, *, only: Sequence[str] | None = None, reps: int | None = None) -> RunInfo:
+    """Create `<output_dir>/<run_id>/run.json` and `trials.jsonl`, as `run` does, and return the run."""
+    count = _reps(config, reps)  # a bad argument stops before a run directory exists
+    engine = _engine()
+    config.out_dir.mkdir(parents=True, exist_ok=True)
+    (config.out_dir / "logs").mkdir(exist_ok=True)
+    info: RunInfo = engine.make_run_info(config.cfg, only, engine.make_sandbox(config.cfg), count)
+    return RunWriter(config.out_dir, info).info
+
+
+def _open_writer(config: Config, run_id: str) -> RunWriter:
+    """The writer of a run that exists and was started with this config; `RunError` otherwise."""
+    try:
+        writer = RunWriter.open_existing(config.out_dir, run_id, repair=False)
+    except ResumeError as e:
+        raise RunError(str(e)) from e
+    if writer.info.config_sha256 != _config_hash(config):
+        raise RunError(f"the config changed since run {run_id} started; use the config it started with")
+    return writer
+
+
+def open_run(config: Config, run_id: str) -> RunInfo:
+    """A run `start_run` made earlier (to plan it again). Raises `RunError` when it does not exist, is not valid
+    contract data or was started with another config."""
+    return _open_writer(config, run_id).info
+
+
+def plan(
+    config: Config, run: RunInfo, *, only: Sequence[str] | None = None, reps: int | None = None
+) -> list[TrialSpec]:
+    """Every trial of the run, in the order `run` executes them: pairs, then tasks, then repetitions. Pure: it reads
+    nothing from disk and starts nothing."""
+    count = _reps(config, reps if reps is not None else run.reps)
+    if run.reps is not None and count > run.reps:
+        raise RunError(f"run {run.run_id} plans {run.reps} repetition(s), not {count}")
+    sha = _config_hash(config)
+    if run.config_sha256 != sha:
+        raise RunError(f"the config changed since run {run.run_id} started; use the config it started with")
+    engine = _engine()
+    return [
+        TrialSpec(
+            run_id=run.run_id,
+            trial_id=engine.planned_trial_id(run.run_id, planned),
+            task_id=planned.task["id"],
+            harness=planned.hname,
+            model=planned.model,
+            rep=planned.rep,
+            config_sha256=sha,
+        )
+        for planned in engine.planned_trials(config.cfg, only, count)
+    ]
+
+
+def parse_spec(text: str) -> TrialSpec:
+    """The `TrialSpec` in one JSON text. Raises `SpecError` for anything else: bad JSON, unknown or missing keys, a
+    value that does not fit (a path-like `run_id`, an empty name)."""
+    try:
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            raise ValueError("a spec is a JSON object")
+        return TrialSpec.from_dict(data)
+    except ValueError as e:  # ContractError and json.JSONDecodeError are both ValueErrors
+        raise SpecError(f"not a valid trial spec: {e}") from e
+
+
+def _resolve(config: Config, spec: TrialSpec) -> Any:
+    """The engine's planned trial that `spec` names. Raises `SpecError` unless the config hash, the task, the harness,
+    the pair and the recomputed `trial_id` all agree with this config. Reads no file."""
+    engine, cfg = _engine(), config.cfg
+    if spec.config_sha256 != _config_hash(config):
+        raise SpecError("config_sha256 is not the hash of this config: the worker must use the config of the plan")
+    task = next((t for t in cfg["tasks"] if t["id"] == spec.task_id), None)
+    if task is None:
+        raise SpecError(f"unknown task {spec.task_id!r}")
+    if spec.harness not in cfg["harnesses"]:
+        raise SpecError(f"unknown harness {spec.harness!r}")
+    pair = next((p for p in cfg["matrix"] if (p["harness"], p["model"]) == (spec.harness, spec.model)), None)
+    if pair is None:
+        raise SpecError(f"{spec.harness!r} with model {spec.model!r} is not a pair of the matrix")
+    planned = engine.planned_trial(cfg, pair, task, spec.rep)
+    if engine.planned_trial_id(spec.run_id, planned) != spec.trial_id:
+        raise SpecError("trial_id is not the one this config gives the trial")
+    return planned
+
+
+def _recorded(trials: Sequence[TrialResult], spec: TrialSpec) -> TrialResult | None:
+    return next((t for t in trials if t.trial_id == spec.trial_id), None)
+
+
+def _check_in_plan(config: Config, spec: TrialSpec, planned: Any, info: RunInfo) -> None:
+    """The trial must belong to the run: its target is one of the run's targets (`--only` left the others out) and its
+    repetition is within the reps the run planned (a run of an older version did not record them: the config's)."""
+    target = (spec.harness, planned.runner.version(), spec.model)
+    if target not in {(t.harness, t.harness_version, t.model) for t in info.targets}:
+        raise SpecError(f"{spec.harness!r} with model {spec.model!r} is not a target of run {spec.run_id}")
+    reps = info.reps if info.reps is not None else _reps(config, None)
+    if spec.rep > reps:
+        raise SpecError(f"rep {spec.rep} is beyond the {reps} repetition(s) run {spec.run_id} plans")
+
+
+def run_trial(config: Config, spec: TrialSpec, *, allow_unsandboxed: bool = False) -> TrialResult:
+    """Run the trial `spec` names and return its result, which is also in `trials.jsonl` (and `results.jsonl`).
+
+    A spec that does not match the config or its run is a `SpecError`: nothing runs and nothing is written. A trial
+    already in `trials.jsonl` returns that result and runs nothing (a retry is safe). Without a sandbox, a
+    `SandboxRequiredError` unless `allow_unsandboxed`. The trial gets its own private work dir, baseline git dir,
+    sandbox session and sink feed; they are removed when it returns or raises."""
+    engine = _engine()
+    planned = _resolve(config, spec)
+    try:
+        info, recorded = read_run(config.out_dir / spec.run_id)
+    except ResumeError as e:
+        raise SpecError(f"run {spec.run_id} cannot be used: {e}") from e
+    if (info.run_id, info.config_sha256) != (spec.run_id, spec.config_sha256):
+        raise SpecError(f"run {spec.run_id} was not started with this config")
+    _check_in_plan(config, spec, planned, info)
+    done = _recorded(recorded, spec)
+    if done:
+        return done
+    with _exits_as(SandboxRequiredError):
+        engine.require_sandbox(config.cfg, allow_unsandboxed)
+    run_dir = config.out_dir / spec.run_id
+    with trial_lock(run_dir, spec.trial_id):
+        # A worker that held the lock first may have recorded the trial while this one waited.
+        done = _recorded(read_run(run_dir)[1], spec)
+        if done:
+            return done
+        writer = RunWriter(config.out_dir, info, existing=True)
+        with _exits_as(ConfigError):
+            result: TrialResult = engine.run_trial_isolated(config.cfg, config.base, writer, planned, spec.trial_id)
+        return result
+
+
+def finish_run(config: Config, run_id: str, *, report: bool = True) -> RunInfo:
+    """Mark the run finished (a run that has a finish time keeps it), close its sinks with the finished run (this
+    writes the run span) and, with `report`, write `summary.md` and `summary.csv`. Raises `RunError` when the run
+    does not exist or was started with another config."""
+    engine = _engine()
+    writer = _open_writer(config, run_id)
+    try:
+        # A worker killed between the two files left a trial without its `results.jsonl` row, which the report reads.
+        engine.restore_legacy_rows(writer, config.out_dir / "results.jsonl")
+    except ResumeError as e:
+        raise RunError(str(e)) from e
+    if writer.info.finished_at is None:
+        writer.close(datetime.now(UTC))
+    feed = engine.sink_feed(config.cfg, config.base)
+    feed.open(writer.info)
+    feed.close(writer.info)
+    if report:
+        with _exits_as(RunError):
+            engine.cmd_report(argparse.Namespace(), config.cfg, config.base)
+    return writer.info
+```
+
 `hbench/cli.py`:
 
 ```python
@@ -7790,17 +8292,19 @@ profile (see `hbench.profiles`) and, for `run`, waits for the spend logs and rec
 """
 
 import argparse
+import contextlib
 import importlib
 import json
 import os
 import shutil
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from hbench import api
 from hbench.calibration import calibrate, calibration_status, read_labels, write_calibration
 from hbench.core.schema import schema_document
 from hbench.doctor import run_checks
@@ -7809,6 +8313,8 @@ from hbench.profiles import apply_litellm_profile
 from hbench.results import ResumeError, read_run
 from hbench.sinks.feed import SinkFeed
 from hbench.suites import Suite, SuiteError, load_suite, suite_label, suite_tasks
+
+MAX_SPEC_BYTES = 64 * 1024  # a spec is a few hundred bytes; a bigger input is not one
 
 _DESCRIPTION = (
     "harness-bench: compare coding-agent harness x model pairs. Main metric: cost per solved task.\n\n"
@@ -7821,7 +8327,10 @@ _DESCRIPTION = (
     "  python3 -m hbench suite validate [--config C] [--run [--allow-unsandboxed]] [PATH...]\n"
     "  python3 -m hbench judge calibrate --config C --labels LABELS.jsonl --out calibration.json\n"
     "  python3 -m hbench export    --config C --run RUN_DIR   # replay a run into the configured sinks\n"
-    "  python3 -m hbench doctor    --config C [--network]   # check env, CLIs, image and network; spends nothing\n\n"
+    "  python3 -m hbench doctor    --config C [--network]   # check env, CLIs, image and network; spends nothing\n"
+    "  python3 -m hbench plan      --config C [--only H...] [--reps N] [--run RUN_ID]   # a TrialSpec per line\n"
+    "  python3 -m hbench run-trial --config C [--allow-unsandboxed] --spec FILE|-   # run one spec, print the result\n"
+    "  python3 -m hbench finish    --config C --run RUN_ID [--no-report]   # close the run, write the report\n\n"
     "Add --litellm to run, report or reconcile for the LiteLLM-only benchmark."
 )
 
@@ -7920,6 +8429,21 @@ def build_parser(epilog: str | None = None) -> argparse.ArgumentParser:
     export_cmd = sub.add_parser("export", help="replay a run into the configured sinks (idempotent)")
     export_cmd.add_argument("--config", required=True)
     export_cmd.add_argument("--run", required=True, metavar="RUN_DIR", help="the run directory: <output_dir>/<run_id>")
+    plan_cmd = sub.add_parser("plan", help="start a run (or reuse --run) and print one TrialSpec per line")
+    _add_config(plan_cmd)
+    plan_cmd.add_argument("--reps", type=int)
+    plan_cmd.add_argument("--only", nargs="*", help="only these harness names")
+    plan_cmd.add_argument("--run", metavar="RUN_ID", help="plan this run (started by an earlier plan) again")
+    trial_cmd = sub.add_parser("run-trial", help="run the trial a TrialSpec names and print its result as JSON")
+    _add_config(trial_cmd)
+    trial_cmd.add_argument("--spec", required=True, metavar="FILE", help="the spec: a file, or - for stdin")
+    trial_cmd.add_argument(
+        "--allow-unsandboxed", action="store_true", help="run without a sandbox (only inside a disposable VM)"
+    )
+    finish_cmd = sub.add_parser("finish", help="mark a planned run finished, close its sinks and write the report")
+    _add_config(finish_cmd)
+    finish_cmd.add_argument("--run", required=True, metavar="RUN_ID")
+    finish_cmd.add_argument("--no-report", action="store_true", help="do not write summary.md and summary.csv")
     judge = sub.add_parser("judge", help="LLM judge tools")
     judge_sub = judge.add_subparsers(dest="judge_cmd", required=True)
     calibrate_cmd = judge_sub.add_parser(
@@ -8097,6 +8621,67 @@ def _export(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def _load_config(args: argparse.Namespace) -> api.Config:
+    """The config of the command. Its warnings go to stderr: stdout of `plan` and `run-trial` is data."""
+    try:
+        with contextlib.redirect_stdout(sys.stderr):
+            return api.load_config(args.config, litellm=args.litellm)
+    except api.ApiError as e:
+        sys.exit(f"{args.cmd}: {e}")
+
+
+def _plan(args: argparse.Namespace) -> None:
+    """`plan`: start a run, or reuse the run `--run` names, and print one `TrialSpec` per line."""
+    config = _load_config(args)
+    try:
+        run = api.open_run(config, args.run) if args.run else api.start_run(config, only=args.only, reps=args.reps)
+        specs = api.plan(config, run, only=args.only, reps=args.reps)
+    except api.ApiError as e:
+        sys.exit(f"plan: {e}")
+    for spec in specs:
+        print(json.dumps(spec.to_dict()))
+
+
+def _run_trial(args: argparse.Namespace) -> None:
+    """`run-trial`: run one spec. The engine's progress goes to stderr, so stdout holds only the result."""
+    config = _load_config(args)
+    try:
+        if args.spec == "-":
+            raw = sys.stdin.buffer.read(MAX_SPEC_BYTES + 1)
+        else:
+            with Path(args.spec).open("rb") as f:
+                raw = f.read(MAX_SPEC_BYTES + 1)
+    except OSError as e:
+        sys.exit(f"run-trial: cannot read the spec {args.spec}: {e}")
+    if len(raw) > MAX_SPEC_BYTES:
+        sys.exit(
+            f"run-trial: the spec is larger than {MAX_SPEC_BYTES // 1024} KiB: a spec names a trial and nothing else"
+        )
+    try:
+        text = raw.decode()
+    except UnicodeDecodeError:
+        sys.exit("run-trial: the spec is not UTF-8 text")
+    try:
+        spec = api.parse_spec(text)
+        with contextlib.redirect_stdout(sys.stderr):
+            result = api.run_trial(config, spec, allow_unsandboxed=args.allow_unsandboxed)
+    except api.ApiError as e:
+        sys.exit(f"run-trial: {e}")
+    print(json.dumps(result.to_dict()))
+
+
+def _finish(args: argparse.Namespace) -> None:
+    """`finish`: close the run. Under `--litellm` the report waits for `reconcile`, as it does for `run`."""
+    config = _load_config(args)
+    try:
+        info = api.finish_run(config, args.run, report=not (args.no_report or args.litellm))
+    except api.ApiError as e:
+        sys.exit(f"finish: {e}")
+    print(f"finished run {info.run_id} at {info.finished_at}")
+    if args.litellm:
+        print(f"reconcile, then report: python3 -m hbench reconcile --litellm --config {args.config}")
+
+
 def _run_litellm(engine: ModuleType, args: argparse.Namespace, cfg: dict[str, Any], base: Path) -> None:
     """`run` under the LiteLLM profile: report only after reconcile, when the gateway cost exists."""
     engine.cmd_run(args, cfg, base)
@@ -8108,6 +8693,13 @@ def _run_litellm(engine: ModuleType, args: argparse.Namespace, cfg: dict[str, An
         engine.cmd_reconcile(args, cfg, base)
     except Exception as e:  # noqa: BLE001
         print(f"reconcile failed: {e}\nRun later: python3 -m hbench reconcile --litellm --config {args.config}")
+
+
+_ORCHESTRATOR_COMMANDS: Mapping[str, Callable[[argparse.Namespace], None]] = {
+    "plan": _plan,
+    "run-trial": _run_trial,
+    "finish": _finish,
+}
 
 
 def main(argv: Sequence[str] | None = None, *, epilog: str | None = None) -> None:
@@ -8127,6 +8719,9 @@ def main(argv: Sequence[str] | None = None, *, epilog: str | None = None) -> Non
         return
     if args.cmd == "doctor":
         _doctor(args)
+        return
+    if args.cmd in _ORCHESTRATOR_COMMANDS:
+        _ORCHESTRATOR_COMMANDS[args.cmd](args)
         return
     engine = _engine()
     cfg_path = Path(args.config).resolve()
@@ -9678,6 +10273,49 @@ def main() -> None:
         )
         collector_srv.shutdown()
 
+        # --- orchestrator commands (ADR 0012): plan, run-trial per line and finish give what `run` gives
+        (tmp / "config-plan.json").write_text(json.dumps(dict(cfg, output_dir="results-plan")))
+        planned = run(tmp, "harness_bench.py", "plan", config="config-plan.json").stdout.splitlines()
+        check(len(planned) == 5, "plan: one TrialSpec per line, one per pair")
+        for line in planned:
+            worker = subprocess.run(
+                [PY, "harness_bench.py", "run-trial", "--config", "config-plan.json", "--spec", "-"]
+                + ["--allow-unsandboxed"],
+                cwd=tmp,
+                input=line,
+                capture_output=True,
+                text=True,
+            )
+            check(worker.returncode == 0 and json.loads(worker.stdout)["run_id"], "run-trial: result JSON on stdout")
+        plan_run_id = json.loads(planned[0])["run_id"]
+        run(tmp, "harness_bench.py", "finish", "--run", plan_run_id, config="config-plan.json")
+        planned_rows = {r["harness"]: r for r in results(tmp / "results-plan/results.jsonl")}
+        check(
+            {h: r["passed"] for h, r in planned_rows.items()} == {h: r["passed"] for h, r in rows.items()},
+            "plan | run-trial | finish: the same solved tasks as run",
+        )
+        check(
+            len(results(tmp / "results-plan" / plan_run_id / "trials.jsonl")) == 5
+            and (tmp / "results-plan/summary.md").exists(),
+            "plan | run-trial | finish: 5 trials and the report",
+        )
+        forged = json.dumps(dict(json.loads(planned[0]), config_sha256="0" * 64))
+        before = (tmp / "results-plan" / plan_run_id / "trials.jsonl").read_text()
+        worker = subprocess.run(
+            [PY, "harness_bench.py", "run-trial", "--config", "config-plan.json", "--spec", "-"]
+            + ["--allow-unsandboxed"],
+            cwd=tmp,
+            input=forged,
+            capture_output=True,
+            text=True,
+        )
+        check(
+            worker.returncode != 0
+            and "config_sha256" in worker.stderr
+            and (tmp / "results-plan" / plan_run_id / "trials.jsonl").read_text() == before,
+            "run-trial: a spec of another config is refused and writes nothing",
+        )
+
         # --- config validation and URL policy
         for bad, why in (
             (dict(fizz, id="/etc"), "absolute task id"),
@@ -10249,6 +10887,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))  # lets tests import the engine in-process (coverage sees it directly)
+sys.path.insert(0, str(ROOT / "adapters" / "python"))  # and the Python adapter of ADR 0012
 PY = sys.executable
 AGENT = str(ROOT / "tests" / "fake_agent.py")
 FIZZBUZZ = ROOT / "suites" / "regression" / "fizzbuzz"  # the sample task: `repo/` and `hidden_tests/`
@@ -12478,6 +13117,7 @@ if __name__ == "__main__":
 
 import copy
 import dataclasses
+import json
 import pickle
 import unittest
 from types import MappingProxyType
@@ -12495,6 +13135,7 @@ from hbench.core.models import (
     RunInfo,
     Target,
     TrialResult,
+    TrialSpec,
     TrialStatus,
     Usage,
 )
@@ -12826,8 +13467,30 @@ class ToolCallsTests(unittest.TestCase):
         loaded = TrialResult.from_dict(d)
         self.assertEqual((loaded.usage.tool_calls, loaded.schema_version), (None, "1.0.0"))
 
-    def test_the_current_contract_version_is_1_3_0(self) -> None:
-        self.assertEqual((SCHEMA_VERSION, trial().schema_version), ("1.3.0", "1.3.0"))
+    def test_the_current_contract_version_is_1_4_0(self) -> None:
+        self.assertEqual((SCHEMA_VERSION, trial().schema_version), ("1.4.0", "1.4.0"))
+
+    def test_a_1_3_0_trial_and_run_still_load(self) -> None:
+        for obj in (trial(), run_info()):
+            d = obj.to_dict()
+            d["schema_version"] = "1.3.0"
+            self.assertEqual(type(obj).from_dict(d).schema_version, "1.3.0")
+
+
+class RunRepsTests(unittest.TestCase):
+    def test_a_run_records_its_reps_and_a_run_without_them_loads_with_none(self) -> None:
+        info = run_info(reps=3)
+        self.assertEqual(RunInfo.from_dict(info.to_dict()), info)
+        d = run_info().to_dict()
+        del d["reps"]
+        d["schema_version"] = "1.3.0"
+        self.assertIsNone(RunInfo.from_dict(d).reps)
+
+    def test_reps_must_be_a_whole_number_of_at_least_one(self) -> None:
+        bad_values: list[Any] = [0, -1, True, "2", 1.5]
+        for bad in bad_values:
+            with self.subTest(bad=bad), self.assertRaises(ContractError):
+                run_info(reps=bad)
 
 
 class SandboxFieldTests(unittest.TestCase):
@@ -12890,6 +13553,70 @@ class JudgeFieldTests(unittest.TestCase):
                 usage(tool_calls=bad)
 
 
+def trial_spec(**overrides: Any) -> TrialSpec:
+    values: dict[str, Any] = {
+        "run_id": "a" * 32,
+        "trial_id": "b" * 16,
+        "task_id": "suite/fizzbuzz",
+        "harness": "claude",
+        "model": "p/fix",
+        "rep": 2,
+        "config_sha256": "c" * 64,
+    }
+    values.update(overrides)
+    return TrialSpec(**values)
+
+
+class TrialSpecTests(unittest.TestCase):
+    def test_a_spec_round_trips_through_json(self) -> None:
+        spec = trial_spec()
+        self.assertEqual(TrialSpec.from_dict(json.loads(json.dumps(spec.to_dict()))), spec)
+        self.assertEqual(spec.schema_version, SCHEMA_VERSION)
+
+    def test_a_spec_names_a_trial_and_nothing_else(self) -> None:
+        self.assertEqual(
+            set(trial_spec().to_dict()),
+            {"schema_version", "run_id", "trial_id", "task_id", "harness", "model", "rep", "config_sha256"},
+        )
+
+    def test_extra_and_missing_keys_are_refused(self) -> None:
+        extra = {**trial_spec().to_dict(), "command": ["rm", "-rf", "/"]}
+        with self.assertRaises(ContractError):
+            TrialSpec.from_dict(extra)
+        missing = trial_spec().to_dict()
+        del missing["task_id"]
+        with self.assertRaises(ContractError):
+            TrialSpec.from_dict(missing)
+
+    def test_every_field_is_validated(self) -> None:
+        bad_cases: list[dict[str, Any]] = [
+            {"run_id": "../../etc"},
+            {"run_id": "A" * 32},
+            {"run_id": "a" * 31},
+            {"trial_id": "b" * 15},
+            {"trial_id": "../" + "b" * 13},
+            {"config_sha256": "c" * 63},
+            {"config_sha256": "g" * 64},
+            {"task_id": ""},
+            {"harness": ""},
+            {"model": ""},
+            {"rep": 0},
+            {"rep": True},
+            {"rep": "1"},
+            {"task_id": 3},
+            {"schema_version": "2.0.0"},
+            {"schema_version": "x"},
+        ]
+        for bad in bad_cases:
+            with self.subTest(bad=bad), self.assertRaises(ContractError):
+                trial_spec(**bad)
+
+    def test_a_spec_of_an_older_minor_version_loads(self) -> None:
+        d = trial_spec().to_dict()
+        d["schema_version"] = "1.3.0"
+        self.assertEqual(TrialSpec.from_dict(d).schema_version, "1.3.0")
+
+
 if __name__ == "__main__":
     unittest.main()
 ```
@@ -12907,8 +13634,8 @@ from typing import Any
 
 import fixtures  # noqa: F401  (puts the repo root on sys.path)
 from hbench.core import models
-from hbench.core.schema import RUN_SCHEMA, TRIAL_SCHEMA, check_schema, schema_document, validate
-from test_core_models import run_info, trial
+from hbench.core.schema import RUN_SCHEMA, TRIAL_SCHEMA, TRIAL_SPEC_SCHEMA, check_schema, schema_document, validate
+from test_core_models import run_info, trial, trial_spec
 
 
 class ValidateContractTests(unittest.TestCase):
@@ -12987,9 +13714,17 @@ class ValidateContractTests(unittest.TestCase):
 
     def test_schema_document_holds_both_schemas_with_ids(self) -> None:
         doc = schema_document()
-        self.assertEqual((doc["trial"], doc["run"]), (TRIAL_SCHEMA, RUN_SCHEMA))
-        self.assertTrue(TRIAL_SCHEMA["$id"].endswith("/trial/1.3.0"))
-        self.assertTrue(RUN_SCHEMA["$id"].endswith("/run/1.3.0"))
+        self.assertEqual((doc["trial"], doc["run"], doc["trial_spec"]), (TRIAL_SCHEMA, RUN_SCHEMA, TRIAL_SPEC_SCHEMA))
+        self.assertTrue(TRIAL_SCHEMA["$id"].endswith("/trial/1.4.0"))
+        self.assertTrue(RUN_SCHEMA["$id"].endswith("/run/1.4.0"))
+        self.assertTrue(TRIAL_SPEC_SCHEMA["$id"].endswith("/trial_spec/1.4.0"))
+
+    def test_a_trial_spec_validates_and_a_forged_one_does_not(self) -> None:
+        self.assertEqual(validate(trial_spec().to_dict(), TRIAL_SPEC_SCHEMA), [])
+        forged = {**trial_spec().to_dict(), "command": ["x"]}
+        self.assertEqual(validate(forged, TRIAL_SPEC_SCHEMA), ["$.command: unexpected property"])
+        self.assertEqual(validate({**trial_spec().to_dict(), "rep": 0}, TRIAL_SPEC_SCHEMA), ["$.rep: must be >= 1"])
+        self.assertEqual(check_schema(TRIAL_SPEC_SCHEMA), TRIAL_SPEC_SCHEMA)
 
 
 class ValidatorKeywordTests(unittest.TestCase):
@@ -13092,6 +13827,7 @@ class SchemaMatchesModelsTests(unittest.TestCase):
         (models.Usage, TRIAL_SCHEMA, "usage"),
         (models.Costs, TRIAL_SCHEMA, "costs"),
         (models.RunInfo, RUN_SCHEMA, None),
+        (models.TrialSpec, TRIAL_SPEC_SCHEMA, None),
         (models.Target, RUN_SCHEMA, "target"),
     )
 
@@ -13357,8 +14093,8 @@ class RunWriterTests(unittest.TestCase):
         writer = RunWriter(out, info)
         run_dir = out / info.run_id
         self.assertEqual(RunInfo.from_dict(json.loads((run_dir / "run.json").read_text())), info)
-        writer.append(trial())
-        writer.append(trial(rep=2))
+        writer.append_once(trial(trial_id="1" * 16))
+        writer.append_once(trial(trial_id="2" * 16, rep=2))
         lines = read_jsonl(run_dir / "trials.jsonl")
         self.assertEqual([line["rep"] for line in lines], [1, 2])
 
@@ -13377,7 +14113,7 @@ class ApplyGatewayCostsTests(unittest.TestCase):
     def make(self, out: Path, run_id: str, *traces: str | None) -> Path:
         writer = RunWriter(out, run_info(run_id=run_id))
         for rep, trace in enumerate(traces, 1):
-            writer.append(trial(run_id=run_id, trace_id=trace, rep=rep))
+            writer.append_once(trial(run_id=run_id, trace_id=trace, rep=rep, trial_id=f"{rep:016x}"))
         return out / run_id / "trials.jsonl"
 
     def test_sets_gateway_cost_on_matching_trials_across_run_dirs(self) -> None:
@@ -14317,6 +15053,7 @@ import fixtures
 from hbench import cli
 from hbench.core.schema import schema_document
 from hbench.profiles import apply_litellm_profile
+from test_api import ApiTestCase
 from test_litellm import ScriptedServer, ok
 
 ROOT = fixtures.ROOT
@@ -14707,6 +15444,146 @@ class ReportOptionsTests(unittest.TestCase):
         out = self.report()
         self.assertIn("within 60 pp", out)
         self.assertIn("CI width of 0.40", out)
+
+
+class OrchestratorCommandTests(ApiTestCase):
+    """`plan`, `run-trial` and `finish` (ADR 0012): the API on the command line."""
+
+    def main(self, *argv: str, stdin: str | bytes = "") -> tuple[str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+            mock.patch.object(
+                sys, "stdin", io.TextIOWrapper(io.BytesIO(stdin.encode() if isinstance(stdin, str) else stdin))
+            ),
+        ):
+            cli.main(list(argv))
+        return out.getvalue(), err.getvalue()
+
+    def fails(self, *argv: str, stdin: str | bytes = "") -> str:
+        with self.assertRaises(SystemExit) as cm:
+            self.main(*argv, stdin=stdin)
+        return str(cm.exception.code)
+
+    def plan(self, *extra: str) -> list[dict[str, Any]]:
+        out, _ = self.main("plan", "--config", str(self.config_path), *extra)
+        return [json.loads(line) for line in out.splitlines()]
+
+    def test_plan_prints_one_spec_per_line_and_starts_the_run(self) -> None:
+        specs = self.plan("--reps", "2", "--only", "pi")
+        self.assertEqual([(s["harness"], s["rep"]) for s in specs], [("pi", 1), ("pi", 2)])
+        (run_json,) = (self.base / "results").glob("*/run.json")
+        self.assertEqual({s["run_id"] for s in specs}, {run_json.parent.name})
+
+    def test_plan_with_run_plans_the_same_run_again(self) -> None:
+        first = self.plan()
+        again = self.plan("--run", first[0]["run_id"])
+        self.assertEqual(again, first)
+        self.assertEqual(len(list((self.base / "results").glob("*/run.json"))), 1)
+
+    def test_plan_errors_exit_with_a_message(self) -> None:
+        self.assertIn("cannot read the config", self.fails("plan", "--config", str(self.base / "no.json")))
+        self.assertIn("plan: no run", self.fails("plan", "--config", str(self.config_path), "--run", "e" * 32))
+        self.assertIn("reps", self.fails("plan", "--config", str(self.config_path), "--reps", "0"))
+
+    def test_run_trial_reads_a_file_or_stdin_and_prints_only_the_result_on_stdout(self) -> None:
+        first, second = self.plan("--only", "claude", "--reps", "2")
+        path = self.base / "spec.json"
+        path.write_text(json.dumps(first))
+        out, err = self.main("run-trial", "--config", str(self.config_path), "--allow-unsandboxed", "--spec", str(path))
+        result = json.loads(out)
+        self.assertEqual(
+            (len(out.splitlines()), result["trial_id"], result["status"]), (1, first["trial_id"], "passed")
+        )
+        self.assertIn("done  fizzbuzz__claude__fix__r1", err)  # the engine's progress goes to stderr
+        out, _ = self.main(
+            "run-trial",
+            "--config",
+            str(self.config_path),
+            "--allow-unsandboxed",
+            "--spec",
+            "-",
+            stdin=json.dumps(second),
+        )
+        self.assertEqual(json.loads(out)["trial_id"], second["trial_id"])
+
+    def test_run_trial_errors_exit_with_a_message(self) -> None:
+        (spec,) = self.plan("--only", "claude")
+        config = str(self.config_path)
+        self.assertIn(
+            "cannot read the spec", self.fails("run-trial", "--config", config, "--spec", str(self.base / "x"))
+        )
+        self.assertIn("not a valid trial spec", self.fails("run-trial", "--config", config, "--spec", "-", stdin="{}"))
+        forged = json.dumps({**spec, "config_sha256": "0" * 64})
+        self.assertIn("config_sha256", self.fails("run-trial", "--config", config, "--spec", "-", stdin=forged))
+        message = self.fails("run-trial", "--config", config, "--spec", "-", stdin=json.dumps(spec))
+        self.assertIn("No sandbox configured", message)
+
+    def test_a_spec_that_is_not_utf8_text_is_refused_with_a_message(self) -> None:
+        config = str(self.config_path)
+        self.assertIn("not UTF-8", self.fails("run-trial", "--config", config, "--spec", "-", stdin=b"\xff\xfe{"))
+        path = self.base / "latin.json"
+        path.write_bytes(b'{"x": "\xe9"}')
+        self.assertIn("not UTF-8", self.fails("run-trial", "--config", config, "--spec", str(path)))
+
+    def test_the_limit_counts_bytes_not_characters(self) -> None:
+        config = str(self.config_path)
+        wide = "é" * 40_000  # 40,000 characters, 80,000 bytes
+        self.assertIn("larger than 64 KiB", self.fails("run-trial", "--config", config, "--spec", "-", stdin=wide))
+
+    def test_a_spec_larger_than_64_kib_is_refused_unread(self) -> None:
+        config = str(self.config_path)
+        big = json.dumps({"pad": "x" * 70_000})
+        self.assertIn("larger than 64 KiB", self.fails("run-trial", "--config", config, "--spec", "-", stdin=big))
+        path = self.base / "big.json"
+        path.write_text(big)
+        self.assertIn("larger than 64 KiB", self.fails("run-trial", "--config", config, "--spec", str(path)))
+
+    def test_finish_closes_the_run_and_writes_the_report(self) -> None:
+        specs = self.plan("--only", "claude")
+        self.main(
+            "run-trial",
+            "--config",
+            str(self.config_path),
+            "--allow-unsandboxed",
+            "--spec",
+            "-",
+            stdin=json.dumps(specs[0]),
+        )
+        out, _ = self.main("finish", "--config", str(self.config_path), "--run", specs[0]["run_id"])
+        self.assertIn(f"finished run {specs[0]['run_id']}", out)
+        self.assertTrue((self.base / "results" / "summary.md").exists())
+        info = json.loads((self.base / "results" / specs[0]["run_id"] / "run.json").read_text())
+        self.assertIsNotNone(info["finished_at"])
+
+    def test_finish_without_report_and_its_errors(self) -> None:
+        (spec, *_) = self.plan()
+        self.main("finish", "--config", str(self.config_path), "--run", spec["run_id"], "--no-report")
+        self.assertFalse((self.base / "results" / "summary.md").exists())
+        self.assertIn("finish: no run", self.fails("finish", "--config", str(self.config_path), "--run", "e" * 32))
+
+    def test_the_litellm_profile_applies_and_holds_the_report_back(self) -> None:
+        self.cfg["litellm"] = {"base_url": "http://localhost:4000", "api_key": "${LITELLM_KEY}"}
+        self.cfg["matrix"] = [{"harness": "claude", "model": "fix"}, {"harness": "cursor", "model": "fix"}]
+        self.write_config()
+        specs = self.plan("--litellm")  # the profile's "ignored 1 matrix entries" notice is not on stdout
+        self.assertEqual({s["harness"] for s in specs}, {"claude"})
+        out, _ = self.main("finish", "--config", str(self.config_path), "--litellm", "--run", specs[0]["run_id"])
+        self.assertIn("finished run", out)
+        self.assertIn("python3 -m hbench reconcile --litellm --config", out)
+        self.assertFalse((self.base / "results-litellm" / "summary.md").exists())
+
+    def test_the_litellm_shim_applies_the_profile_to_the_new_commands_too(self) -> None:
+        import harness_bench_litellm as hbl
+
+        for command in ("plan", "run-trial", "finish"):
+            with (
+                mock.patch.object(cli, "main") as cli_main,
+                mock.patch.object(sys, "argv", ["x", command, "--config", "c"]),
+            ):
+                hbl.main()
+            cli_main.assert_called_once_with([command, "--litellm", "--config", "c"], epilog=mock.ANY)
 
 
 class ShimMainTests(unittest.TestCase):
@@ -18703,7 +19580,7 @@ class FakeDockerRunTests(RunTestCase):
                 trial["image_digest"],
                 trial["schema_version"],
             ),
-            (f"docker:{IMAGE}", True, "1.3.0", f"sha256:{DIGEST}", "1.3.0"),
+            (f"docker:{IMAGE}", True, "1.4.0", f"sha256:{DIGEST}", "1.4.0"),
         )
 
     def test_a_container_that_outlives_the_timeout_is_removed_before_the_next_step(self) -> None:
@@ -18864,14 +19741,14 @@ class RunWriterResumeTests(unittest.TestCase):
     def make(self, out: Path, *trials: Any, run_id: str = "a" * 32) -> RunWriter:
         writer = RunWriter(out, run_info(run_id=run_id))
         for t in trials:
-            writer.append(t)
+            writer.append_once(t)
         return writer
 
     def test_open_existing_keeps_the_run_and_appends_to_its_trials(self) -> None:
         out = fixtures.tmpdir(self)
         first = self.make(out, trial(trial_id="1" * 16))
         reopened = RunWriter.open_existing(out, "a" * 32)
-        reopened.append(trial(trial_id="2" * 16, rep=2))
+        reopened.append_once(trial(trial_id="2" * 16, rep=2))
         self.assertEqual(
             (reopened.info, reopened.finished_trial_ids(), first.info == reopened.info),
             (first.info, {"1" * 16, "2" * 16}, True),
@@ -18890,7 +19767,7 @@ class RunWriterResumeTests(unittest.TestCase):
         out = fixtures.tmpdir(self)
         writer = self.make(out)
         with mock.patch("os.fsync") as fsync:
-            writer.append(trial())
+            writer.append_once(trial())
         fsync.assert_called_once()
 
     def test_a_last_line_cut_short_by_a_crash_is_dropped(self) -> None:
@@ -18899,7 +19776,7 @@ class RunWriterResumeTests(unittest.TestCase):
         with writer.trials_path.open("a") as f:
             f.write('{"run_id": "cut off')
         reopened = RunWriter.open_existing(out, "a" * 32)
-        reopened.append(trial(trial_id="2" * 16, rep=2))
+        reopened.append_once(trial(trial_id="2" * 16, rep=2))
         self.assertEqual(reopened.finished_trial_ids(), {"1" * 16, "2" * 16})
 
     def test_a_trials_file_that_was_never_created_reads_as_empty(self) -> None:
@@ -19135,7 +20012,7 @@ class ResumeRunTests(RunTestCase):
             self.cmd_run()
         (run_dir,) = self.run_dirs()
         results = self.base / "results" / "results.jsonl"
-        self.assertEqual((len(self.trials(run_dir)), results.read_text()), (1, ""))
+        self.assertEqual((len(self.trials(run_dir)), results.read_text() if results.exists() else ""), (1, ""))
         out = self.cmd_run(resume=run_dir.name)
         self.assertEqual((out.count("run   "), len(self.trials(run_dir)), len(rows_of(self.base))), (0, 1, 1))
 
@@ -20592,15 +21469,23 @@ class ReplayTests(OtlpTestCase):
         second.close(make_info())
         self.assertEqual(len(file_requests(self.trace_file)), 3)
 
-    def test_a_last_line_cut_short_by_a_crash_is_not_a_span_and_the_next_line_starts_on_its_own(self) -> None:
+    def test_a_last_line_cut_short_by_a_crash_is_dropped_and_the_next_line_starts_on_its_own(self) -> None:
         self.trace_file.parent.mkdir()
         self.trace_file.write_text('{"resourceSpans": [{"scopeSp')
         sink = self.sink()
         sink.open(make_info())
         sink.write(make_trial())
         lines = self.trace_file.read_text().splitlines()
-        self.assertEqual(len(lines), 2)
-        self.assertEqual(span_of(json.loads(lines[1]))["spanId"], make_trial().trial_id)
+        self.assertEqual(len(lines), 1)  # repaired under the lock: the cut line is gone, not kept beside the new one
+        self.assertEqual(span_of(json.loads(lines[0]))["spanId"], make_trial().trial_id)
+
+    def test_a_complete_line_that_is_no_json_holds_no_span(self) -> None:
+        self.trace_file.parent.mkdir()
+        self.trace_file.write_text("not json at all\n")
+        sink = self.sink()
+        sink.open(make_info())
+        sink.write(make_trial())
+        self.assertEqual(len(self.trace_file.read_text().splitlines()), 2)
 
     def test_lines_that_are_not_requests_hold_no_span_ids(self) -> None:
         self.trace_file.parent.mkdir()
@@ -21176,6 +22061,794 @@ class DashboardTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()) as usage:
             self.assertEqual(synthetic_db.main(["synthetic_db"]), 2)
         self.assertIn("usage:", usage.getvalue())
+```
+
+`tests/test_api.py`:
+
+```python
+"""The orchestrator API (ADR 0012): `plan` and `run_trial` give the results of `run`, a forged spec runs nothing,
+a retry is safe, and workers on one run directory never tear a line."""
+
+import contextlib
+import inspect
+import io
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import threading
+import unittest
+from pathlib import Path
+from typing import Any
+from unittest import mock
+
+import fixtures
+import harness_bench as hb
+import run_parallel
+from hbench import api, cli
+from hbench.core.convert import row_from_trial
+from hbench.core.ids import trial_id as make_trial_id
+from hbench.core.models import RunInfo, TrialResult, TrialSpec
+from hbench.results import LogCursor, RunWriter, locked_append, locked_log, read_run, trial_lock
+from hbench.sinks import otlp, sqlite
+from hbench.sinks.otlp import TRACES_FILE
+from test_core_models import trial
+from test_run import RunTestCase, args, rows_of
+
+VOLATILE_TRIAL_KEYS = {"run_id", "trial_id", "started_at", "latency_s", "trace_id", "artifact_uri"}
+
+
+def masked(result: TrialResult | dict[str, Any]) -> dict[str, Any]:
+    """A trial without its ids and clocks: what two runs of the same trial must share."""
+    data = result.to_dict() if isinstance(result, TrialResult) else dict(result)
+    return {k: v for k, v in data.items() if k not in VOLATILE_TRIAL_KEYS}
+
+
+def tree(path: Path) -> list[str]:
+    """Every file and directory under `path`, to prove that nothing was written."""
+    return sorted(str(p.relative_to(path)) for p in path.rglob("*"))
+
+
+class ApiTestCase(RunTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.config_path = self.base / "config.json"
+        self.write_config()
+
+    def write_config(self) -> api.Config:
+        self.config_path.write_text(json.dumps(self.cfg))
+        self.config = api.load_config(self.config_path)
+        return self.config
+
+    def start(self, **kwargs: Any) -> tuple[Any, list[TrialSpec]]:
+        run = api.start_run(self.config, **kwargs)
+        return run, api.plan(self.config, run, **kwargs)
+
+    def run_dir(self, run_id: str) -> Path:
+        return self.base / "results" / run_id
+
+    def run_all(self) -> tuple[Any, list[TrialResult]]:
+        run, specs = self.start()
+        with fixtures.quiet():
+            return run, [api.run_trial(self.config, spec, allow_unsandboxed=True) for spec in specs]
+
+
+class SignatureTests(unittest.TestCase):
+    def test_the_public_signatures_are_pinned(self) -> None:
+        only = "only: collections.abc.Sequence[str] | None = None"
+        cfg, info, spec = "config: hbench.api.Config", "hbench.core.models.RunInfo", "hbench.core.models.TrialSpec"
+        expected = {
+            "load_config": "(path: pathlib.Path | str, *, litellm: bool = False) -> hbench.api.Config",
+            "start_run": f"({cfg}, *, {only}, reps: int | None = None) -> {info}",
+            "plan": f"({cfg}, run: {info}, *, {only}, reps: int | None = None) -> list[{spec}]",
+            "run_trial": (
+                f"({cfg}, spec: {spec}, *, allow_unsandboxed: bool = False) -> hbench.core.models.TrialResult"
+            ),
+            "finish_run": f"({cfg}, run_id: str, *, report: bool = True) -> {info}",
+        }
+        for name, signature in expected.items():
+            with self.subTest(name=name):
+                self.assertEqual(str(inspect.signature(getattr(api, name), eval_str=False)).replace("'", ""), signature)
+
+
+class LoadConfigTests(ApiTestCase):
+    def test_it_expands_and_validates_the_config(self) -> None:
+        self.assertEqual(
+            (self.config.base, self.config.out_dir), (self.base.resolve(), self.base.resolve() / "results")
+        )
+        self.assertEqual([t["id"] for t in self.config.cfg["tasks"]], ["fizzbuzz"])
+
+    def test_every_config_problem_is_a_config_error(self) -> None:
+        bad = self.base / "bad.json"
+        with self.assertRaises(api.ConfigError):
+            api.load_config(self.base / "missing.json")
+        bad.write_text("{not json")
+        with self.assertRaises(api.ConfigError):
+            api.load_config(bad)
+        bad.write_text("[]")
+        with self.assertRaises(api.ConfigError) as cm:
+            api.load_config(bad)
+        self.assertIn("JSON object", str(cm.exception))
+        bad.write_text(json.dumps({**self.cfg, "cost_source": "nope"}))
+        with self.assertRaises(api.ConfigError):
+            api.load_config(bad)
+        with self.assertRaises(api.ConfigError) as cm:
+            api.load_config(self.config_path, litellm=True)
+        self.assertIn("litellm", str(cm.exception))
+
+    def test_the_litellm_profile_drops_the_harnesses_without_spend_logs(self) -> None:
+        self.cfg["litellm"] = {"base_url": "http://localhost:4000", "api_key": "${LITELLM_KEY}"}
+        self.cfg["matrix"] = [{"harness": "claude", "model": "fix"}, {"harness": "cursor", "model": "fix"}]
+        self.config_path.write_text(json.dumps(self.cfg))
+        with fixtures.quiet():
+            config = api.load_config(self.config_path, litellm=True)
+        self.assertEqual([p["harness"] for p in config.cfg["matrix"]], ["claude"])
+        self.assertEqual(config.out_dir.name, "results-litellm")
+
+
+class StartAndPlanTests(ApiTestCase):
+    def test_start_run_creates_the_run_files_and_plan_lists_every_trial_in_run_order(self) -> None:
+        run, specs = self.start(reps=2)
+        self.assertEqual(sorted(p.name for p in self.run_dir(run.run_id).iterdir()), ["run.json", "trials.jsonl"])
+        self.assertEqual(
+            [(s.harness, s.model, s.task_id, s.rep) for s in specs],
+            [("claude", "fix", "fizzbuzz", 1), ("claude", "fix", "fizzbuzz", 2)]
+            + [("pi", "p/nofix", "fizzbuzz", 1), ("pi", "p/nofix", "fizzbuzz", 2)],
+        )
+        self.assertEqual({s.run_id for s in specs}, {run.run_id})
+        self.assertEqual(len({s.trial_id for s in specs}), 4)
+
+    def test_plan_is_pure(self) -> None:
+        run = api.start_run(self.config)
+        before = tree(self.base)
+        first = api.plan(self.config, run, only=["pi"])
+        self.assertEqual((tree(self.base), [s.harness for s in first]), (before, ["pi"]))
+        self.assertEqual(api.plan(self.config, run, only=["pi"]), first)
+
+    def test_plan_takes_the_reps_of_the_run_and_refuses_more(self) -> None:
+        run = api.start_run(self.config, reps=2)
+        self.assertEqual(run.reps, 2)
+        self.assertEqual(len(api.plan(self.config, run)), 4)
+        with self.assertRaises(api.RunError):
+            api.plan(self.config, run, reps=3)
+
+    def test_plan_uses_the_trial_ids_that_run_records(self) -> None:
+        with fixtures.quiet():
+            hb.cmd_run(args(), self.cfg, self.base)
+        (run_dir,) = (self.base / "results").glob("*/run.json")
+        info, trials = read_run(run_dir.parent)
+        specs = api.plan(self.config, info)
+        self.assertEqual({s.trial_id for s in specs}, {t.trial_id for t in trials})
+
+    def test_a_bad_reps_stops_before_a_run_directory_exists(self) -> None:
+        for bad in (0, -1):
+            with self.assertRaises(api.ConfigError):
+                api.start_run(self.config, reps=bad)
+        self.cfg["reps"] = "many"
+        with self.assertRaises(api.ConfigError):
+            api.start_run(self.write_config())
+        self.assertFalse(list((self.base / "results").glob("*/run.json")) if (self.base / "results").exists() else [])
+
+    def test_a_changed_config_cannot_plan_or_reopen_the_run(self) -> None:
+        run = api.start_run(self.config)
+        self.cfg["timeout"] = 5
+        changed = self.write_config()
+        with self.assertRaises(api.RunError):
+            api.plan(changed, run)
+        with self.assertRaises(api.RunError):
+            api.open_run(changed, run.run_id)
+
+    def test_open_run_returns_a_run_that_exists_and_refuses_one_that_does_not(self) -> None:
+        run = api.start_run(self.config)
+        self.assertEqual(api.open_run(self.config, run.run_id), run)
+        with self.assertRaises(api.RunError):
+            api.open_run(self.config, "e" * 32)
+
+
+class RunTrialTests(ApiTestCase):
+    def test_run_trial_records_what_run_records_for_the_same_trial(self) -> None:
+        _, results = self.run_all()
+        other = fixtures.tmpdir(self)
+        shutil.copytree(fixtures.FIZZBUZZ, other / "tasks" / "fizzbuzz")
+        with fixtures.quiet():
+            hb.cmd_run(args(), self.cfg, other)
+        reference = [masked(row) for row in fixtures.read_rows(next((other / "results").glob("*/trials.jsonl")))]
+        self.assertEqual([masked(r) for r in results], reference)
+        self.assertEqual([r.passed for r in results], [True, False])
+
+    def test_a_legacy_row_cut_short_by_a_crash_does_not_spoil_the_next_row(self) -> None:
+        run, specs = self.start(only=["claude"])
+        results = self.base / "results" / "results.jsonl"
+        results.write_text('{"task": "cut')
+        with fixtures.quiet():
+            api.run_trial(self.config, specs[0], allow_unsandboxed=True)
+        self.assertEqual(len(rows_of(self.base)), 1)  # every line is valid JSON
+
+    def test_the_result_is_in_both_result_files(self) -> None:
+        run, results = self.run_all()
+        info, recorded = read_run(self.run_dir(run.run_id))
+        self.assertEqual(recorded, results)
+        self.assertEqual(
+            [(r["task"], r["harness"], r["model"], r["rep"]) for r in rows_of(self.base)],
+            [("fizzbuzz", "claude", "fix", 1), ("fizzbuzz", "pi", "p/nofix", 1)],
+        )
+        self.assertEqual(rows_of(self.base)[0]["passed"], row_from_trial(results[0])["passed"])
+
+    def test_a_trial_that_is_already_recorded_returns_its_result_and_runs_nothing(self) -> None:
+        run, specs = self.start(only=["claude"])
+        with fixtures.quiet():
+            first = api.run_trial(self.config, specs[0], allow_unsandboxed=True)
+        with mock.patch.object(hb, "run_trial_isolated", side_effect=AssertionError("ran again")):
+            second = api.run_trial(self.config, specs[0])  # no sandbox flag: it never gets that far
+        self.assertEqual(second, first)
+        self.assertEqual(len(read_run(self.run_dir(run.run_id))[1]), 1)
+        self.assertEqual(len(rows_of(self.base)), 1)
+
+    def test_two_workers_that_ran_the_same_trial_leave_one_record(self) -> None:
+        run, specs = self.start(only=["claude"])
+        with fixtures.quiet():
+            first = api.run_trial(self.config, specs[0], allow_unsandboxed=True)
+            info = read_run(self.run_dir(run.run_id))[0]
+            # The second worker read the run before the first one wrote its trial.
+            with mock.patch.object(api, "read_run", return_value=(info, [])):
+                second = api.run_trial(self.config, specs[0], allow_unsandboxed=True)
+        self.assertEqual(second, first)
+        self.assertEqual((len(read_run(self.run_dir(run.run_id))[1]), len(rows_of(self.base))), (1, 1))
+
+    def test_a_worker_that_waited_for_the_trial_lock_returns_what_the_first_recorded(self) -> None:
+        run, specs = self.start(only=["claude"])
+        with fixtures.quiet():
+            first = api.run_trial(self.config, specs[0], allow_unsandboxed=True)
+        real_read_run = read_run
+        calls: list[Path] = []
+
+        def read_run_before_the_other_worker_finished(run_dir: Path) -> Any:
+            calls.append(run_dir)
+            return (real_read_run(run_dir)[0], []) if len(calls) == 1 else real_read_run(run_dir)
+
+        with (
+            mock.patch.object(api, "read_run", read_run_before_the_other_worker_finished),
+            mock.patch.object(hb, "run_trial_isolated", side_effect=AssertionError("ran again")),
+        ):
+            second = api.run_trial(self.config, specs[0], allow_unsandboxed=True)
+        self.assertEqual((second, len(calls)), (first, 2))
+
+    def test_two_processes_given_the_same_spec_run_the_agent_once(self) -> None:
+        slow = (
+            "import time, sys, runpy; time.sleep(2); sys.argv = sys.argv[1:]; "
+            "runpy.run_path(sys.argv[0], run_name='__main__')"
+        )
+        self.cfg["harnesses"]["claude"]["command"] = [fixtures.PY, "-c", slow, fixtures.AGENT, "claude", "{model_name}"]
+        self.config = self.write_config()
+        run, specs = self.start(only=["claude"])
+        outputs: list[subprocess.CompletedProcess[str]] = []
+
+        def worker() -> None:
+            outputs.append(
+                subprocess.run(
+                    [fixtures.PY, "-m", "hbench", "run-trial", "--config", str(self.config_path)]
+                    + ["--spec", "-", "--allow-unsandboxed"],
+                    input=json.dumps(specs[0].to_dict()),
+                    capture_output=True,
+                    text=True,
+                    cwd=fixtures.ROOT,
+                )
+            )
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual([p.returncode for p in outputs], [0, 0], [p.stderr for p in outputs])
+        self.assertEqual({json.loads(p.stdout)["trial_id"] for p in outputs}, {specs[0].trial_id})
+        self.assertEqual(len((self.base / "tags.txt").read_text().splitlines()), 1)  # the agent ran once
+        self.assertEqual((len(read_run(self.run_dir(run.run_id))[1]), len(rows_of(self.base))), (1, 1))
+
+    def test_without_a_sandbox_and_without_the_flag_nothing_runs(self) -> None:
+        run, specs = self.start()
+        before = tree(self.base)
+        with self.assertRaises(api.SandboxRequiredError) as cm:
+            api.run_trial(self.config, specs[0])
+        self.assertIn("No sandbox configured", str(cm.exception))
+        self.assertEqual(tree(self.base), before)
+
+    def test_a_work_dir_inside_the_repository_is_a_config_error(self) -> None:
+        self.cfg["work_dir"] = str(self.base / "inside")
+        config = self.write_config()
+        run = api.start_run(config)
+        (spec,) = api.plan(config, run, only=["claude"])
+        with self.assertRaises(api.ConfigError) as cm:
+            api.run_trial(config, spec, allow_unsandboxed=True)
+        self.assertIn("work_dir", str(cm.exception))
+        self.assertEqual(read_run(self.run_dir(run.run_id))[1], [])
+
+    def spy_on_private_dirs(self, fail: bool) -> list[tuple[Path, Path]]:
+        seen: list[tuple[Path, Path]] = []
+        real = hb._run_trial
+
+        def spy(m: Any, planned: Any, tid: str) -> TrialResult:
+            seen.append((m.work_root, m.git_root))
+            self.assertTrue(m.work_root.is_dir() and m.git_root.is_dir())
+            if fail:
+                raise RuntimeError("boom")
+            result: TrialResult = real(m, planned, tid)
+            return result
+
+        patcher = mock.patch.object(hb, "_run_trial", spy)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return seen
+
+    def test_the_private_dirs_are_removed_after_the_trial(self) -> None:
+        seen = self.spy_on_private_dirs(fail=False)
+        self.run_all()
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(len({work for work, _ in seen}), 2)  # one private work dir per trial
+        for work, git in seen:
+            self.assertFalse(work.exists() or git.exists())
+
+    def test_the_private_dirs_are_removed_when_the_trial_raises(self) -> None:
+        seen = self.spy_on_private_dirs(fail=True)
+        run, specs = self.start(only=["claude"])
+        with self.assertRaises(RuntimeError), fixtures.quiet():
+            api.run_trial(self.config, specs[0], allow_unsandboxed=True)
+        ((work, git),) = seen
+        self.assertFalse(work.exists() or git.exists())
+        self.assertEqual(read_run(self.run_dir(run.run_id))[1], [])
+
+    def test_a_configured_work_dir_is_kept(self) -> None:
+        work = fixtures.tmpdir(self) / "work"
+        self.cfg["work_dir"] = str(work)
+        self.config = self.write_config()
+        self.run_all()
+        self.assertTrue(work.is_dir())
+
+    def test_a_sink_feed_belongs_to_the_trial_and_the_run_span_to_finish(self) -> None:
+        self.cfg["sinks"] = [{"type": "sqlite", "path": "out.db"}, {"type": "otlp"}]
+        self.config = self.write_config()
+        run, results = self.run_all()
+        spans = (self.run_dir(run.run_id) / TRACES_FILE).read_text()
+        self.assertEqual(spans.count('"name": "eval.trial"'), 2)
+        self.assertNotIn('"name": "eval.run"', spans)
+        with contextlib.closing(sqlite3.connect(self.base / "out.db")) as db:
+            self.assertEqual(db.execute("SELECT count(*), max(finished_at) FROM trials, runs").fetchone(), (2, None))
+        api.finish_run(self.config, run.run_id, report=False)
+        self.assertEqual((self.run_dir(run.run_id) / TRACES_FILE).read_text().count('"name": "eval.run"'), 1)
+        with contextlib.closing(sqlite3.connect(self.base / "out.db")) as db:
+            self.assertIsNotNone(db.execute("SELECT finished_at FROM runs").fetchone()[0])
+        self.assertEqual(len(results), 2)
+
+
+class ForgedSpecTests(ApiTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.started, specs = self.start(only=["pi"])
+        self.spec = specs[0]
+
+    def forge(self, **overrides: Any) -> TrialSpec:
+        return TrialSpec.from_dict({**self.spec.to_dict(), **overrides})
+
+    def assert_refused(self, spec: TrialSpec, fragment: str) -> None:
+        before = tree(self.base)
+        with self.assertRaises(api.SpecError) as cm:
+            api.run_trial(self.config, spec, allow_unsandboxed=True)
+        self.assertIn(fragment, str(cm.exception))
+        self.assertEqual(tree(self.base), before)  # nothing ran and nothing was written
+        self.assertEqual(read_run(self.run_dir(self.started.run_id))[1], [])
+
+    def test_a_spec_for_another_config_is_refused(self) -> None:
+        self.assert_refused(self.forge(config_sha256="0" * 64), "config_sha256")
+
+    def test_an_unknown_task_harness_or_pair_is_refused(self) -> None:
+        self.assert_refused(self.forge(task_id="rm-rf"), "unknown task")
+        self.assert_refused(self.forge(harness="evil"), "unknown harness")
+        self.assert_refused(self.forge(model="other"), "not a pair")
+        self.assert_refused(self.forge(harness="claude"), "not a pair")  # a harness of the config, with another model
+
+    def test_a_trial_id_that_is_not_the_recomputed_one_is_refused(self) -> None:
+        self.assert_refused(self.forge(trial_id="0" * 16), "trial_id")
+        self.assert_refused(self.forge(rep=7), "trial_id")  # the id belongs to rep 1
+        self.assert_refused(self.forge(run_id="f" * 32), "trial_id")
+
+    def test_a_trial_outside_the_plan_of_the_run_is_refused(self) -> None:
+        # rep 99 with the trial_id that matches it: the run planned one repetition
+        planned = api.plan(self.config, self.started, only=["pi"], reps=1)[0]
+        beyond = TrialSpec.from_dict(
+            {
+                **planned.to_dict(),
+                "rep": 99,
+                "trial_id": make_trial_id(self.started.run_id, "fizzbuzz", "pi@unknown:p/nofix", 99),
+            }
+        )
+        self.assert_refused(beyond, "beyond")
+        # a harness the run left out with --only: the run has the target `pi` alone
+        other = api.plan(self.config, api.start_run(self.config, only=["claude"]), only=["claude"])[0]
+        out_of_run = TrialSpec.from_dict(
+            {
+                **other.to_dict(),
+                "run_id": self.started.run_id,
+                "trial_id": make_trial_id(self.started.run_id, "fizzbuzz", "claude@unknown:fix", 1),
+            }
+        )
+        self.assert_refused(out_of_run, "not a target")
+
+    def test_a_run_of_an_older_version_without_reps_uses_the_config_reps(self) -> None:
+        info = self.started.to_dict()
+        del info["reps"]
+        (self.run_dir(self.started.run_id) / "run.json").write_text(json.dumps(info))
+        beyond = api.plan(self.config, RunInfo.from_dict(info), only=["pi"], reps=1)[0]
+        self.assertEqual(beyond.rep, 1)
+        far = TrialSpec.from_dict(
+            {
+                **beyond.to_dict(),
+                "rep": 99,
+                "trial_id": make_trial_id(self.started.run_id, "fizzbuzz", "pi@unknown:p/nofix", 99),
+            }
+        )
+        self.assert_refused(far, "beyond")
+
+    def test_a_run_that_does_not_exist_is_refused(self) -> None:
+        other = api.plan(self.config, RunInfo.from_dict({**self.started.to_dict(), "run_id": "9" * 32}))
+        shutil.rmtree(self.run_dir("9" * 32), ignore_errors=True)
+        self.assert_refused(other[0], "run " + "9" * 32)
+
+    def test_a_run_of_another_config_is_refused(self) -> None:
+        info = self.started.to_dict() | {"config_sha256": "1" * 64}
+        (self.run_dir(self.started.run_id) / "run.json").write_text(json.dumps(info))
+        self.assert_refused(self.spec, "was not started with this config")
+
+    def test_malformed_specs_are_refused_before_they_are_a_spec(self) -> None:
+        good = self.spec.to_dict()
+        bad_texts = [
+            "not json",
+            "[]",
+            json.dumps({**good, "run_id": "../../etc"}),
+            json.dumps({**good, "run_id": "a" * 31 + "/"}),
+            json.dumps({**good, "command": ["rm", "-rf", "/"]}),
+            json.dumps({k: v for k, v in good.items() if k != "model"}),
+            json.dumps({**good, "rep": 0}),
+            json.dumps({**good, "schema_version": "2.0.0"}),
+        ]
+        for text in bad_texts:
+            with self.subTest(text=text), self.assertRaises(api.SpecError):
+                api.parse_spec(text)
+        self.assertEqual(api.parse_spec(json.dumps(good)), self.spec)
+
+
+class FinishRunTests(ApiTestCase):
+    def test_finish_sets_the_finish_time_once_and_writes_the_report(self) -> None:
+        run, _ = self.run_all()
+        with fixtures.quiet():
+            info = api.finish_run(self.config, run.run_id)
+        self.assertIsNotNone(info.finished_at)
+        self.assertEqual(read_run(self.run_dir(run.run_id))[0], info)
+        self.assertTrue((self.base / "results" / "summary.md").exists())
+        with fixtures.quiet():
+            again = api.finish_run(self.config, run.run_id, report=False)
+        self.assertEqual(again.finished_at, info.finished_at)
+
+    def test_finish_restores_the_legacy_row_of_a_trial_that_lost_it(self) -> None:
+        run, results = self.run_all()
+        rows = (self.base / "results" / "results.jsonl").read_text().splitlines()
+        (self.base / "results" / "results.jsonl").write_text(rows[0] + "\n")  # a worker killed between the two files
+        api.finish_run(self.config, run.run_id, report=False)
+        self.assertEqual(len(rows_of(self.base)), len(results))
+
+    def test_finish_of_a_run_with_an_invalid_trials_file_is_a_run_error(self) -> None:
+        run = api.start_run(self.config)
+        (self.run_dir(run.run_id) / "trials.jsonl").write_text("garbage\n")
+        with self.assertRaises(api.RunError):
+            api.finish_run(self.config, run.run_id, report=False)
+
+    def test_without_report_no_summary_is_written(self) -> None:
+        run, _ = self.run_all()
+        api.finish_run(self.config, run.run_id, report=False)
+        self.assertFalse((self.base / "results" / "summary.md").exists())
+
+    def test_a_report_without_results_is_a_run_error(self) -> None:
+        run = api.start_run(self.config)
+        with self.assertRaises(api.RunError) as cm, fixtures.quiet():
+            api.finish_run(self.config, run.run_id)
+        self.assertIn("no results", str(cm.exception))
+
+    def test_a_run_that_does_not_exist_or_has_another_config_is_a_run_error(self) -> None:
+        with self.assertRaises(api.RunError):
+            api.finish_run(self.config, "e" * 32)
+        with self.assertRaises(api.RunError):
+            api.finish_run(self.config, "not-a-run")
+
+
+class LockedAppendTests(unittest.TestCase):
+    def test_threads_appending_long_lines_never_tear_them(self) -> None:
+        path = fixtures.tmpdir(self) / "file.jsonl"
+        path.touch()
+
+        def worker(n: int) -> None:
+            for i in range(15):
+                locked_append(path, json.dumps({"n": n, "i": i, "pad": "x" * 200_000}) + "\n")
+
+        threads = [threading.Thread(target=worker, args=(n,)) for n in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual(sorted((r["n"], r["i"]) for r in rows), [(n, i) for n in range(4) for i in range(15)])
+
+    def test_locked_append_drops_a_last_line_cut_short_by_a_crash(self) -> None:
+        path = fixtures.tmpdir(self) / "file.jsonl"
+        path.write_text('{"a": 1}\n{"cut')
+        locked_append(path, '{"b": 2}\n')
+        self.assertEqual(path.read_text(), '{"a": 1}\n{"b": 2}\n')
+        only_cut = fixtures.tmpdir(self) / "cut.jsonl"
+        only_cut.write_text("no newline at all")
+        locked_append(only_cut, "x\n")
+        self.assertEqual(only_cut.read_text(), "x\n")
+
+    def test_a_cursor_reads_only_what_was_added_and_starts_over_when_the_file_changed(self) -> None:
+        path = fixtures.tmpdir(self) / "file.jsonl"
+        path.write_text("one\ntwo\n")
+        cursor = LogCursor()
+        with locked_log(path, cursor) as (_, text):
+            self.assertEqual((text, cursor.fresh), ("one\ntwo\n", True))
+            cursor.ids.add("seen")
+        locked_append(path, "three\n")
+        with locked_log(path, cursor) as (_, text):
+            self.assertEqual((text, cursor.fresh, cursor.ids), ("three\n", False, {"seen"}))
+        with path.open("a") as f:
+            f.write("cut")  # a writer killed in the middle of a line
+        with locked_log(path, cursor) as (_, text):
+            self.assertEqual((text, path.read_text()), ("", "one\ntwo\nthree\n"))
+        path.write_text("x\n")  # the file shrank
+        with locked_log(path, cursor) as (_, text):
+            self.assertEqual((text, cursor.fresh, cursor.ids), ("x\n", True, set()))
+        replacement = path.with_name("other.jsonl")
+        replacement.write_text("y\nz\n")
+        replacement.replace(path)  # another file under the same name
+        cursor.ids.add("stale")
+        with locked_log(path, cursor) as (_, text):
+            self.assertEqual((text, cursor.fresh, cursor.ids), ("y\nz\n", True, set()))
+
+    def test_append_once_sees_what_another_writer_added_since_its_last_read(self) -> None:
+        from test_core_models import run_info
+
+        out = fixtures.tmpdir(self)
+        first = RunWriter(out, run_info(run_id="a" * 32))
+        second = RunWriter.open_existing(out, "a" * 32)
+        a, b = trial(trial_id="1" * 16), trial(trial_id="2" * 16)
+        self.assertIs(first.append_once(a), a)
+        self.assertEqual(second.append_once(trial(trial_id="1" * 16, rep=2)), a)
+        self.assertIs(first.append_once(b), b)
+        self.assertEqual(second.append_once(trial(trial_id="2" * 16, rep=3)), b)  # found in what was added
+        self.assertEqual([t.trial_id for t in first.trials()], ["1" * 16, "2" * 16])
+
+    def test_the_otlp_sink_appends_under_the_same_lock(self) -> None:
+        out = fixtures.tmpdir(self)
+        sink = otlp.OtlpSink(out, None, {}, 1.0)
+        from sink_helpers import make_info, make_trial
+
+        sink.open(make_info())
+        with mock.patch.object(otlp, "locked_log", wraps=locked_log) as spy:
+            sink.write(make_trial())
+        self.assertEqual([call.args[0] for call in spy.call_args_list], [out / make_info().run_id / TRACES_FILE])
+
+    def test_two_sinks_on_one_run_write_a_span_once_and_repair_a_cut_line(self) -> None:
+        from sink_helpers import make_info, make_trial
+
+        out = fixtures.tmpdir(self)
+        first, second = (otlp.OtlpSink(out, None, {}, 1.0) for _ in range(2))
+        first.open(make_info())
+        second.open(make_info())  # opened before the first one wrote anything
+        first.write(make_trial())
+        path = out / make_info().run_id / TRACES_FILE
+        with path.open("a") as f:
+            f.write('{"resourceSp')  # a worker killed in the middle of a line
+        second.write(make_trial())  # the same span: not repeated
+        second.write(make_trial(rep=2))
+        lines = path.read_text().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(
+            [json.loads(line) for line in lines][1]["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["spanId"],
+            make_trial(rep=2).trial_id,
+        )
+
+    def test_a_trial_lock_makes_a_second_holder_wait(self) -> None:
+        run_dir = fixtures.tmpdir(self)
+        order: list[str] = []
+        entered, release = threading.Event(), threading.Event()
+
+        def first() -> None:
+            with trial_lock(run_dir, "a" * 16):
+                order.append("first in")
+                entered.set()
+                release.wait(5)
+                order.append("first out")
+
+        def second() -> None:
+            entered.wait(5)
+            with trial_lock(run_dir, "a" * 16):
+                order.append("second in")
+
+        threads = [threading.Thread(target=first), threading.Thread(target=second)]
+        for t in threads:
+            t.start()
+        entered.wait(5)
+        release.set()
+        for t in threads:
+            t.join()
+        self.assertEqual(order, ["first in", "first out", "second in"])
+
+    def test_the_sqlite_sink_waits_for_a_locked_database(self) -> None:
+        from sink_helpers import make_info
+
+        sink = sqlite.SqliteSink(fixtures.tmpdir(self) / "x.db")
+        sink.open(make_info())
+        db = sink._connection()
+        self.assertEqual(db.execute("PRAGMA busy_timeout").fetchone()[0], int(sqlite.BUSY_TIMEOUT_S * 1000))
+        sink.close(make_info())
+
+
+class AppendOnceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.out = fixtures.tmpdir(self)
+        from test_core_models import run_info
+
+        self.writer = RunWriter(self.out, run_info(run_id="a" * 32))
+
+    def test_a_trial_is_written_once_and_the_stored_one_comes_back(self) -> None:
+        first = trial(trial_id="1" * 16)
+        self.assertIs(self.writer.append_once(first), first)
+        again = trial(trial_id="1" * 16, rep=2)
+        self.assertEqual(self.writer.append_once(again), first)
+        self.assertEqual([t.trial_id for t in self.writer.trials()], ["1" * 16])
+
+    def test_a_last_line_cut_short_by_a_crash_is_dropped_under_the_lock(self) -> None:
+        self.writer.append_once(trial(trial_id="1" * 16))
+        with self.writer.trials_path.open("a") as f:
+            f.write('{"trial_id": "2222')
+        self.writer.append_once(trial(trial_id="3" * 16))
+        self.assertEqual([t.trial_id for t in self.writer.trials()], ["1" * 16, "3" * 16])
+
+    def test_a_line_that_is_no_trial_never_matches(self) -> None:
+        with self.writer.trials_path.open("a") as f:
+            f.write("garbage\n[1]\n")
+        stored = trial(trial_id="4" * 16)
+        self.assertIs(self.writer.append_once(stored), stored)
+
+    def test_open_existing_keeps_a_last_line_that_may_be_another_workers(self) -> None:
+        self.writer.append_once(trial())
+        with self.writer.trials_path.open("a") as f:
+            f.write('{"half')
+        RunWriter.open_existing(self.out, "a" * 32, repair=False)
+        self.assertTrue(self.writer.trials_path.read_text().endswith('{"half'))
+        RunWriter.open_existing(self.out, "a" * 32)
+        self.assertTrue(self.writer.trials_path.read_text().endswith("}\n"))
+
+
+class ConcurrentWorkersTests(ApiTestCase):
+    def test_four_worker_processes_on_one_run_directory_record_every_trial_once(self) -> None:
+        self.cfg["matrix"] = [{"harness": "claude", "model": "fix"}, {"harness": "pi", "model": "p/fix"}]
+        self.cfg["reps"] = 4
+        self.config = self.write_config()
+        run, specs = self.start()
+        self.assertEqual(len(specs), 8)
+        failures: list[str] = []
+
+        def worker(mine: list[TrialSpec]) -> None:
+            for spec in mine:
+                p = subprocess.run(
+                    [fixtures.PY, "-m", "hbench", "run-trial", "--config", str(self.config_path), "--spec", "-"]
+                    + ["--allow-unsandboxed"],
+                    input=json.dumps(spec.to_dict()),
+                    capture_output=True,
+                    text=True,
+                    cwd=fixtures.ROOT,
+                )
+                if p.returncode != 0 or TrialResult.from_dict(json.loads(p.stdout)).trial_id != spec.trial_id:
+                    failures.append(p.stderr)
+
+        threads = [threading.Thread(target=worker, args=(specs[i::4],)) for i in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(failures, [])
+        lines = (self.run_dir(run.run_id) / "trials.jsonl").read_text().splitlines()
+        self.assertEqual(sorted(json.loads(line)["trial_id"] for line in lines), sorted(s.trial_id for s in specs))
+        keys = [(r["task"], r["harness"], r["model"], r["rep"]) for r in rows_of(self.base)]
+        self.assertEqual((len(keys), len(set(keys))), (8, 8))
+
+
+class AcceptanceTests(RunTestCase):
+    """`run`, the CLI commands, a script over the API and the Python adapter give the same trials (ADR 0012)."""
+
+    def world(self) -> tuple[Path, Path]:
+        """A new benchmark directory with the sample task and the config of this test."""
+        base = fixtures.tmpdir(self)
+        shutil.copytree(fixtures.FIZZBUZZ, base / "tasks" / "fizzbuzz")
+        path = base / "config.json"
+        path.write_text(json.dumps(self.cfg))
+        return base, path
+
+    def trials_of(self, base: Path) -> list[dict[str, Any]]:
+        (path,) = (base / "results").glob("*/trials.jsonl")
+        rows = [masked(json.loads(line)) for line in path.read_text().splitlines()]
+        return sorted(rows, key=lambda r: (r["target"]["harness"], r["rep"]))
+
+    def test_run_the_cli_commands_a_script_and_the_adapter_agree(self) -> None:
+        self.cfg["reps"] = 2
+        reference_base, _ = self.world()
+        with fixtures.quiet():
+            hb.cmd_run(args(), self.cfg, reference_base)
+        reference = self.trials_of(reference_base)
+        self.assertEqual(len(reference), 4)
+
+        cli_base, cli_config = self.world()
+        with fixtures.quiet() as out:
+            cli.main(["plan", "--config", str(cli_config)])
+        lines = out.getvalue().splitlines()
+        for line in lines:
+            with fixtures.quiet(), mock.patch.object(sys, "stdin", io.TextIOWrapper(io.BytesIO(line.encode()))):
+                cli.main(["run-trial", "--config", str(cli_config), "--allow-unsandboxed", "--spec", "-"])
+        run_id = json.loads(lines[0])["run_id"]
+        with fixtures.quiet():
+            cli.main(["finish", "--config", str(cli_config), "--run", run_id])
+        self.assertEqual(self.trials_of(cli_base), reference)
+        self.assertTrue((cli_base / "results" / "summary.md").exists())
+
+        api_base, api_config = self.world()
+        config = api.load_config(api_config)
+        run = api.start_run(config)
+        with fixtures.quiet():
+            for spec in api.plan(config, run):
+                api.run_trial(config, spec, allow_unsandboxed=True)
+            api.finish_run(config, run.run_id, report=False)
+        self.assertEqual(self.trials_of(api_base), reference)
+
+        adapter_base, adapter_config = self.world()
+        with fixtures.quiet():
+            results = run_parallel.run_parallel(adapter_config, workers=2, allow_unsandboxed=True)
+        self.assertEqual(self.trials_of(adapter_base), reference)
+        self.assertEqual([r.target.harness for r in results], ["claude", "claude", "pi", "pi"])
+
+    def test_the_adapter_runs_as_a_script_and_reports_a_bad_config(self) -> None:
+        base, config = self.world()
+        script = str(fixtures.ROOT / "adapters" / "python" / "run_parallel.py")
+        env = {**os.environ, "PYTHONPATH": str(fixtures.ROOT)}
+        p = subprocess.run(
+            [fixtures.PY, script, "--config", str(config), "--workers", "2", "--only", "claude"]
+            + ["--reps", "1", "--allow-unsandboxed"],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=base,
+        )
+        self.assertEqual((p.returncode, p.stdout.splitlines()[-1]), (0, "1 of 1 trials passed"), p.stderr)
+        p = subprocess.run(
+            [fixtures.PY, script, "--config", str(base / "nope.json")],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=base,
+        )
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("run_parallel: cannot read the config", p.stderr)
+
+    def test_the_adapter_worker_function_runs_one_spec(self) -> None:
+        base, config = self.world()
+        loaded = api.load_config(config)
+        run = api.start_run(loaded)
+        (spec,) = api.plan(loaded, run, only=["claude"])
+        with fixtures.quiet():
+            text = run_parallel.run_one(str(config), json.dumps(spec.to_dict()), True)
+        self.assertEqual(TrialResult.from_dict(json.loads(text)).trial_id, spec.trial_id)
+
+
+if __name__ == "__main__":
+    unittest.main()
 ```
 
 ## Sandbox

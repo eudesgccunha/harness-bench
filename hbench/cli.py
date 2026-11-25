@@ -5,17 +5,19 @@ profile (see `hbench.profiles`) and, for `run`, waits for the spend logs and rec
 """
 
 import argparse
+import contextlib
 import importlib
 import json
 import os
 import shutil
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from hbench import api
 from hbench.calibration import calibrate, calibration_status, read_labels, write_calibration
 from hbench.core.schema import schema_document
 from hbench.doctor import run_checks
@@ -24,6 +26,8 @@ from hbench.profiles import apply_litellm_profile
 from hbench.results import ResumeError, read_run
 from hbench.sinks.feed import SinkFeed
 from hbench.suites import Suite, SuiteError, load_suite, suite_label, suite_tasks
+
+MAX_SPEC_BYTES = 64 * 1024  # a spec is a few hundred bytes; a bigger input is not one
 
 _DESCRIPTION = (
     "harness-bench: compare coding-agent harness x model pairs. Main metric: cost per solved task.\n\n"
@@ -36,7 +40,10 @@ _DESCRIPTION = (
     "  python3 -m hbench suite validate [--config C] [--run [--allow-unsandboxed]] [PATH...]\n"
     "  python3 -m hbench judge calibrate --config C --labels LABELS.jsonl --out calibration.json\n"
     "  python3 -m hbench export    --config C --run RUN_DIR   # replay a run into the configured sinks\n"
-    "  python3 -m hbench doctor    --config C [--network]   # check env, CLIs, image and network; spends nothing\n\n"
+    "  python3 -m hbench doctor    --config C [--network]   # check env, CLIs, image and network; spends nothing\n"
+    "  python3 -m hbench plan      --config C [--only H...] [--reps N] [--run RUN_ID]   # a TrialSpec per line\n"
+    "  python3 -m hbench run-trial --config C [--allow-unsandboxed] --spec FILE|-   # run one spec, print the result\n"
+    "  python3 -m hbench finish    --config C --run RUN_ID [--no-report]   # close the run, write the report\n\n"
     "Add --litellm to run, report or reconcile for the LiteLLM-only benchmark."
 )
 
@@ -135,6 +142,21 @@ def build_parser(epilog: str | None = None) -> argparse.ArgumentParser:
     export_cmd = sub.add_parser("export", help="replay a run into the configured sinks (idempotent)")
     export_cmd.add_argument("--config", required=True)
     export_cmd.add_argument("--run", required=True, metavar="RUN_DIR", help="the run directory: <output_dir>/<run_id>")
+    plan_cmd = sub.add_parser("plan", help="start a run (or reuse --run) and print one TrialSpec per line")
+    _add_config(plan_cmd)
+    plan_cmd.add_argument("--reps", type=int)
+    plan_cmd.add_argument("--only", nargs="*", help="only these harness names")
+    plan_cmd.add_argument("--run", metavar="RUN_ID", help="plan this run (started by an earlier plan) again")
+    trial_cmd = sub.add_parser("run-trial", help="run the trial a TrialSpec names and print its result as JSON")
+    _add_config(trial_cmd)
+    trial_cmd.add_argument("--spec", required=True, metavar="FILE", help="the spec: a file, or - for stdin")
+    trial_cmd.add_argument(
+        "--allow-unsandboxed", action="store_true", help="run without a sandbox (only inside a disposable VM)"
+    )
+    finish_cmd = sub.add_parser("finish", help="mark a planned run finished, close its sinks and write the report")
+    _add_config(finish_cmd)
+    finish_cmd.add_argument("--run", required=True, metavar="RUN_ID")
+    finish_cmd.add_argument("--no-report", action="store_true", help="do not write summary.md and summary.csv")
     judge = sub.add_parser("judge", help="LLM judge tools")
     judge_sub = judge.add_subparsers(dest="judge_cmd", required=True)
     calibrate_cmd = judge_sub.add_parser(
@@ -312,6 +334,67 @@ def _export(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def _load_config(args: argparse.Namespace) -> api.Config:
+    """The config of the command. Its warnings go to stderr: stdout of `plan` and `run-trial` is data."""
+    try:
+        with contextlib.redirect_stdout(sys.stderr):
+            return api.load_config(args.config, litellm=args.litellm)
+    except api.ApiError as e:
+        sys.exit(f"{args.cmd}: {e}")
+
+
+def _plan(args: argparse.Namespace) -> None:
+    """`plan`: start a run, or reuse the run `--run` names, and print one `TrialSpec` per line."""
+    config = _load_config(args)
+    try:
+        run = api.open_run(config, args.run) if args.run else api.start_run(config, only=args.only, reps=args.reps)
+        specs = api.plan(config, run, only=args.only, reps=args.reps)
+    except api.ApiError as e:
+        sys.exit(f"plan: {e}")
+    for spec in specs:
+        print(json.dumps(spec.to_dict()))
+
+
+def _run_trial(args: argparse.Namespace) -> None:
+    """`run-trial`: run one spec. The engine's progress goes to stderr, so stdout holds only the result."""
+    config = _load_config(args)
+    try:
+        if args.spec == "-":
+            raw = sys.stdin.buffer.read(MAX_SPEC_BYTES + 1)
+        else:
+            with Path(args.spec).open("rb") as f:
+                raw = f.read(MAX_SPEC_BYTES + 1)
+    except OSError as e:
+        sys.exit(f"run-trial: cannot read the spec {args.spec}: {e}")
+    if len(raw) > MAX_SPEC_BYTES:
+        sys.exit(
+            f"run-trial: the spec is larger than {MAX_SPEC_BYTES // 1024} KiB: a spec names a trial and nothing else"
+        )
+    try:
+        text = raw.decode()
+    except UnicodeDecodeError:
+        sys.exit("run-trial: the spec is not UTF-8 text")
+    try:
+        spec = api.parse_spec(text)
+        with contextlib.redirect_stdout(sys.stderr):
+            result = api.run_trial(config, spec, allow_unsandboxed=args.allow_unsandboxed)
+    except api.ApiError as e:
+        sys.exit(f"run-trial: {e}")
+    print(json.dumps(result.to_dict()))
+
+
+def _finish(args: argparse.Namespace) -> None:
+    """`finish`: close the run. Under `--litellm` the report waits for `reconcile`, as it does for `run`."""
+    config = _load_config(args)
+    try:
+        info = api.finish_run(config, args.run, report=not (args.no_report or args.litellm))
+    except api.ApiError as e:
+        sys.exit(f"finish: {e}")
+    print(f"finished run {info.run_id} at {info.finished_at}")
+    if args.litellm:
+        print(f"reconcile, then report: python3 -m hbench reconcile --litellm --config {args.config}")
+
+
 def _run_litellm(engine: ModuleType, args: argparse.Namespace, cfg: dict[str, Any], base: Path) -> None:
     """`run` under the LiteLLM profile: report only after reconcile, when the gateway cost exists."""
     engine.cmd_run(args, cfg, base)
@@ -323,6 +406,13 @@ def _run_litellm(engine: ModuleType, args: argparse.Namespace, cfg: dict[str, An
         engine.cmd_reconcile(args, cfg, base)
     except Exception as e:  # noqa: BLE001
         print(f"reconcile failed: {e}\nRun later: python3 -m hbench reconcile --litellm --config {args.config}")
+
+
+_ORCHESTRATOR_COMMANDS: Mapping[str, Callable[[argparse.Namespace], None]] = {
+    "plan": _plan,
+    "run-trial": _run_trial,
+    "finish": _finish,
+}
 
 
 def main(argv: Sequence[str] | None = None, *, epilog: str | None = None) -> None:
@@ -342,6 +432,9 @@ def main(argv: Sequence[str] | None = None, *, epilog: str | None = None) -> Non
         return
     if args.cmd == "doctor":
         _doctor(args)
+        return
+    if args.cmd in _ORCHESTRATOR_COMMANDS:
+        _ORCHESTRATOR_COMMANDS[args.cmd](args)
         return
     engine = _engine()
     cfg_path = Path(args.config).resolve()

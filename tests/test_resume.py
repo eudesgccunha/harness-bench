@@ -120,14 +120,14 @@ class RunWriterResumeTests(unittest.TestCase):
     def make(self, out: Path, *trials: Any, run_id: str = "a" * 32) -> RunWriter:
         writer = RunWriter(out, run_info(run_id=run_id))
         for t in trials:
-            writer.append(t)
+            writer.append_once(t)
         return writer
 
     def test_open_existing_keeps_the_run_and_appends_to_its_trials(self) -> None:
         out = fixtures.tmpdir(self)
         first = self.make(out, trial(trial_id="1" * 16))
         reopened = RunWriter.open_existing(out, "a" * 32)
-        reopened.append(trial(trial_id="2" * 16, rep=2))
+        reopened.append_once(trial(trial_id="2" * 16, rep=2))
         self.assertEqual(
             (reopened.info, reopened.finished_trial_ids(), first.info == reopened.info),
             (first.info, {"1" * 16, "2" * 16}, True),
@@ -146,7 +146,7 @@ class RunWriterResumeTests(unittest.TestCase):
         out = fixtures.tmpdir(self)
         writer = self.make(out)
         with mock.patch("os.fsync") as fsync:
-            writer.append(trial())
+            writer.append_once(trial())
         fsync.assert_called_once()
 
     def test_a_last_line_cut_short_by_a_crash_is_dropped(self) -> None:
@@ -155,7 +155,7 @@ class RunWriterResumeTests(unittest.TestCase):
         with writer.trials_path.open("a") as f:
             f.write('{"run_id": "cut off')
         reopened = RunWriter.open_existing(out, "a" * 32)
-        reopened.append(trial(trial_id="2" * 16, rep=2))
+        reopened.append_once(trial(trial_id="2" * 16, rep=2))
         self.assertEqual(reopened.finished_trial_ids(), {"1" * 16, "2" * 16})
 
     def test_a_trials_file_that_was_never_created_reads_as_empty(self) -> None:
@@ -391,7 +391,7 @@ class ResumeRunTests(RunTestCase):
             self.cmd_run()
         (run_dir,) = self.run_dirs()
         results = self.base / "results" / "results.jsonl"
-        self.assertEqual((len(self.trials(run_dir)), results.read_text()), (1, ""))
+        self.assertEqual((len(self.trials(run_dir)), results.read_text() if results.exists() else ""), (1, ""))
         out = self.cmd_run(resume=run_dir.name)
         self.assertEqual((out.count("run   "), len(self.trials(run_dir)), len(rows_of(self.base))), (0, 1, 1))
 

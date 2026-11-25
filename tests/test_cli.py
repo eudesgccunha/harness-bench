@@ -17,6 +17,7 @@ import fixtures
 from hbench import cli
 from hbench.core.schema import schema_document
 from hbench.profiles import apply_litellm_profile
+from test_api import ApiTestCase
 from test_litellm import ScriptedServer, ok
 
 ROOT = fixtures.ROOT
@@ -407,6 +408,146 @@ class ReportOptionsTests(unittest.TestCase):
         out = self.report()
         self.assertIn("within 60 pp", out)
         self.assertIn("CI width of 0.40", out)
+
+
+class OrchestratorCommandTests(ApiTestCase):
+    """`plan`, `run-trial` and `finish` (ADR 0012): the API on the command line."""
+
+    def main(self, *argv: str, stdin: str | bytes = "") -> tuple[str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+            mock.patch.object(
+                sys, "stdin", io.TextIOWrapper(io.BytesIO(stdin.encode() if isinstance(stdin, str) else stdin))
+            ),
+        ):
+            cli.main(list(argv))
+        return out.getvalue(), err.getvalue()
+
+    def fails(self, *argv: str, stdin: str | bytes = "") -> str:
+        with self.assertRaises(SystemExit) as cm:
+            self.main(*argv, stdin=stdin)
+        return str(cm.exception.code)
+
+    def plan(self, *extra: str) -> list[dict[str, Any]]:
+        out, _ = self.main("plan", "--config", str(self.config_path), *extra)
+        return [json.loads(line) for line in out.splitlines()]
+
+    def test_plan_prints_one_spec_per_line_and_starts_the_run(self) -> None:
+        specs = self.plan("--reps", "2", "--only", "pi")
+        self.assertEqual([(s["harness"], s["rep"]) for s in specs], [("pi", 1), ("pi", 2)])
+        (run_json,) = (self.base / "results").glob("*/run.json")
+        self.assertEqual({s["run_id"] for s in specs}, {run_json.parent.name})
+
+    def test_plan_with_run_plans_the_same_run_again(self) -> None:
+        first = self.plan()
+        again = self.plan("--run", first[0]["run_id"])
+        self.assertEqual(again, first)
+        self.assertEqual(len(list((self.base / "results").glob("*/run.json"))), 1)
+
+    def test_plan_errors_exit_with_a_message(self) -> None:
+        self.assertIn("cannot read the config", self.fails("plan", "--config", str(self.base / "no.json")))
+        self.assertIn("plan: no run", self.fails("plan", "--config", str(self.config_path), "--run", "e" * 32))
+        self.assertIn("reps", self.fails("plan", "--config", str(self.config_path), "--reps", "0"))
+
+    def test_run_trial_reads_a_file_or_stdin_and_prints_only_the_result_on_stdout(self) -> None:
+        first, second = self.plan("--only", "claude", "--reps", "2")
+        path = self.base / "spec.json"
+        path.write_text(json.dumps(first))
+        out, err = self.main("run-trial", "--config", str(self.config_path), "--allow-unsandboxed", "--spec", str(path))
+        result = json.loads(out)
+        self.assertEqual(
+            (len(out.splitlines()), result["trial_id"], result["status"]), (1, first["trial_id"], "passed")
+        )
+        self.assertIn("done  fizzbuzz__claude__fix__r1", err)  # the engine's progress goes to stderr
+        out, _ = self.main(
+            "run-trial",
+            "--config",
+            str(self.config_path),
+            "--allow-unsandboxed",
+            "--spec",
+            "-",
+            stdin=json.dumps(second),
+        )
+        self.assertEqual(json.loads(out)["trial_id"], second["trial_id"])
+
+    def test_run_trial_errors_exit_with_a_message(self) -> None:
+        (spec,) = self.plan("--only", "claude")
+        config = str(self.config_path)
+        self.assertIn(
+            "cannot read the spec", self.fails("run-trial", "--config", config, "--spec", str(self.base / "x"))
+        )
+        self.assertIn("not a valid trial spec", self.fails("run-trial", "--config", config, "--spec", "-", stdin="{}"))
+        forged = json.dumps({**spec, "config_sha256": "0" * 64})
+        self.assertIn("config_sha256", self.fails("run-trial", "--config", config, "--spec", "-", stdin=forged))
+        message = self.fails("run-trial", "--config", config, "--spec", "-", stdin=json.dumps(spec))
+        self.assertIn("No sandbox configured", message)
+
+    def test_a_spec_that_is_not_utf8_text_is_refused_with_a_message(self) -> None:
+        config = str(self.config_path)
+        self.assertIn("not UTF-8", self.fails("run-trial", "--config", config, "--spec", "-", stdin=b"\xff\xfe{"))
+        path = self.base / "latin.json"
+        path.write_bytes(b'{"x": "\xe9"}')
+        self.assertIn("not UTF-8", self.fails("run-trial", "--config", config, "--spec", str(path)))
+
+    def test_the_limit_counts_bytes_not_characters(self) -> None:
+        config = str(self.config_path)
+        wide = "é" * 40_000  # 40,000 characters, 80,000 bytes
+        self.assertIn("larger than 64 KiB", self.fails("run-trial", "--config", config, "--spec", "-", stdin=wide))
+
+    def test_a_spec_larger_than_64_kib_is_refused_unread(self) -> None:
+        config = str(self.config_path)
+        big = json.dumps({"pad": "x" * 70_000})
+        self.assertIn("larger than 64 KiB", self.fails("run-trial", "--config", config, "--spec", "-", stdin=big))
+        path = self.base / "big.json"
+        path.write_text(big)
+        self.assertIn("larger than 64 KiB", self.fails("run-trial", "--config", config, "--spec", str(path)))
+
+    def test_finish_closes_the_run_and_writes_the_report(self) -> None:
+        specs = self.plan("--only", "claude")
+        self.main(
+            "run-trial",
+            "--config",
+            str(self.config_path),
+            "--allow-unsandboxed",
+            "--spec",
+            "-",
+            stdin=json.dumps(specs[0]),
+        )
+        out, _ = self.main("finish", "--config", str(self.config_path), "--run", specs[0]["run_id"])
+        self.assertIn(f"finished run {specs[0]['run_id']}", out)
+        self.assertTrue((self.base / "results" / "summary.md").exists())
+        info = json.loads((self.base / "results" / specs[0]["run_id"] / "run.json").read_text())
+        self.assertIsNotNone(info["finished_at"])
+
+    def test_finish_without_report_and_its_errors(self) -> None:
+        (spec, *_) = self.plan()
+        self.main("finish", "--config", str(self.config_path), "--run", spec["run_id"], "--no-report")
+        self.assertFalse((self.base / "results" / "summary.md").exists())
+        self.assertIn("finish: no run", self.fails("finish", "--config", str(self.config_path), "--run", "e" * 32))
+
+    def test_the_litellm_profile_applies_and_holds_the_report_back(self) -> None:
+        self.cfg["litellm"] = {"base_url": "http://localhost:4000", "api_key": "${LITELLM_KEY}"}
+        self.cfg["matrix"] = [{"harness": "claude", "model": "fix"}, {"harness": "cursor", "model": "fix"}]
+        self.write_config()
+        specs = self.plan("--litellm")  # the profile's "ignored 1 matrix entries" notice is not on stdout
+        self.assertEqual({s["harness"] for s in specs}, {"claude"})
+        out, _ = self.main("finish", "--config", str(self.config_path), "--litellm", "--run", specs[0]["run_id"])
+        self.assertIn("finished run", out)
+        self.assertIn("python3 -m hbench reconcile --litellm --config", out)
+        self.assertFalse((self.base / "results-litellm" / "summary.md").exists())
+
+    def test_the_litellm_shim_applies_the_profile_to_the_new_commands_too(self) -> None:
+        import harness_bench_litellm as hbl
+
+        for command in ("plan", "run-trial", "finish"):
+            with (
+                mock.patch.object(cli, "main") as cli_main,
+                mock.patch.object(sys, "argv", ["x", command, "--config", "c"]),
+            ):
+                hbl.main()
+            cli_main.assert_called_once_with([command, "--litellm", "--config", "c"], epilog=mock.ANY)
 
 
 class ShimMainTests(unittest.TestCase):

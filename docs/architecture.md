@@ -165,3 +165,18 @@ a sink only receives the contract objects, so it cannot leak content, and a sink
 
 `TrialResult.trace_id` keeps the run tag: `reconcile` matches the spend logs by it. The OTLP trace id is the `run_id`.
 Plan: [`superpowers/plans/2026-11-24-phase-7-sinks-telemetry.md`](superpowers/plans/2026-11-24-phase-7-sinks-telemetry.md).
+
+## Phase 8: orchestrator API
+
+Decisions: [ADR 0012](adr/0012-plan-and-run-trial-api.md). `_run_trial` stays the only implementation of a trial. `run` runs it in one process with shared dirs, heartbeat and sink feed; `hbench/api.py` runs it for one `TrialSpec` in private ones, so any worker can do it.
+
+| Module | Role |
+|---|---|
+| `hbench/api.py` | The stable surface: `load_config`, `start_run`, `open_run`, `plan`, `parse_spec`, `run_trial`, `finish_run`, and the errors `ConfigError`, `SpecError`, `RunError`, `SandboxRequiredError` (all `ApiError`). It validates a spec against the config and the run, returns the recorded result of a trial that is already in `trials.jsonl`, and calls the engine. |
+| `hbench/core/models.py` | `TrialSpec` (contract 1.4.0): names a trial, carries no command, prompt, path, env or secret. |
+| `hbench/results.py` | `locked_append` (`flock`, write, flush, `fsync`) for `trials.jsonl`, `results.jsonl` and the OTLP file; `RunWriter.append_once` (check and write under one lock); `open_existing(repair=False)` for workers. |
+| `harness_bench.py` | `planned_trials` and `planned_trial` (the order of `run`, shared with `plan`); `run_trial_isolated` (private work dir, git dir, sandbox session and sink feed around `_run_trial`); `sink_feed`. |
+| `hbench/cli.py` | `plan`, `run-trial` (the engine's progress goes to stderr, stdout is the result) and `finish`. |
+| `adapters/` | Shell, GitHub Actions, Kubernetes and Python examples over the three calls. |
+
+The guide is [`orchestrator-integration.md`](orchestrator-integration.md). Plan: [`superpowers/plans/2026-11-25-phase-8-orchestrator-api.md`](superpowers/plans/2026-11-25-phase-8-orchestrator-api.md).

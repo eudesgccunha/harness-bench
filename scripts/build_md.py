@@ -92,6 +92,7 @@ HBENCH_SOURCES = [
     "hbench/report.py",
     "hbench/profiles.py",
     "hbench/suites.py",
+    "hbench/api.py",
     "hbench/cli.py",
     "hbench/__main__.py",
 ]
@@ -121,6 +122,7 @@ HBENCH_TESTS = [
     "tests/test_otlp_sink.py",
     "tests/test_sink_run.py",
     "tests/test_dashboard.py",
+    "tests/test_api.py",
 ]
 
 
@@ -214,7 +216,8 @@ If a run shows cost `n/a`, its tag did not reach LiteLLM. See the "LiteLLM: what
 harness-bench/
 ├── harness_bench.py
 ├── harness_bench_litellm.py     # LiteLLM-only variant (no Cursor)
-├── hbench/                      # data contract, report, suites, sinks and single CLI (ADR 0005, 0008, 0011)
+├── hbench/                      # data contract, report, suites, sinks, orchestrator API and single CLI (ADR 0005, 0008, 0011, 0012)
+├── adapters/                    # shell, GitHub Actions, Kubernetes and Python examples over plan / run-trial / finish (ADR 0012)
 ├── docs/sql/                    # reference schema and scorecard queries of the sqlite sink (ADR 0011)
 ├── docs/dashboards/             # example Grafana dashboard; scripts/synthetic_db.py writes demo data
 ├── README.md / AGENTS.md
@@ -277,6 +280,8 @@ Outputs in `results/`:
 - `logs/`: each agent's JSON output, stderr, setup, tests, and the `.diff` of everything the agent changed. Known secrets show as `***REDACTED***`.
 
 To also send each trial to a SQLite database and OTLP traces, add a `sinks` list to the config (see `docs/running-a-benchmark.md` and `config.example.json`): `{{"type": "sqlite", "path": "results/bench.sqlite"}}` and `{{"type": "otlp", "endpoint": "https://collector:4318", "headers": {{"x-key": "${{OTLP_KEY}}"}}}}`. `trials.jsonl` is written first and stays the source of truth; a sink that fails is warned about once and left out for that run, and `python3 -m hbench export --config config.json --run results/<run_id>` sends a run again (idempotent by `trial_id`). Spans hold ids, status, model, tokens and cost, never a prompt, response or log. The agent gets `BENCH_RUN_ID` and `BENCH_TRIAL_ID` in its environment.
+
+To run the trials of one run on several workers (processes, CI jobs, pods), use the three orchestrator commands: `python3 -m hbench plan --config config.json > specs.jsonl` starts the run and prints one `TrialSpec` JSON per line, `python3 -m hbench run-trial --config config.json --spec -` runs the spec on its stdin and prints the `TrialResult`, and `python3 -m hbench finish --config config.json --run RUN_ID` closes the run and writes the report. A spec names a trial and carries no command, prompt, path, env or secret: each worker resolves everything from its own copy of the config, and a spec that does not match it is refused before anything runs. Running a spec twice is safe (the second returns the first result). Workers on one run directory need a shared filesystem with working `flock`. The Python API is `hbench/api.py` (`load_config`, `start_run`, `plan`, `run_trial`, `finish_run`); examples are in `adapters/` and the guide is `docs/orchestrator-integration.md` ([ADR 0012](docs/adr/0012-plan-and-run-trial-api.md)).
 
 `run` only starts with a sandbox configured (`sandbox.type` `docker`, or a `sandbox.prefix`; see [Security](#security)). Inside a disposable VM, add `--allow-unsandboxed`. To continue a run that was killed, use `run --resume RUN_ID` (see [Sandbox types, limits, resume and doctor](#sandbox-types-limits-resume-and-doctor)).
 
@@ -569,7 +574,7 @@ In `sandbox.prefix`: `{{workdir}}` and `{{env_file}}`.
 
 ## `hbench/` package
 
-New code lives in the `hbench/` package ([ADR 0005](docs/adr/0005-data-contract-and-package.md)); the two scripts above call into it. `hbench/sandboxes/` holds the sandboxes and `hbench/doctor.py` the `doctor` checks.
+New code lives in the `hbench/` package ([ADR 0005](docs/adr/0005-data-contract-and-package.md)); the two scripts above call into it. `hbench/sandboxes/` holds the sandboxes, `hbench/doctor.py` the `doctor` checks and `hbench/api.py` the API for orchestrators.
 
 {hbench_md}## `config.litellm.example.json`
 

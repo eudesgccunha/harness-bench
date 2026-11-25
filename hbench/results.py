@@ -4,7 +4,9 @@ needs: reopening a run directory and the heartbeat that says whether a run is st
 Files hold references only (log path prefixes), never prompts, agent output or diffs.
 """
 
+import contextlib
 import dataclasses
+import fcntl
 import json
 import os
 import re
@@ -13,11 +15,12 @@ import socket
 import sys
 import tempfile
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Self
+from typing import IO, Any, Self, TextIO
 
 from hbench.core.models import ContractError, Costs, RunInfo, TrialResult
 
@@ -41,6 +44,82 @@ def _atomic_write(path: Path, text: str) -> None:
         raise
 
 
+@contextlib.contextmanager
+def _exclusive(f: IO[Any]) -> Iterator[None]:
+    """An exclusive `flock` on the open file, released when the block ends."""
+    fcntl.flock(f, fcntl.LOCK_EX)
+    try:
+        yield
+    finally:
+        fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def locked_append(path: Path, text: str) -> None:
+    """Append `text` to `path` under an exclusive `flock`: write, flush, `fsync`, unlock. Workers on one run directory
+    take turns, so no line is ever torn or interleaved (ADR 0012; it needs a filesystem where `flock` works). Under the
+    lock no live writer is mid-write, so a last line without its newline was cut short by a crash: it is dropped."""
+    with path.open("a+b") as f, _exclusive(f):
+        size = os.fstat(f.fileno()).st_size
+        if size:
+            f.seek(size - 1)
+            if f.read(1) != b"\n":
+                f.seek(0)
+                data = f.read()
+                f.truncate(data.rfind(b"\n") + 1)
+        f.write(text.encode())
+        f.flush()
+        os.fsync(f.fileno())
+
+
+@dataclass
+class LogCursor:
+    """What a reader of a line file keeps between calls of `locked_log`: where it stopped, which file that was, and
+    what the caller learned from the lines (`ids`). `fresh` says the last read began at the start of the file."""
+
+    inode: int | None = None
+    offset: int = 0
+    fresh: bool = True
+    ids: set[str] = field(default_factory=set)
+
+
+@contextlib.contextmanager
+def locked_log(path: Path, cursor: LogCursor) -> Iterator[tuple[TextIO, str]]:
+    """Open the line file `path` for reading and appending under an exclusive `flock` and yield it with its complete
+    lines. Under the lock no live writer is mid-write, so anything after the last newline was cut short by a crash and
+    is dropped first. The caller writes its line (one `write`, then `flush` and `fsync`).
+
+    Only the lines added since the `cursor`'s last read come back, so a long file is not read again for every line.
+    A file that shrank or was replaced (another inode) is read from the start: `cursor.fresh` is True and
+    `cursor.ids` is emptied; the caller refills it from the lines it gets."""
+    with path.open("a+") as f, _exclusive(f):
+        stat = os.fstat(f.fileno())
+        start = cursor.offset if cursor.inode == stat.st_ino and cursor.offset <= stat.st_size else 0
+        f.seek(start)
+        text = f.read()
+        complete = text[: text.rfind("\n") + 1]
+        end = start + len(complete.encode())
+        if len(complete) != len(text):
+            f.truncate(end)
+        if start == 0:
+            cursor.ids.clear()
+        cursor.fresh, cursor.inode, cursor.offset = start == 0, stat.st_ino, end
+        yield f, complete
+
+
+@contextlib.contextmanager
+def trial_lock(run_dir: Path, trial_id: str) -> Iterator[None]:
+    """An exclusive `flock` on `<run_dir>/.locks/<trial_id>.lock`, held for the whole trial: two workers given the same
+    spec never run it at once (the second waits). The lock goes when its holder dies, however it dies."""
+    lock_dir = run_dir / ".locks"
+    lock_dir.mkdir(exist_ok=True)
+    with (lock_dir / f"{trial_id}.lock").open("a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
 RUN_ID = re.compile(r"[0-9a-f]{32}")  # `new_run_id()`: a UUID4 in hex
 
 
@@ -57,16 +136,19 @@ class RunWriter:
         self.info = info
         self.run_dir = out_dir / info.run_id
         self.trials_path = self.run_dir / "trials.jsonl"
+        self._cursor = LogCursor()  # the `trial_id`s `append_once` has seen, so it reads only what was added since
         if not existing:
             self.run_dir.mkdir(parents=True)
             self.trials_path.touch()
             self._write_info()
 
     @classmethod
-    def open_existing(cls, out_dir: Path, run_id: str) -> Self:
-        """The writer of the run `run_id` in `out_dir`, appending to its `trials.jsonl`. A last line cut short by a
-        crash is dropped, so the next trial starts on a line of its own. Raises `ResumeError` for an id that is
-        not a run id, a run that does not exist, or files that are not valid."""
+    def open_existing(cls, out_dir: Path, run_id: str, *, repair: bool = True) -> Self:
+        """The writer of the run `run_id` in `out_dir`, appending to its `trials.jsonl`. With `repair`, a last line
+        cut short by a crash is dropped, so the next trial starts on a line of its own; a worker that shares the run
+        with others passes `repair=False` (a line that looks cut short may be another worker's write in progress:
+        `append_once` repairs it under the lock). Raises `ResumeError` for an id that is not a run id, a run that
+        does not exist, or files that are not valid."""
         if RUN_ID.fullmatch(run_id) is None:
             raise ResumeError(f"{run_id!r} is not a run id (32 lowercase hex characters, the name of a run directory)")
         info_path = out_dir / run_id / "run.json"
@@ -77,7 +159,8 @@ class RunWriter:
         except ValueError as e:  # ContractError and json.JSONDecodeError are both ValueErrors
             raise ResumeError(f"{info_path} is not valid run data: {e}") from e
         writer = cls(out_dir, info, existing=True)
-        writer._drop_partial_last_line()
+        if repair:
+            writer._drop_partial_last_line()
         return writer
 
     def _drop_partial_last_line(self) -> None:
@@ -96,12 +179,26 @@ class RunWriter:
     def finished_trial_ids(self) -> set[str]:
         return {trial.trial_id for trial in self.trials()}
 
-    def append(self, trial: TrialResult) -> None:
-        """Add a trial and make it durable before returning: `fsync`, so a crash right after cannot lose it."""
-        with self.trials_path.open("a") as f:
+    def append_once(self, trial: TrialResult) -> TrialResult:
+        """Add a trial and make it durable before returning (`fsync`), unless a trial with this `trial_id` is already in
+        the file: then nothing is written and the stored trial is returned (`trial` itself when it was written). Check
+        and write happen under one lock, so two workers that ran the same trial (an orchestrator retry) leave one line.
+        Under the lock no other writer is mid-write, so a last line cut short belongs to a crashed one and is dropped
+        first. Only the lines added since the last call are read."""
+        with locked_log(self.trials_path, self._cursor) as (f, complete):
+            self._cursor.ids |= {i for i in map(_line_trial_id, complete.splitlines()) if isinstance(i, str)}
+            if trial.trial_id in self._cursor.ids:
+                f.seek(0)
+                return next(
+                    TrialResult.from_dict(json.loads(line))
+                    for line in f.read().splitlines()
+                    if _line_trial_id(line) == trial.trial_id
+                )
             f.write(json.dumps(trial.to_dict()) + "\n")
             f.flush()
             os.fsync(f.fileno())
+            self._cursor.ids.add(trial.trial_id)
+            return trial
 
     def close(self, finished_at: datetime) -> None:
         self.info = dataclasses.replace(self.info, finished_at=finished_at)
@@ -109,6 +206,15 @@ class RunWriter:
 
     def _write_info(self) -> None:
         _atomic_write(self.run_dir / "run.json", json.dumps(self.info.to_dict(), indent=2) + "\n")
+
+
+def _line_trial_id(line: str) -> object:
+    """The `trial_id` of one line of `trials.jsonl`, or None for a line that holds no JSON object with one."""
+    try:
+        data = json.loads(line)
+    except ValueError:
+        return None
+    return data.get("trial_id") if isinstance(data, dict) else None
 
 
 def read_run(run_dir: Path) -> tuple[RunInfo, list[TrialResult]]:

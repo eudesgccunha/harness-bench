@@ -230,15 +230,23 @@ class ReplayTests(OtlpTestCase):
         second.close(make_info())
         self.assertEqual(len(file_requests(self.trace_file)), 3)
 
-    def test_a_last_line_cut_short_by_a_crash_is_not_a_span_and_the_next_line_starts_on_its_own(self) -> None:
+    def test_a_last_line_cut_short_by_a_crash_is_dropped_and_the_next_line_starts_on_its_own(self) -> None:
         self.trace_file.parent.mkdir()
         self.trace_file.write_text('{"resourceSpans": [{"scopeSp')
         sink = self.sink()
         sink.open(make_info())
         sink.write(make_trial())
         lines = self.trace_file.read_text().splitlines()
-        self.assertEqual(len(lines), 2)
-        self.assertEqual(span_of(json.loads(lines[1]))["spanId"], make_trial().trial_id)
+        self.assertEqual(len(lines), 1)  # repaired under the lock: the cut line is gone, not kept beside the new one
+        self.assertEqual(span_of(json.loads(lines[0]))["spanId"], make_trial().trial_id)
+
+    def test_a_complete_line_that_is_no_json_holds_no_span(self) -> None:
+        self.trace_file.parent.mkdir()
+        self.trace_file.write_text("not json at all\n")
+        sink = self.sink()
+        sink.open(make_info())
+        sink.write(make_trial())
+        self.assertEqual(len(self.trace_file.read_text().splitlines()), 2)
 
     def test_lines_that_are_not_requests_hold_no_span_ids(self) -> None:
         self.trace_file.parent.mkdir()

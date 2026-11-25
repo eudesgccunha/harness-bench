@@ -1,0 +1,53 @@
+# Example for ADR 0012: an Indexed Job where pod N runs line N of the plan. Steps:
+#   python3 -m hbench plan --config config.json > specs.jsonl      # on your machine: starts the run
+#   kubectl create configmap hbench-specs --from-file=specs.jsonl
+#   kubectl create secret generic hbench-config --from-file=config.json
+#   kubectl create secret generic hbench-env --from-literal=NAME=value   # one entry per ${VAR} of the config
+#   kubectl apply -f adapters/kubernetes/indexed-job.yaml           # set `completions` to the number of lines
+#   python3 -m hbench finish --config config.json --run RUN_ID      # once the job is complete
+# The `results` volume must be shared by every pod (ReadWriteMany, with working flock: the workers append to the same
+# files) and `output_dir` of the config must point into it. The pods run the image of sandbox/Dockerfile; the config must
+# set a sandbox that works inside a pod (the pod itself is not one), and its secrets must come in as env vars (${VAR}).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hbench-trials
+spec:
+  completionMode: Indexed
+  completions: 12
+  parallelism: 4
+  backoffLimit: 2
+  activeDeadlineSeconds: 14400  # the whole job; a trial that hangs cannot hold the cluster for ever
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: worker
+          image: <image>@sha256:<digest>  # pin by digest: the image runs agent code
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: "1", memory: 2Gi}
+            limits: {cpu: "2", memory: 4Gi}
+          # The variables the config names (${VAR}), such as the API keys, come from a Secret, never from a spec.
+          envFrom:
+            - secretRef: {name: hbench-env}
+          command: ["/bin/sh", "-c"]
+          # JOB_COMPLETION_INDEX is set by Kubernetes: 0 for the first pod. The spec is data on stdin, never a command.
+          args:
+            - sed -n "$((JOB_COMPLETION_INDEX + 1))p" /specs/specs.jsonl | python3 -m hbench run-trial --config /config/config.json --spec -
+          volumeMounts:
+            - {name: specs, mountPath: /specs, readOnly: true}
+            - {name: config, mountPath: /config, readOnly: true}
+            - {name: results, mountPath: /results}
+      volumes:
+        - name: specs
+          configMap: {name: hbench-specs}
+        - name: config
+          secret: {secretName: hbench-config}
+        - name: results
+          persistentVolumeClaim: {claimName: hbench-results}

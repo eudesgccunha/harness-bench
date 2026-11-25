@@ -43,9 +43,10 @@ from hbench import runners as _runners  # noqa: E402
 from hbench.calibration import Calibration, read_calibration  # noqa: E402
 from hbench.core.convert import row_from_trial, trial_from_row_lenient, trials_from_rows  # noqa: E402
 from hbench.core.ids import new_run_id, sha256_json, trial_id  # noqa: E402
-from hbench.core.models import GraderResult, RunInfo, Target  # noqa: E402
+from hbench.core.models import GraderResult, RunInfo, Target, TrialResult  # noqa: E402
 from hbench.graders import GRADERS as GRADERS, Change, GradeContext, GradePlan, compose, grade_plan  # noqa: E402
 from hbench.results import HEARTBEAT_FILE, Heartbeat, ResumeError, RunWriter, apply_gateway_costs  # noqa: E402
+from hbench.results import locked_append  # noqa: E402
 from hbench.results import heartbeat_is_live, read_heartbeat, read_trials  # noqa: E402
 from hbench.runners import PARSERS as PARSERS, empty_usage as empty_usage, json_lines as json_lines  # noqa: E402
 from hbench.runners import num as num, runner_for  # noqa: E402
@@ -1016,7 +1017,9 @@ def validate_task_behavior(cfg: Mapping[str, Any], task: Mapping[str, Any], base
     return TaskCheck(task_id=task["id"], untouched_passed=untouched, solution_passed=solved)
 
 
-def make_run_info(cfg: Mapping[str, Any], only: Sequence[str] | None, sandbox: Sandbox) -> RunInfo:
+def make_run_info(
+    cfg: Mapping[str, Any], only: Sequence[str] | None, sandbox: Sandbox, reps: int | None = None
+) -> RunInfo:
     """Metadata of this `run`. The config hash covers `${VAR}` references, never expanded values, and the
     config as written: the tasks that came from suites are not part of it."""
     targets = tuple(
@@ -1040,6 +1043,7 @@ def make_run_info(cfg: Mapping[str, Any], only: Sequence[str] | None, sandbox: S
         platform=platform.platform(),
         sandboxed=sandbox.isolated,
         sandbox=sandbox.describe(),
+        reps=reps,
         targets=targets,
     )
 
@@ -1086,18 +1090,22 @@ class _Planned:
     price: Mapping[str, Any] | None
 
 
-def _planned_trials(cfg: Mapping[str, Any], only: Sequence[str] | None, reps: int) -> Iterator[_Planned]:
+def planned_trials(cfg: Mapping[str, Any], only: Sequence[str] | None, reps: int) -> Iterator[_Planned]:
     """Every trial of the matrix in run order: pairs, then tasks, then repetitions."""
-    prices = cfg.get("prices", {})
     for pair in cfg["matrix"]:
-        hname, model = pair["harness"], pair["model"]
-        if only and hname not in only:
+        if only and pair["harness"] not in only:
             continue
         for task in cfg["tasks"]:
             for rep in range(1, reps + 1):
-                harness = cfg["harnesses"][hname]
-                price = prices.get(pair.get("price", model))
-                yield _Planned(task, harness, hname, model, rep, runner_for(harness), price)
+                yield planned_trial(cfg, pair, task, rep)
+
+
+def planned_trial(cfg: Mapping[str, Any], pair: Mapping[str, Any], task: Mapping[str, Any], rep: int) -> _Planned:
+    """The trial of one matrix pair, one task and one repetition."""
+    hname, model = pair["harness"], pair["model"]
+    harness = cfg["harnesses"][hname]
+    price = cfg.get("prices", {}).get(pair.get("price", model))
+    return _Planned(task, harness, hname, model, rep, runner_for(harness), price)
 
 
 def planned_trial_id(run_id: str, planned: _Planned) -> str:
@@ -1145,8 +1153,7 @@ def restore_legacy_rows(writer: RunWriter, results_path: Path) -> None:
     done = done_keys(results_path)
     for trial in writer.trials():
         if (trial.task_id, trial.target.harness, trial.target.model, trial.rep) not in done:
-            with results_path.open("a") as f:
-                f.write(json.dumps(row_from_trial(trial)) + "\n")
+            locked_append(results_path, json.dumps(row_from_trial(trial)) + "\n")
 
 
 def _run_matrix(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path, git_root: Path) -> None:
@@ -1173,7 +1180,7 @@ def _run_matrix(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path, gi
     if work_root:
         print(f"work dir: {work_root}")
     if not (args.dry_run or resume_id):
-        writer = RunWriter(out_dir, make_run_info(cfg, args.only, sandbox))
+        writer = RunWriter(out_dir, make_run_info(cfg, args.only, sandbox, reps))
     finished = done_keys(results_path)
     finished_ids = writer.finished_trial_ids() if writer else set()
     shared = None
@@ -1208,7 +1215,7 @@ def _run_matrix(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path, gi
     try:
         try:
             with shared.heartbeat if shared else contextlib.nullcontext():
-                for planned in _planned_trials(cfg, args.only, reps):
+                for planned in planned_trials(cfg, args.only, reps):
                     task, hname, model, rep = planned.task, planned.hname, planned.model, planned.rep
                     key = (task["id"], hname, model, rep)
                     tid = planned_trial_id(writer.info.run_id, planned) if writer else ""
@@ -1231,7 +1238,56 @@ def _run_matrix(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path, gi
         cmd_report(args, cfg, base)
 
 
-def _run_trial(m: _Matrix, planned: _Planned, tid: str) -> None:
+def sink_feed(cfg: Mapping[str, Any], base: Path) -> SinkFeed:
+    """The sinks of the config behind a feed that reports a failing sink (with secrets redacted) and never raises."""
+    secrets = [os.environ.get(v, "") for v in spend_key_vars(cfg)]
+    return SinkFeed(make_sinks(cfg, base), lambda message: print(redact(message, secrets), file=sys.stderr))
+
+
+def run_trial_isolated(
+    cfg: Mapping[str, Any], base: Path, writer: RunWriter, planned: _Planned, tid: str
+) -> TrialResult:
+    """One trial of a run that other workers share (ADR 0012): its own private work dir (unless `work_dir` is set),
+    its own private baseline git dir, its own sandbox session and its own sink feed, all gone when it returns or
+    raises. It is `_run_trial`, so every defense of `run` applies. The caller has validated the trial and checked the
+    sandbox rule."""
+    logs_dir = base / cfg.get("output_dir", "results") / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    secrets = [os.environ.get(v, "") for v in spend_key_vars(cfg)]
+    with tempfile.TemporaryDirectory(prefix="harness-bench-git-") as git_root:
+        plant_token(Path(git_root))
+        work_root = resolve_work_root(cfg, base)
+        try:
+            shared = _Matrix(
+                cfg=cfg,
+                base=base,
+                work_root=work_root,
+                git_root=Path(git_root),
+                logs_dir=logs_dir,
+                results_path=logs_dir.parent / "results.jsonl",
+                writer=writer,
+                # Nobody reads a worker's heartbeat (the run heartbeat belongs to `run`): its file stays in the
+                # private git dir and is never started as a thread.
+                heartbeat=Heartbeat(Path(git_root) / HEARTBEAT_FILE),
+                sandbox=make_sandbox(cfg),
+                plans={planned.task["id"]: grade_plan(planned.task)},
+                redactor=load_redactor(cfg["judge"]) if uses_judge(cfg) else None,
+                secrets=secrets,
+                keep=False,
+                resuming=True,  # a retry may follow a worker that was killed: reclaim what it left for this trial
+                sinks=sink_feed(cfg, base),
+            )
+            shared.sinks.open(writer.info)
+            try:
+                return _run_trial(shared, planned, tid)
+            finally:
+                shared.sinks.close(writer.info)
+        finally:
+            if not cfg.get("work_dir"):
+                shutil.rmtree(work_root, ignore_errors=True)
+
+
+def _run_trial(m: _Matrix, planned: _Planned, tid: str) -> TrialResult:
     """One trial: workdir, setup, baseline, agent, audit diff, protected paths, graders; then its two result rows
     (`trials.jsonl` first, flushed to disk, so a crash between the two can only lose the legacy row). The trial's
     sandbox session is always destroyed."""
@@ -1362,18 +1418,21 @@ def _run_trial(m: _Matrix, planned: _Planned, tid: str) -> None:
         ),
         image_digest=m.sandbox.image_digest(),
     )
-    m.writer.append(trial)
-    m.sinks.write(trial)  # after `trials.jsonl`, which is the source of truth; a failing sink never stops the run
-    with m.results_path.open("a") as f:
-        f.write(json.dumps(row) + "\n")
-    tokens = sum(usage[k] for k in ("input", "output", "reasoning", "cache_read", "cache_write"))
-    print(
-        f"done  {tag} passed={row['passed']} tokens={tokens}"
-        f" cost={row['cost_computed'] if row['cost_computed'] is not None else usage['cost_reported']}",
-        flush=True,
-    )
+    stored = m.writer.append_once(trial)
+    if stored is trial:
+        m.sinks.write(trial)  # after `trials.jsonl`, which is the source of truth; a failing sink never stops the run
+        locked_append(m.results_path, json.dumps(row) + "\n")
+        tokens = sum(usage[k] for k in ("input", "output", "reasoning", "cache_read", "cache_write"))
+        print(
+            f"done  {tag} passed={row['passed']} tokens={tokens}"
+            f" cost={row['cost_computed'] if row['cost_computed'] is not None else usage['cost_reported']}",
+            flush=True,
+        )
+    else:  # another worker recorded this very trial first (an orchestrator retry): its record counts
+        print(f"skip  {tag} (already recorded)", flush=True)
     if not m.keep:
         rmtree_inside(workdir, m.work_root)
+    return stored
 
 
 # ---------------------------------------------------------------- LiteLLM

@@ -43,8 +43,8 @@ ignore = ["UP036", "ANN401"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-# Every Python file of the repo: the engine, the wrapper, the doc generator, the tests and the `hbench` package.
-files = ["harness_bench.py", "harness_bench_litellm.py", "scripts", "tests", "hbench"]
+# Every Python file of the repo: the engine, the wrapper, the doc generator, the tests, the `hbench` package and the adapters.
+files = ["harness_bench.py", "harness_bench_litellm.py", "scripts", "tests", "hbench", "adapters"]
 
 [tool.bandit]
 # B404: importing subprocess is the engine's job.
@@ -62,7 +62,13 @@ patch = ["subprocess"]
 # `harness_bench.py` there combines with the repo file of the same name.
 relative_files = true
 # `include` (not `source`) so the temp-dir copies match.
-include = ["*/harness_bench.py", "*/harness_bench_litellm.py", "*/hbench/**/*.py", "*/tests/fixtures.py"]
+include = [
+    "*/harness_bench.py",
+    "*/harness_bench_litellm.py",
+    "*/hbench/**/*.py",
+    "*/tests/fixtures.py",
+    "*/adapters/python/*.py",
+]
 omit = ["*/tests/fake_*.py", "*/tests/test_*.py", "*/tests/smoke.py"]
 
 [tool.coverage.report]

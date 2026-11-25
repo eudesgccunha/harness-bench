@@ -16,6 +16,7 @@ from hbench.core.models import RunInfo, TrialResult
 from hbench.sinks.base import SinkError
 
 SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
+BUSY_TIMEOUT_S = 60.0  # workers of one run share the database: a writer waits for the lock instead of failing
 
 _UPSERT_RUN = """
 INSERT INTO runs (run_id, started_at, finished_at, harness_bench_version, config_sha256, suite_version, sandbox,
@@ -171,7 +172,7 @@ class SqliteSink:
         except OSError as e:
             raise SinkError(f"cannot read the schema {SCHEMA_PATH}: {e}") from e
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        db = sqlite3.connect(self.path)
+        db = sqlite3.connect(self.path, timeout=BUSY_TIMEOUT_S)
         self._db = db
         db.executescript(schema)
         with db:

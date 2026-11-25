@@ -4,7 +4,7 @@ PYTHON ?= python3
 UV ?= uv
 UV_RUN = $(UV) run --locked
 UNITTEST = -m unittest discover -s tests -p 'test_*.py'
-BANDIT_TARGETS = harness_bench.py harness_bench_litellm.py hbench scripts
+BANDIT_TARGETS = harness_bench.py harness_bench_litellm.py hbench scripts adapters
 
 .DEFAULT_GOAL := help
 
@@ -65,8 +65,8 @@ security: ## bandit + gitleaks (missing gitleaks fails only when CI is set)
 		echo "gitleaks not installed: skipped locally (https://github.com/gitleaks/gitleaks)"; \
 	fi
 
-actionlint: ## Lint the GitHub workflow
-	$(UV_RUN) actionlint .github/workflows/ci.yml
+actionlint: ## Lint the GitHub workflow and the example workflow of the adapters
+	$(UV_RUN) actionlint .github/workflows/ci.yml adapters/github-actions/benchmark.yml
 
 docs: ## Regenerate HARNESS_BENCH.md
 	$(PYTHON) scripts/build_md.py

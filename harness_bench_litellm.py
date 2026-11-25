@@ -27,8 +27,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hbench import cli  # noqa: E402
 from hbench.profiles import apply_litellm_profile  # noqa: E402
 
-LITELLM_COMMANDS = {"run", "report", "reconcile"}
-EPILOG = "The LiteLLM profile is applied automatically to run, report and reconcile (same as passing --litellm)."
+LITELLM_COMMANDS = {"run", "report", "reconcile", "plan", "run-trial", "finish"}
+EPILOG = (
+    "The LiteLLM profile is applied automatically to run, report, reconcile, plan, run-trial and finish "
+    "(same as passing --litellm)."
+)
 
 
 def load_config(path: str | Path) -> tuple[dict[str, Any], Path]:

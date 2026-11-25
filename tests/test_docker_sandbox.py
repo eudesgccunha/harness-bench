@@ -422,7 +422,7 @@ class FakeDockerRunTests(RunTestCase):
                 trial["image_digest"],
                 trial["schema_version"],
             ),
-            (f"docker:{IMAGE}", True, "1.3.0", f"sha256:{DIGEST}", "1.3.0"),
+            (f"docker:{IMAGE}", True, "1.4.0", f"sha256:{DIGEST}", "1.4.0"),
         )
 
     def test_a_container_that_outlives_the_timeout_is_removed_before_the_next_step(self) -> None:

@@ -560,6 +560,49 @@ def main() -> None:
         )
         collector_srv.shutdown()
 
+        # --- orchestrator commands (ADR 0012): plan, run-trial per line and finish give what `run` gives
+        (tmp / "config-plan.json").write_text(json.dumps(dict(cfg, output_dir="results-plan")))
+        planned = run(tmp, "harness_bench.py", "plan", config="config-plan.json").stdout.splitlines()
+        check(len(planned) == 5, "plan: one TrialSpec per line, one per pair")
+        for line in planned:
+            worker = subprocess.run(
+                [PY, "harness_bench.py", "run-trial", "--config", "config-plan.json", "--spec", "-"]
+                + ["--allow-unsandboxed"],
+                cwd=tmp,
+                input=line,
+                capture_output=True,
+                text=True,
+            )
+            check(worker.returncode == 0 and json.loads(worker.stdout)["run_id"], "run-trial: result JSON on stdout")
+        plan_run_id = json.loads(planned[0])["run_id"]
+        run(tmp, "harness_bench.py", "finish", "--run", plan_run_id, config="config-plan.json")
+        planned_rows = {r["harness"]: r for r in results(tmp / "results-plan/results.jsonl")}
+        check(
+            {h: r["passed"] for h, r in planned_rows.items()} == {h: r["passed"] for h, r in rows.items()},
+            "plan | run-trial | finish: the same solved tasks as run",
+        )
+        check(
+            len(results(tmp / "results-plan" / plan_run_id / "trials.jsonl")) == 5
+            and (tmp / "results-plan/summary.md").exists(),
+            "plan | run-trial | finish: 5 trials and the report",
+        )
+        forged = json.dumps(dict(json.loads(planned[0]), config_sha256="0" * 64))
+        before = (tmp / "results-plan" / plan_run_id / "trials.jsonl").read_text()
+        worker = subprocess.run(
+            [PY, "harness_bench.py", "run-trial", "--config", "config-plan.json", "--spec", "-"]
+            + ["--allow-unsandboxed"],
+            cwd=tmp,
+            input=forged,
+            capture_output=True,
+            text=True,
+        )
+        check(
+            worker.returncode != 0
+            and "config_sha256" in worker.stderr
+            and (tmp / "results-plan" / plan_run_id / "trials.jsonl").read_text() == before,
+            "run-trial: a spec of another config is refused and writes nothing",
+        )
+
         # --- config validation and URL policy
         for bad, why in (
             (dict(fizz, id="/etc"), "absolute task id"),

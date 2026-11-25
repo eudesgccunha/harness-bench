@@ -118,6 +118,18 @@ python3 harness_bench_litellm.py reconcile --config config.litellm.json
 - Add the `null` harness (see `config.example.json`) as a negative control: if it solves any task, the hidden tests are too lenient. The `Discrimination` section lists tasks every pair solves or none solves; `report --drop-saturated` leaves the saturated ones out.
 - Investigate failures through the `.diff` files and logs in `logs/`, and through Lens traces if you use Lens.
 
+### Run the trials on several workers (optional)
+
+`run` runs every trial in one process. To spread them over processes, CI jobs or pods, plan the run, run each spec anywhere and finish the run:
+
+```bash
+python3 -m hbench plan --config config.json > specs.jsonl
+while read -r spec; do printf '%s\n' "$spec" | python3 -m hbench run-trial --config config.json --spec -; done < specs.jsonl   # or any orchestrator
+python3 -m hbench finish --config config.json --run RUN_ID
+```
+
+Run `finish` only after every trial has ended, and `reconcile` only after `finish` (it replaces `trials.jsonl` atomically, so a worker still writing would lose its line). A spec names a trial and holds no command, prompt, path or secret; each worker uses its own copy of the config. See [Orchestrator integration](orchestrator-integration.md) and the examples in `adapters/`.
+
 ### Send the results to a database and traces (optional)
 
 `trials.jsonl` always holds the results. A `sinks` list in the config also sends each trial, as it finishes, to a SQLite database and to OpenTelemetry traces (see [ADR 0011](adr/0011-sinks-and-telemetry.md)):

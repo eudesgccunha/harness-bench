@@ -387,14 +387,18 @@ Decisions: [ADR 0011](adr/0011-sinks-and-telemetry.md). Plan:
 
 ### Phase 8 — Orchestrator integration (optional)
 
-- [ ] Stable Python API: `plan(suite, targets, reps) -> list[TrialSpec]` and
-      `run_trial(spec) -> TrialResult`. That is what any orchestrator calls.
-- [ ] Serializable `TrialSpec` (JSON), to run on any worker.
-- [ ] Example adapters in `adapters/` (separate packages) for popular orchestrators.
-      Each is only a shell over `run_trial`.
-- [ ] Guide "how to integrate with your orchestrator" that assumes none in particular.
+- [x] Stable Python API: `plan(config, run) -> list[TrialSpec]` and
+      `run_trial(config, spec) -> TrialResult` (`hbench/api.py`). That is what any orchestrator calls.
+      The plan's `plan(suite, targets, reps)` became `plan(config, run, ...)`: suites and targets are config keys.
+- [x] Serializable `TrialSpec` (JSON, contract 1.4.0), to run on any worker.
+- [x] Example adapters in `adapters/` (shell, GitHub Actions, Kubernetes, Python; no dependency).
+      Each is only a shell over `run_trial`. Adapters for packaged orchestrators live outside this repository.
+- [x] Guide "how to integrate with your orchestrator" that assumes none in particular
+      ([`orchestrator-integration.md`](orchestrator-integration.md)).
 
 Acceptance: `run_trial` behaves the same from the CLI, a script and an adapter.
+Decisions: [ADR 0012](adr/0012-plan-and-run-trial-api.md). Plan:
+[`superpowers/plans/2026-11-25-phase-8-orchestrator-api.md`](superpowers/plans/2026-11-25-phase-8-orchestrator-api.md).
 
 ### Phase 9 — From benchmark to decision
 

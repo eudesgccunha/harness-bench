@@ -17,6 +17,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))  # lets tests import the engine in-process (coverage sees it directly)
+sys.path.insert(0, str(ROOT / "adapters" / "python"))  # and the Python adapter of ADR 0012
 PY = sys.executable
 AGENT = str(ROOT / "tests" / "fake_agent.py")
 FIZZBUZZ = ROOT / "suites" / "regression" / "fizzbuzz"  # the sample task: `repo/` and `hidden_tests/`

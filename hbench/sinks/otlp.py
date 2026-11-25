@@ -19,6 +19,7 @@ from typing import Any, Self
 
 from hbench.core.models import RunInfo, TrialResult, TrialStatus
 from hbench.net import NetError, post_bounded, url_allowed
+from hbench.results import LogCursor, locked_log
 from hbench.sinks.base import SinkError
 
 TRACES_FILE = "traces.otlp.jsonl"
@@ -147,8 +148,7 @@ class OtlpSink:
         self.headers = dict(headers)
         self.timeout = timeout
         self._opened: tuple[RunInfo, Path] | None = None
-        self._known: set[str] = set()  # the span ids already in the file
-        self._glue = ""  # a newline when the file ends in a line cut short by a crash
+        self._cursor = LogCursor()
         self._post_failed = False  # after one failed POST the file is still written but nothing is sent again
 
     @classmethod
@@ -167,17 +167,9 @@ class OtlpSink:
     def open(self, info: RunInfo) -> None:
         run_dir = self.out_dir / info.run_id
         run_dir.mkdir(parents=True, exist_ok=True)
-        path = run_dir / TRACES_FILE
-        text = path.read_text() if path.exists() else ""
-        self._known = set()
-        for line in text.splitlines():
-            try:
-                self._known |= _span_ids(json.loads(line))
-            except ValueError:  # a line cut short by a crash holds no span
-                continue
-        self._glue = "\n" if text and not text.endswith("\n") else ""
         self._post_failed = False
-        self._opened = (info, path)
+        self._cursor = LogCursor()  # the span ids already in the file: each append reads only what was added
+        self._opened = (info, run_dir / TRACES_FILE)
 
     def _state(self) -> tuple[RunInfo, Path]:
         if self._opened is None:
@@ -185,13 +177,21 @@ class OtlpSink:
         return self._opened
 
     def _append(self, span_id: str, request: Mapping[str, Any]) -> None:
-        """Add the request to the file unless its span is already there (one `write` call: one line)."""
-        if span_id in self._known:
-            return
-        with self._state()[1].open("a") as f:
-            f.write(f"{self._glue}{json.dumps(request)}\n")
-        self._glue = ""
-        self._known.add(span_id)
+        """Add the request to the file unless its span is already there (one `write` call: one line). Workers share the
+        file (ADR 0012), so what is there is read again under the lock: a span another worker wrote is not repeated, and
+        a line cut short by a crash is dropped."""
+        with locked_log(self._state()[1], self._cursor) as (f, complete):
+            for line in complete.splitlines():  # only the lines added since the last append
+                try:
+                    self._cursor.ids |= _span_ids(json.loads(line))
+                except ValueError:  # a line that is no JSON holds no span
+                    continue
+            if span_id in self._cursor.ids:
+                return
+            f.write(f"{json.dumps(request)}\n")
+            f.flush()
+            os.fsync(f.fileno())
+            self._cursor.ids.add(span_id)
 
     def _send(self, request: Mapping[str, Any]) -> None:
         """POST the request when there is an endpoint. A failure raises a `SinkError` that holds no header."""

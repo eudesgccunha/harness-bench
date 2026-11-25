@@ -1,0 +1,107 @@
+# Example for ADR 0012: one GitHub job per trial. A matrix has at most 256 jobs, so plan fewer trials than that (use
+# --only or --reps) or pick another adapter. Secrets go in `env:` of the step that needs them (see the `trial` job).
+# Copy it to .github/workflows/ to use it; it sits here so it does not
+# run in this repository. The jobs have no shared disk, so each one starts from the run directory that `plan` made,
+# writes its own trial, and the `finish` job concatenates the trial files (every trial_id is unique) before closing the
+# run. The config must set a sandbox the runner supports and read its secrets from the job env (${VAR}).
+name: benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        description: Config file in the repository
+        required: true
+        default: config.json
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      run_id: ${{ steps.plan.outputs.run_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: plan
+        env:
+          CONFIG: ${{ inputs.config }}
+        run: |
+          python3 -m hbench plan --config "$CONFIG" > specs.jsonl
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          specs = [json.loads(line) for line in open("specs.jsonl")]
+          if not 1 <= len(specs) <= 256:
+              raise SystemExit(f"the plan has {len(specs)} trials: a matrix takes 1 to 256")
+          entries = [{"trial_id": s["trial_id"], "spec": json.dumps(s)} for s in specs]
+          print("matrix=" + json.dumps({"include": entries}))
+          print("run_id=" + specs[0]["run_id"])
+          PY
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: run
+          path: results
+
+  trial:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: run
+          path: results
+      - name: Run the trial the spec names
+        env:
+          CONFIG: ${{ inputs.config }}
+          SPEC: ${{ matrix.spec }}
+          # One line per variable the config names (${VAR}); the values are repository secrets, never in a spec:
+          # ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: printf '%s\n' "$SPEC" | python3 -m hbench run-trial --config "$CONFIG" --spec -
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: trial-${{ matrix.trial_id }}
+          path: results
+
+  finish:
+    needs: [plan, trial]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: run
+          path: results
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: trial-*
+          path: trials
+      - name: Merge the trial files and finish the run
+        env:
+          CONFIG: ${{ inputs.config }}
+          RUN_ID: ${{ needs.plan.outputs.run_id }}
+        run: |
+          for dir in trials/*/; do
+            cat "$dir$RUN_ID/trials.jsonl" >> "results/$RUN_ID/trials.jsonl"
+            cat "${dir}results.jsonl" >> results/results.jsonl
+          done
+          python3 -m hbench finish --config "$CONFIG" --run "$RUN_ID"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: report
+          path: results

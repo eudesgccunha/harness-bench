@@ -130,6 +130,7 @@ RUN_SCHEMA: dict[str, Any] = {
             "platform": _STRING,
             "sandboxed": _BOOLEAN,
             "sandbox": _STRING,
+            "reps": {"type": ["integer", "null"], "minimum": 1},
             "targets": {"type": "array", "items": {"$ref": "#/$defs/target"}},
         },
         [
@@ -149,9 +150,29 @@ RUN_SCHEMA: dict[str, Any] = {
 }
 
 
+TRIAL_SPEC_SCHEMA: dict[str, Any] = {
+    "$schema": _DIALECT,
+    "$id": f"{_ID_BASE}/trial_spec/{SCHEMA_VERSION}",
+    "title": "Trial spec",
+    **_object(
+        {
+            "schema_version": _STRING,
+            "run_id": _STRING,
+            "trial_id": _STRING,
+            "task_id": _STRING,
+            "harness": _STRING,
+            "model": _STRING,
+            "rep": {"type": "integer", "minimum": 1},
+            "config_sha256": _STRING,
+        },
+        ["schema_version", "run_id", "trial_id", "task_id", "harness", "model", "rep", "config_sha256"],
+    ),
+}
+
+
 def schema_document() -> dict[str, Any]:
-    """Both schemas in one document, as `schema export` prints it."""
-    return {"trial": TRIAL_SCHEMA, "run": RUN_SCHEMA}
+    """All schemas in one document, as `schema export` prints it."""
+    return {"trial": TRIAL_SCHEMA, "run": RUN_SCHEMA, "trial_spec": TRIAL_SPEC_SCHEMA}
 
 
 # ---------------------------------------------------------------- validator

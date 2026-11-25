@@ -15,9 +15,12 @@ from enum import Enum, StrEnum
 from types import MappingProxyType, UnionType
 from typing import Any, ClassVar, Self, get_args, get_origin, get_type_hints
 
-SCHEMA_VERSION = "1.3.0"
+SCHEMA_VERSION = "1.4.0"
 _VERSION_RE = re.compile(r"^(\d+)\.\d+\.\d+$")
 _MAJOR = SCHEMA_VERSION.split(".")[0]
+_RUN_ID_RE = re.compile(r"[0-9a-f]{32}")  # `new_run_id()`: a UUID4 in hex
+_TRIAL_ID_RE = re.compile(r"[0-9a-f]{16}")  # `trial_id()`: 16 hex characters
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 class ContractError(ValueError):
@@ -373,6 +376,7 @@ class RunInfo(_Model):
     sandboxed: bool
     targets: tuple[Target, ...]
     sandbox: str = "unknown"  # what ran the commands: `docker:<image>`, `prefix`, `local-tmp`, a plugin's name
+    reps: int | None = None  # repetitions per task and pair the run plans; None: not recorded (the config says)
 
     DECODERS: ClassVar[Mapping[str, Callable[[Any], Any]]] = {
         "started_at": _parse_datetime,
@@ -386,3 +390,36 @@ class RunInfo(_Model):
         _require_aware("started_at", self.started_at)
         if self.finished_at is not None:
             _require_aware("finished_at", self.finished_at)
+        if self.reps is not None and self.reps < 1:
+            raise ContractError(f"reps must be >= 1, got {self.reps}")
+
+
+@dataclass(frozen=True, kw_only=True)
+class TrialSpec(_Model):
+    """Names one trial of a run so any worker can run it (ADR 0012). It carries no command, prompt, path, env or
+    secret: the worker resolves everything from its own copy of the config, which `config_sha256` must match."""
+
+    schema_version: str = SCHEMA_VERSION
+    run_id: str
+    trial_id: str
+    task_id: str
+    harness: str
+    model: str
+    rep: int
+    config_sha256: str
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _check_schema_version(self.schema_version)
+        for name, pattern in (
+            ("run_id", _RUN_ID_RE),
+            ("trial_id", _TRIAL_ID_RE),
+            ("config_sha256", _SHA256_RE),
+        ):
+            if pattern.fullmatch(getattr(self, name)) is None:
+                raise ContractError(f"TrialSpec.{name} must match {pattern.pattern}")
+        for name in ("task_id", "harness", "model"):
+            if not getattr(self, name):
+                raise ContractError(f"TrialSpec.{name} must not be empty")
+        if self.rep < 1:
+            raise ContractError(f"rep must be >= 1, got {self.rep}")

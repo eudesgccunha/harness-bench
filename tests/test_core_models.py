@@ -2,6 +2,7 @@
 
 import copy
 import dataclasses
+import json
 import pickle
 import unittest
 from types import MappingProxyType
@@ -19,6 +20,7 @@ from hbench.core.models import (
     RunInfo,
     Target,
     TrialResult,
+    TrialSpec,
     TrialStatus,
     Usage,
 )
@@ -350,8 +352,30 @@ class ToolCallsTests(unittest.TestCase):
         loaded = TrialResult.from_dict(d)
         self.assertEqual((loaded.usage.tool_calls, loaded.schema_version), (None, "1.0.0"))
 
-    def test_the_current_contract_version_is_1_3_0(self) -> None:
-        self.assertEqual((SCHEMA_VERSION, trial().schema_version), ("1.3.0", "1.3.0"))
+    def test_the_current_contract_version_is_1_4_0(self) -> None:
+        self.assertEqual((SCHEMA_VERSION, trial().schema_version), ("1.4.0", "1.4.0"))
+
+    def test_a_1_3_0_trial_and_run_still_load(self) -> None:
+        for obj in (trial(), run_info()):
+            d = obj.to_dict()
+            d["schema_version"] = "1.3.0"
+            self.assertEqual(type(obj).from_dict(d).schema_version, "1.3.0")
+
+
+class RunRepsTests(unittest.TestCase):
+    def test_a_run_records_its_reps_and_a_run_without_them_loads_with_none(self) -> None:
+        info = run_info(reps=3)
+        self.assertEqual(RunInfo.from_dict(info.to_dict()), info)
+        d = run_info().to_dict()
+        del d["reps"]
+        d["schema_version"] = "1.3.0"
+        self.assertIsNone(RunInfo.from_dict(d).reps)
+
+    def test_reps_must_be_a_whole_number_of_at_least_one(self) -> None:
+        bad_values: list[Any] = [0, -1, True, "2", 1.5]
+        for bad in bad_values:
+            with self.subTest(bad=bad), self.assertRaises(ContractError):
+                run_info(reps=bad)
 
 
 class SandboxFieldTests(unittest.TestCase):
@@ -412,6 +436,70 @@ class JudgeFieldTests(unittest.TestCase):
         for bad in (-1, 1.5, True, "3"):
             with self.assertRaises(ContractError, msg=repr(bad)):
                 usage(tool_calls=bad)
+
+
+def trial_spec(**overrides: Any) -> TrialSpec:
+    values: dict[str, Any] = {
+        "run_id": "a" * 32,
+        "trial_id": "b" * 16,
+        "task_id": "suite/fizzbuzz",
+        "harness": "claude",
+        "model": "p/fix",
+        "rep": 2,
+        "config_sha256": "c" * 64,
+    }
+    values.update(overrides)
+    return TrialSpec(**values)
+
+
+class TrialSpecTests(unittest.TestCase):
+    def test_a_spec_round_trips_through_json(self) -> None:
+        spec = trial_spec()
+        self.assertEqual(TrialSpec.from_dict(json.loads(json.dumps(spec.to_dict()))), spec)
+        self.assertEqual(spec.schema_version, SCHEMA_VERSION)
+
+    def test_a_spec_names_a_trial_and_nothing_else(self) -> None:
+        self.assertEqual(
+            set(trial_spec().to_dict()),
+            {"schema_version", "run_id", "trial_id", "task_id", "harness", "model", "rep", "config_sha256"},
+        )
+
+    def test_extra_and_missing_keys_are_refused(self) -> None:
+        extra = {**trial_spec().to_dict(), "command": ["rm", "-rf", "/"]}
+        with self.assertRaises(ContractError):
+            TrialSpec.from_dict(extra)
+        missing = trial_spec().to_dict()
+        del missing["task_id"]
+        with self.assertRaises(ContractError):
+            TrialSpec.from_dict(missing)
+
+    def test_every_field_is_validated(self) -> None:
+        bad_cases: list[dict[str, Any]] = [
+            {"run_id": "../../etc"},
+            {"run_id": "A" * 32},
+            {"run_id": "a" * 31},
+            {"trial_id": "b" * 15},
+            {"trial_id": "../" + "b" * 13},
+            {"config_sha256": "c" * 63},
+            {"config_sha256": "g" * 64},
+            {"task_id": ""},
+            {"harness": ""},
+            {"model": ""},
+            {"rep": 0},
+            {"rep": True},
+            {"rep": "1"},
+            {"task_id": 3},
+            {"schema_version": "2.0.0"},
+            {"schema_version": "x"},
+        ]
+        for bad in bad_cases:
+            with self.subTest(bad=bad), self.assertRaises(ContractError):
+                trial_spec(**bad)
+
+    def test_a_spec_of_an_older_minor_version_loads(self) -> None:
+        d = trial_spec().to_dict()
+        d["schema_version"] = "1.3.0"
+        self.assertEqual(TrialSpec.from_dict(d).schema_version, "1.3.0")
 
 
 if __name__ == "__main__":
