@@ -36,6 +36,8 @@ current name in the existing config and results format until Phase 1 migrates it
 | Heartbeat | `<run_id>/heartbeat.json` | File a running `run` rewrites (pid, host, trial, phase, time) so `--resume` can tell a live run from a killed one. |
 | Resume | `run --resume RUN_ID` | Continue an interrupted run in its own directory, skipping the trials already in its `trials.jsonl` (by `trial_id`). |
 | Doctor | `python3 -m hbench doctor` | Checks that a benchmark can run (config, variables, CLIs, image, network, URLs) without spending tokens. |
+| Sink | `sinks` config list, `Sink` protocol (`hbench/sinks/`), entry-point group `harness_bench.sinks` | Where the trials of a run go besides `trials.jsonl`: `sqlite` (tables of `docs/sql/schema.sql`) and `otlp` (spans) are built in; Postgres, S3 or Parquet are plugins. A sink receives contract objects only, writes idempotently by `trial_id`, and a failing sink never changes a result. `python3 -m hbench export` replays a run into the sinks. |
+| Span | `traces.otlp.jsonl`, `POST <endpoint>/v1/traces` | OTLP/JSON trace of a run: the trace id is the `run_id`, the run is the root span, each trial is a child span whose id is the `trial_id`. Attributes are ids, status, model, token counts and cost; never prompt, response or log content. An unknown value is absent. |
 | Cost per solved task | `cost_per_solved` | Main ranking metric: total cost of a target divided by its solved trials. |
 | pass@k | `pass_at_k` (report) | Chance that at least one of k runs of a task passes (capability). Unbiased estimator averaged over tasks; k is the smallest run count of any task for the target. |
 | pass^k | `pass_hat_k` (report) | Chance that all k runs of a task pass (consistency). |

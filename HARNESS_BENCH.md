@@ -54,7 +54,9 @@ If a run shows cost `n/a`, its tag did not reach LiteLLM. See the "LiteLLM: what
 harness-bench/
 ├── harness_bench.py
 ├── harness_bench_litellm.py     # LiteLLM-only variant (no Cursor)
-├── hbench/                      # data contract, report, suites and single CLI (ADR 0005, 0008)
+├── hbench/                      # data contract, report, suites, sinks and single CLI (ADR 0005, 0008, 0011)
+├── docs/sql/                    # reference schema and scorecard queries of the sqlite sink (ADR 0011)
+├── docs/dashboards/             # example Grafana dashboard; scripts/synthetic_db.py writes demo data
 ├── README.md / AGENTS.md
 ├── scripts/build_md.py          # generates this HARNESS_BENCH.md
 ├── sandbox/Dockerfile           # sandbox image with the CLIs
@@ -113,6 +115,8 @@ Outputs in `results/`:
 - `results.jsonl`: one line per run, with raw data;
 - `summary.md` and `summary.csv`: table sorted by cost per solved task, the statistics sections described in [Reading the report](#reading-the-report) and the per-task pass matrix;
 - `logs/`: each agent's JSON output, stderr, setup, tests, and the `.diff` of everything the agent changed. Known secrets show as `***REDACTED***`.
+
+To also send each trial to a SQLite database and OTLP traces, add a `sinks` list to the config (see `docs/running-a-benchmark.md` and `config.example.json`): `{"type": "sqlite", "path": "results/bench.sqlite"}` and `{"type": "otlp", "endpoint": "https://collector:4318", "headers": {"x-key": "${OTLP_KEY}"}}`. `trials.jsonl` is written first and stays the source of truth; a sink that fails is warned about once and left out for that run, and `python3 -m hbench export --config config.json --run results/<run_id>` sends a run again (idempotent by `trial_id`). Spans hold ids, status, model, tokens and cost, never a prompt, response or log. The agent gets `BENCH_RUN_ID` and `BENCH_TRIAL_ID` in its environment.
 
 `run` only starts with a sandbox configured (`sandbox.type` `docker`, or a `sandbox.prefix`; see [Security](#security)). Inside a disposable VM, add `--allow-unsandboxed`. To continue a run that was killed, use `run --resume RUN_ID` (see [Sandbox types, limits, resume and doctor](#sandbox-types-limits-resume-and-doctor)).
 
@@ -479,9 +483,8 @@ import urllib.request
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from email.message import Message
 from pathlib import Path
-from typing import IO, Any
+from typing import Any
 
 if sys.version_info < (3, 12):
     sys.exit("Python 3.12+ required")
@@ -499,8 +502,12 @@ from hbench.runners import PARSERS as PARSERS, empty_usage as empty_usage, json_
 from hbench.runners import num as num, runner_for  # noqa: E402
 from hbench.graders.base import LogStep, RunStep, discard_log  # noqa: E402
 from hbench.judge import GatewayJudge, Judge, JudgeError  # noqa: E402
+from hbench.net import NoRedirect, url_allowed  # noqa: E402
 from hbench.plugins import PluginError, redactor_for  # noqa: E402
 from hbench.runners.base import HarnessRunner, ParseUsage, build_argv  # noqa: E402
+from hbench.sinks import sink_secret_vars, sinks_for  # noqa: E402
+from hbench.sinks.base import Sink  # noqa: E402
+from hbench.sinks.feed import SinkFeed  # noqa: E402
 from hbench.sandboxes import Sandbox, SandboxError, SandboxSession, sandbox_for  # noqa: E402
 from hbench.safe_copy import safe_copy_into  # noqa: E402
 from hbench.suites import SUITE_ONLY_KEYS, SUITE_PATH_KEYS, Suite, SuiteError, load_suite, suite_tasks  # noqa: E402
@@ -547,7 +554,6 @@ def computed_cost(u: Mapping[str, Any], price: Mapping[str, Any] | None) -> floa
 # names it explicitly in its "env" block.
 BASE_ENV = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ", "TMPDIR")
 SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]")
-LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 # Stale bytecode in a task source must not reach the workdir (a diff of the agent's work would show it).
 PYCACHE = shutil.ignore_patterns("__pycache__")
 
@@ -572,12 +578,14 @@ def base_env(cfg: Mapping[str, Any]) -> dict[str, str]:
 
 
 def spend_key_vars(cfg: Mapping[str, Any]) -> set[str]:
-    """The environment variables that hold a gateway key (LiteLLM spend key, judge key): never given to an agent,
-    always redacted."""
+    """The environment variables that hold a gateway key (LiteLLM spend key, judge key, the header values of the sinks):
+    never given to an agent, always redacted."""
     judge = cfg.get("judge")
     judge_key = judge.get("api_key") if isinstance(judge, Mapping) else None
-    return env_var_names((cfg.get("litellm") or {}).get("api_key")) | env_var_names(
-        judge_key if isinstance(judge_key, str) else None
+    return (
+        env_var_names((cfg.get("litellm") or {}).get("api_key"))
+        | env_var_names(judge_key if isinstance(judge_key, str) else None)
+        | sink_secret_vars(cfg)
     )
 
 
@@ -767,6 +775,7 @@ def validate_config(cfg: Mapping[str, Any]) -> None:
             sys.exit(f"harness {name}: {e}")
     validate_judge(cfg)
     make_sandbox(cfg)  # exits with a message for a bad `sandbox` section (a tag instead of a digest, bad limits)
+    make_sinks(cfg, Path())  # likewise for `sinks`; building a sink does no I/O, so the base only matters to `run`
     leaked = spend_key_vars(cfg) & (
         set(cfg.get("env_passthrough", []))
         | {v for h in cfg["harnesses"].values() for val in h.get("env", {}).values() for v in env_var_names(val)}
@@ -782,6 +791,14 @@ def make_sandbox(cfg: Mapping[str, Any]) -> Sandbox:
         return sandbox_for(cfg, run_proc, base_env(cfg))
     except ValueError as e:  # SandboxError and PluginError
         sys.exit(f"sandbox: {e}")
+
+
+def make_sinks(cfg: Mapping[str, Any], base: Path) -> list[Sink]:
+    """The sinks of the config (ADR 0011); exits with a message when a `sinks` entry is invalid."""
+    try:
+        return sinks_for(cfg, base)
+    except ValueError as e:  # SinkError and PluginError
+        sys.exit(f"sinks: {e}")
 
 
 def is_sandboxed(cfg: Mapping[str, Any]) -> bool:
@@ -1504,6 +1521,7 @@ class _Matrix:
     secrets: Sequence[str]
     keep: bool
     resuming: bool
+    sinks: SinkFeed
 
 
 @dataclass(frozen=True)
@@ -1610,6 +1628,7 @@ def _run_matrix(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path, gi
     finished = done_keys(results_path)
     finished_ids = writer.finished_trial_ids() if writer else set()
     shared = None
+    secrets = [os.environ.get(v, "") for v in spend_key_vars(cfg)]
     if work_root and writer:  # a dry run has neither
         # The temp dirs a killed run leaves are found again by resume through these paths and tokens.
         paths = {"git_root": str(git_root), "git_token": (git_root / OWNER_MARK_FILE).read_text()}
@@ -1627,29 +1646,38 @@ def _run_matrix(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path, gi
             sandbox=sandbox,
             plans={task["id"]: grade_plan(task) for task in cfg["tasks"]},
             redactor=load_redactor(cfg["judge"]) if uses_judge(cfg) else None,
-            secrets=[os.environ.get(v, "") for v in spend_key_vars(cfg)],
+            secrets=secrets,
             keep=args.keep,
             resuming=bool(resume_id),
+            sinks=SinkFeed(
+                make_sinks(cfg, base),
+                lambda message: print(redact(message, secrets), file=sys.stderr),
+            ),
         )
+        shared.sinks.open(writer.info)
 
     try:
-        with shared.heartbeat if shared else contextlib.nullcontext():
-            for planned in _planned_trials(cfg, args.only, reps):
-                task, hname, model, rep = planned.task, planned.hname, planned.model, planned.rep
-                key = (task["id"], hname, model, rep)
-                tid = planned_trial_id(writer.info.run_id, planned) if writer else ""
-                if (key in finished or tid in finished_ids) and not args.dry_run:
-                    print(f"skip  {key} (done)")
-                    continue
-                if shared is None:  # dry run: no work dir and no writer
-                    print(shlex.join(planned.runner.command(model, task["prompt"])))
-                    continue
-                _run_trial(shared, planned, tid)
-    finally:  # also when a trial raises: the private work dir is never left behind
-        if work_root and not args.keep and not cfg.get("work_dir"):
-            shutil.rmtree(work_root, ignore_errors=True)
-    if writer:
-        writer.close(datetime.now(UTC))
+        try:
+            with shared.heartbeat if shared else contextlib.nullcontext():
+                for planned in _planned_trials(cfg, args.only, reps):
+                    task, hname, model, rep = planned.task, planned.hname, planned.model, planned.rep
+                    key = (task["id"], hname, model, rep)
+                    tid = planned_trial_id(writer.info.run_id, planned) if writer else ""
+                    if (key in finished or tid in finished_ids) and not args.dry_run:
+                        print(f"skip  {key} (done)")
+                        continue
+                    if shared is None:  # dry run: no work dir and no writer
+                        print(shlex.join(planned.runner.command(model, task["prompt"])))
+                        continue
+                    _run_trial(shared, planned, tid)
+        finally:  # also when a trial raises: the private work dir is never left behind
+            if work_root and not args.keep and not cfg.get("work_dir"):
+                shutil.rmtree(work_root, ignore_errors=True)
+        if writer:
+            writer.close(datetime.now(UTC))
+    finally:  # the sinks see the run as `writer.close` left it (unfinished after an error or Ctrl-C) and are released
+        if shared:
+            shared.sinks.close(shared.writer.info)
     if not args.dry_run and not getattr(args, "no_report", False):
         cmd_report(args, cfg, base)
 
@@ -1668,7 +1696,8 @@ def _run_trial(m: _Matrix, planned: _Planned, tid: str) -> None:
     workdir = m.work_root / tag
     run_tag = f"bench-{datetime.now().strftime('%Y%m%d%H%M%S')}-{tag}"
     cmd_env = base_env(m.cfg)
-    agent_env = dict(cmd_env, BENCH_TAG=run_tag)  # Pi/OpenCode/Codex send it as x-litellm-tags
+    # Pi/OpenCode/Codex send BENCH_TAG as x-litellm-tags; the ids let a harness config send them as headers too
+    agent_env = dict(cmd_env, BENCH_TAG=run_tag, BENCH_RUN_ID=m.writer.info.run_id, BENCH_TRIAL_ID=tid)
     harness_env = {k: expand_env(v).replace("{run_tag}", run_tag) for k, v in h.get("env", {}).items()}
     agent_env.update(harness_env)
     secrets = list(m.secrets) + [v for v in harness_env.values() if v != run_tag]
@@ -1785,6 +1814,7 @@ def _run_trial(m: _Matrix, planned: _Planned, tid: str) -> None:
         image_digest=m.sandbox.image_digest(),
     )
     m.writer.append(trial)
+    m.sinks.write(trial)  # after `trials.jsonl`, which is the source of truth; a failing sink never stops the run
     with m.results_path.open("a") as f:
         f.write(json.dumps(row) + "\n")
     tokens = sum(usage[k] for k in ("input", "output", "reasoning", "cache_read", "cache_write"))
@@ -1800,25 +1830,9 @@ def _run_trial(m: _Matrix, planned: _Planned, tid: str) -> None:
 # ---------------------------------------------------------------- LiteLLM
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Never follow redirects: the Authorization header must not reach another host."""
-
-    def redirect_request(
-        self,
-        req: urllib.request.Request,
-        fp: IO[bytes],
-        code: int,
-        msg: str,
-        headers: Message,
-        newurl: str,
-    ) -> None:
-        return None
-
-
 def check_litellm_url(base_url: str, name: str = "litellm.base_url") -> None:
     """Exits unless `base_url` is https, or http to localhost. `name` is the setting shown in the message."""
-    u = urllib.parse.urlparse(base_url)
-    if u.scheme == "https" or (u.scheme == "http" and u.hostname in LOCAL_HOSTS):
+    if url_allowed(base_url):
         return
     sys.exit(f"{name} must use https (http only for localhost): {base_url}")
 
@@ -1827,7 +1841,7 @@ def litellm_get(base_url: str, key: str, path: str, params: Mapping[str, Any]) -
     check_litellm_url(base_url)
     url = base_url.rstrip("/") + path + "?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"})
-    opener = urllib.request.build_opener(_NoRedirect)
+    opener = urllib.request.build_opener(NoRedirect)
     with opener.open(req, timeout=120) as r:
         return json.loads(r.read().decode())
 
@@ -1871,7 +1885,7 @@ def _judge_exchange(request: urllib.request.Request, timeout: float, abandoned: 
     chunks: list[bytes] = []
     size = 0
     try:
-        with urllib.request.build_opener(_NoRedirect).open(request, timeout=timeout) as r:
+        with urllib.request.build_opener(NoRedirect).open(request, timeout=timeout) as r:
             while chunk := r.read1(min(65_536, MAX_JUDGE_REPLY_BYTES + 1 - size)):  # one socket read at a time
                 chunks.append(chunk)
                 size += len(chunk)
@@ -4863,9 +4877,10 @@ __all__ = ["GRADERS", "GRADER_GROUP", "GradePlan", "grade_plan", "grader_for"]
 """Plugins through entry points (ADR 0007, decision 7).
 
 Third-party packages register a factory `(config) -> HarnessRunner | Grader | redactor` in the groups
-`harness_bench.runners`, `harness_bench.graders`, `harness_bench.redactors` and `harness_bench.sandboxes` (a
-redactor is a callable `(text: str) -> str` that runs on an artifact before it is sent to the judge; a sandbox
-factory takes the `sandbox` section and returns a `Sandbox`, ADR 0010). Built-in names always win: callers
+`harness_bench.runners`, `harness_bench.graders`, `harness_bench.redactors`, `harness_bench.sandboxes` and
+`harness_bench.sinks` (a redactor is a callable `(text: str) -> str` that runs on an artifact before it is sent to
+the judge; a sandbox factory takes the `sandbox` section and returns a `Sandbox`, ADR 0010; a sink factory takes one
+entry of the `sinks` list and returns a `Sink`, ADR 0011). Built-in names always win: callers
 only come here for a name that is not built in, so a plain run never imports third-party code. Every failure is a
 `PluginError` with a message that names the plugin, never a traceback from the engine.
 """
@@ -4878,6 +4893,7 @@ RUNNER_GROUP = "harness_bench.runners"
 GRADER_GROUP = "harness_bench.graders"
 REDACTOR_GROUP = "harness_bench.redactors"
 SANDBOX_GROUP = "harness_bench.sandboxes"
+SINK_GROUP = "harness_bench.sinks"
 
 
 class PluginError(ValueError):
@@ -4961,6 +4977,719 @@ def _is_redactor(obj: object) -> TypeGuard[Callable[[str], str]]:
 def redactor_for(name: str, config: Mapping[str, Any]) -> Callable[[str], str]:
     """The redactor of the plugin `name` (there are no built-in ones), built from `config` (the `judge` section)."""
     return create_plugin(REDACTOR_GROUP, name, (), config, _is_redactor, "callable")
+```
+
+`hbench/net.py`:
+
+```python
+"""The network rules every outgoing request follows: https (http only for localhost), no redirects, a total
+deadline and a cap on the reply that is read. `check_litellm_url` (the engine) and the OTLP sink share them."""
+
+import threading
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections.abc import Mapping
+from email.message import Message
+from typing import IO
+
+LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+MAX_REPLY_BYTES = 1_000_000
+
+
+class NetError(Exception):
+    """A request failed in a way the caller should report: an oversized reply."""
+
+
+def url_allowed(url: str) -> bool:
+    """Whether `url` is https, or http to localhost."""
+    u = urllib.parse.urlparse(url)
+    return u.scheme == "https" or (u.scheme == "http" and u.hostname in LOCAL_HOSTS)
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow redirects: a header (an Authorization key) must not reach another host."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: Message,
+        newurl: str,
+    ) -> None:
+        return None
+
+
+def _exchange(request: urllib.request.Request, timeout: float, abandoned: threading.Event) -> bytes:
+    """Send `request` and read the reply, at most `MAX_REPLY_BYTES`; stops reading once `abandoned` is set."""
+    chunks: list[bytes] = []
+    size = 0
+    try:
+        with urllib.request.build_opener(NoRedirect).open(request, timeout=timeout) as r:
+            while chunk := r.read1(min(65_536, MAX_REPLY_BYTES + 1 - size)):  # one socket read at a time
+                chunks.append(chunk)
+                size += len(chunk)
+                if size > MAX_REPLY_BYTES:
+                    raise NetError("the reply is too large")
+                if abandoned.is_set():
+                    raise TimeoutError("the reply took too long")
+    except urllib.error.HTTPError as e:
+        e.close()  # an error status holds the socket open until it is closed
+        raise
+    return b"".join(chunks)
+
+
+def post_bounded(url: str, headers: Mapping[str, str], body: bytes, timeout: float) -> bytes:
+    """POST `body` to `url` and return the reply. The URL must pass `url_allowed` (`ValueError` otherwise), no
+    redirect is followed, the whole exchange takes at most `timeout` seconds (`TimeoutError`) and the reply is
+    at most `MAX_REPLY_BYTES` (`NetError`). Any other failure (HTTP status, connection) is raised as it is.
+
+    `timeout` alone limits each socket operation, so a server that drips the status line, the headers or the
+    body never times out. The exchange runs in a daemon thread (it cannot keep the process alive) and the caller
+    waits at most `timeout` for it."""
+    if not url_allowed(url):
+        raise ValueError("the URL must use https (http only for localhost)")
+    request = urllib.request.Request(url, data=body, headers=dict(headers), method="POST")
+    outcome: list[bytes | BaseException] = []
+    abandoned = threading.Event()
+
+    def exchange() -> None:
+        try:
+            outcome.append(_exchange(request, timeout, abandoned))
+        except BaseException as e:  # handed to the caller, which re-raises it
+            outcome.append(e)
+
+    worker = threading.Thread(target=exchange, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive() or not outcome:
+        abandoned.set()  # the thread stops at its next read; its sockets time out on their own
+        raise TimeoutError("the reply took too long")
+    result = outcome[0]
+    if isinstance(result, BaseException):
+        raise result
+    return result
+```
+
+`hbench/sinks/__init__.py`:
+
+```python
+"""Sinks: the protocol, the built-in types and the registry (ADR 0011).
+
+`sinks_for(cfg, base)` is the only way the engine gets its sinks: for each entry of the `sinks` list, the built-in
+type of `type`, else the plugin of that name in the entry-point group `harness_bench.sinks`. Building a sink does no
+I/O; `Sink.open` does.
+"""
+
+import re
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any, TypeGuard
+
+from hbench.plugins import SINK_GROUP, create_plugin
+from hbench.sinks.base import Sink, SinkError
+from hbench.sinks.otlp import OtlpSink
+from hbench.sinks.sqlite import SqliteSink
+
+__all__ = ["BUILTIN_TYPES", "Sink", "SinkError", "sink_secret_vars", "sinks_for"]
+
+BUILTIN_TYPES = ("sqlite", "otlp")
+_ALLOWED_KEYS: Mapping[str, frozenset[str]] = {
+    "sqlite": frozenset({"type", "path"}),
+    "otlp": frozenset({"type", "endpoint", "headers", "timeout"}),
+}
+_ENV_REF = re.compile(r"\$\{(\w+)\}")
+
+
+def _is_sink(obj: object) -> TypeGuard[Sink]:
+    return isinstance(obj, Sink)
+
+
+def _entries(cfg: Mapping[str, Any]) -> list[Any]:
+    section = cfg.get("sinks")
+    if section is None:
+        return []
+    if not isinstance(section, list):
+        raise SinkError("sinks must be a list of objects")
+    return section
+
+
+def _build(entry: object, base: Path, out_dir: Path) -> Sink:
+    if not isinstance(entry, Mapping):
+        raise SinkError("must be an object")
+    kind = entry.get("type")
+    if not isinstance(kind, str) or not kind:
+        raise SinkError("type must be a non-empty string")
+    if kind in _ALLOWED_KEYS:
+        unknown = sorted(set(entry) - _ALLOWED_KEYS[kind] - {"_comment"})
+        if unknown:
+            raise SinkError(f"unknown keys {unknown} (a {kind} sink takes {sorted(_ALLOWED_KEYS[kind])})")
+    if kind == "sqlite":
+        return SqliteSink.from_section(entry, base)
+    if kind == "otlp":
+        return OtlpSink.from_section(entry, out_dir)
+    return create_plugin(SINK_GROUP, kind, BUILTIN_TYPES, entry, _is_sink, "Sink")
+
+
+def sinks_for(cfg: Mapping[str, Any], base: Path) -> list[Sink]:
+    """The sinks of the `sinks` list of `cfg`; paths are relative to `base`, the directory of the config. Raises
+    `SinkError` or `PluginError` (both `ValueError`) for a bad entry; the message names the entry."""
+    out_dir = base / cfg.get("output_dir", "results")
+    sinks = []
+    for index, entry in enumerate(_entries(cfg)):
+        try:
+            sinks.append(_build(entry, base, out_dir))
+        except ValueError as e:
+            raise type(e)(f"sinks[{index}]: {e}") from e
+    return sinks
+
+
+def sink_secret_vars(cfg: Mapping[str, Any]) -> set[str]:
+    """The environment variables named by the header values of the sinks: secrets that never go to an agent."""
+    names: set[str] = set()
+    for entry in cfg.get("sinks") or []:
+        headers = entry.get("headers") if isinstance(entry, Mapping) else None
+        if isinstance(headers, Mapping):
+            for value in headers.values():
+                names |= set(_ENV_REF.findall(value)) if isinstance(value, str) else set()
+    return names
+```
+
+`hbench/sinks/base.py`:
+
+```python
+"""The `Sink` protocol (ADR 0011): where the trials of a run go besides `trials.jsonl`.
+
+A sink receives only contract objects, which never hold artifact content, agent output or the judge's reason, so no
+sink can leak them. `write` must be idempotent by `trial_id`: resume and `export` send a trial again.
+"""
+
+from typing import Protocol, runtime_checkable
+
+from hbench.core.models import RunInfo, TrialResult
+
+
+class SinkError(ValueError):
+    """A `sinks` entry is invalid, or a sink could not do its work. The message never holds a secret."""
+
+
+@runtime_checkable
+class Sink(Protocol):
+    def open(self, info: RunInfo) -> None:
+        """Start receiving the trials of the run `info`. May be called again for a run that was seen before."""
+
+    def write(self, trial: TrialResult) -> None:
+        """Record one trial. Sending the same trial again must not duplicate it."""
+
+    def close(self, info: RunInfo) -> None:
+        """The run is over (`info.finished_at` is set when it finished): flush and release everything."""
+```
+
+`hbench/sinks/feed.py`:
+
+```python
+"""`SinkFeed`: sends the run and its trials to every sink, and never lets a sink stop the run (ADR 0011, decision 5).
+
+A sink that raises (disk full, a locked database, a collector that answers 500, times out or redirects) is reported
+once through `warn` and not used again for this run. Nothing else changes: `trials.jsonl`, `results.jsonl` and the
+report are written before and independently of any sink, and `export` replays a run into the sinks later.
+"""
+
+import contextlib
+from collections.abc import Callable, Sequence
+
+from hbench.core.models import RunInfo, TrialResult
+from hbench.sinks.base import Sink
+
+
+class SinkFeed:
+    def __init__(self, sinks: Sequence[Sink], warn: Callable[[str], None]) -> None:
+        self._live = list(sinks)
+        self._warn = warn
+        self._info: RunInfo | None = None
+        self.failed = 0
+
+    def _each(self, action: Callable[[Sink], None]) -> None:
+        for sink in list(self._live):
+            try:
+                action(sink)
+            except Exception as e:  # a sink is third-party code in the plugin case: nothing it raises ends the run
+                self._live.remove(sink)
+                self.failed += 1
+                self._release(sink)
+                self._warn(
+                    f"warning: sink {type(sink).__name__} failed and is off for this run "
+                    f"(replay later with `python3 -m hbench export`): {type(e).__name__}: {e}"
+                )
+
+    def _release(self, sink: Sink) -> None:
+        """Best effort: let a dropped sink release its file or connection; its own failure is not reported again."""
+        if self._info is not None:
+            with contextlib.suppress(Exception):
+                sink.close(self._info)
+
+    def open(self, info: RunInfo) -> None:
+        self._info = info
+        self._each(lambda sink: sink.open(info))
+
+    def write(self, trial: TrialResult) -> None:
+        self._each(lambda sink: sink.write(trial))
+
+    def close(self, info: RunInfo) -> None:
+        self._each(lambda sink: sink.close(info))
+```
+
+`hbench/sinks/sqlite.py`:
+
+```python
+"""The `sqlite` sink: runs, trials and grader results in a SQLite file (ADR 0011).
+
+The tables come from `schema.sql` in this package; `docs/sql/schema.sql` is the same file for readers (a test checks
+they are equal).
+
+Every statement is parameterized (a task id is data, never SQL) and every write is an upsert by `run_id` or
+`trial_id`, so resume and `export` can send a trial again. Unknown tokens, tool calls and costs are NULL.
+"""
+
+import sqlite3
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any, Self
+
+from hbench.core.models import RunInfo, TrialResult
+from hbench.sinks.base import SinkError
+
+SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
+
+_UPSERT_RUN = """
+INSERT INTO runs (run_id, started_at, finished_at, harness_bench_version, config_sha256, suite_version, sandbox,
+                  sandboxed, schema_version)
+VALUES (:run_id, :started_at, :finished_at, :harness_bench_version, :config_sha256, :suite_version, :sandbox,
+        :sandboxed, :schema_version)
+ON CONFLICT (run_id) DO UPDATE SET
+    started_at = excluded.started_at,
+    finished_at = excluded.finished_at,
+    harness_bench_version = excluded.harness_bench_version,
+    config_sha256 = excluded.config_sha256,
+    suite_version = excluded.suite_version,
+    sandbox = excluded.sandbox,
+    sandboxed = excluded.sandboxed,
+    schema_version = excluded.schema_version
+"""
+
+_UPSERT_TRIAL = """
+INSERT INTO trials (trial_id, run_id, task_id, suite_version, harness, harness_version, model, target_id, rep, status,
+                    passed, latency_s, started_at, agent_exit_code, sandboxed, image_digest, run_tag, usage_parsed,
+                    input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens, turns,
+                    tool_calls, cost_usd, cost_source, cost_gateway, cost_price_table, cost_harness)
+VALUES (:trial_id, :run_id, :task_id, :suite_version, :harness, :harness_version, :model, :target_id, :rep, :status,
+        :passed, :latency_s, :started_at, :agent_exit_code, :sandboxed, :image_digest, :run_tag, :usage_parsed,
+        :input_tokens, :output_tokens, :reasoning_tokens, :cache_read_tokens, :cache_write_tokens, :turns,
+        :tool_calls, :cost_usd, :cost_source, :cost_gateway, :cost_price_table, :cost_harness)
+ON CONFLICT (trial_id) DO UPDATE SET
+    run_id = excluded.run_id,
+    task_id = excluded.task_id,
+    suite_version = excluded.suite_version,
+    harness = excluded.harness,
+    harness_version = excluded.harness_version,
+    model = excluded.model,
+    target_id = excluded.target_id,
+    rep = excluded.rep,
+    status = excluded.status,
+    passed = excluded.passed,
+    latency_s = excluded.latency_s,
+    started_at = excluded.started_at,
+    agent_exit_code = excluded.agent_exit_code,
+    sandboxed = excluded.sandboxed,
+    image_digest = excluded.image_digest,
+    run_tag = excluded.run_tag,
+    usage_parsed = excluded.usage_parsed,
+    input_tokens = excluded.input_tokens,
+    output_tokens = excluded.output_tokens,
+    reasoning_tokens = excluded.reasoning_tokens,
+    cache_read_tokens = excluded.cache_read_tokens,
+    cache_write_tokens = excluded.cache_write_tokens,
+    turns = excluded.turns,
+    tool_calls = excluded.tool_calls,
+    cost_usd = excluded.cost_usd,
+    cost_source = excluded.cost_source,
+    cost_gateway = excluded.cost_gateway,
+    cost_price_table = excluded.cost_price_table,
+    cost_harness = excluded.cost_harness
+"""
+
+_INSERT_GRADER = """
+INSERT INTO grader_results (trial_id, position, grader, grader_version, passed, score, timed_out, judge)
+VALUES (:trial_id, :position, :grader, :grader_version, :passed, :score, :timed_out, :judge)
+"""
+
+
+def run_row(info: RunInfo) -> dict[str, Any]:
+    return {
+        "run_id": info.run_id,
+        "started_at": info.started_at.isoformat(),
+        "finished_at": info.finished_at.isoformat() if info.finished_at else None,
+        "harness_bench_version": info.harness_bench_version,
+        "config_sha256": info.config_sha256,
+        "suite_version": info.suite_version,
+        "sandbox": info.sandbox,
+        "sandboxed": int(info.sandboxed),
+        "schema_version": info.schema_version,
+    }
+
+
+def trial_row(trial: TrialResult) -> dict[str, Any]:
+    """The `trials` row: token counts and the tool-call count are NULL when the harness output was not parsed."""
+    usage, costs = trial.usage, trial.usage.costs
+    known = usage.parsed
+    return {
+        "trial_id": trial.trial_id,
+        "run_id": trial.run_id,
+        "task_id": trial.task_id,
+        "suite_version": trial.suite_version,
+        "harness": trial.target.harness,
+        "harness_version": trial.target.harness_version,
+        "model": trial.target.model,
+        "target_id": f"{trial.target.harness}/{trial.target.model}",
+        "rep": trial.rep,
+        "status": trial.status.value,
+        "passed": int(trial.passed),
+        "latency_s": trial.latency_s,
+        "started_at": trial.started_at.isoformat(),
+        "agent_exit_code": trial.agent_exit_code,
+        "sandboxed": int(trial.sandboxed),
+        "image_digest": trial.image_digest,
+        "run_tag": trial.trace_id,
+        "usage_parsed": int(known),
+        "input_tokens": usage.input_tokens if known else None,
+        "output_tokens": usage.output_tokens if known else None,
+        "reasoning_tokens": usage.reasoning_tokens if known else None,
+        "cache_read_tokens": usage.cache_read_tokens if known else None,
+        "cache_write_tokens": usage.cache_write_tokens if known else None,
+        "turns": usage.turns if known else None,
+        "tool_calls": usage.tool_calls,
+        "cost_usd": usage.cost_usd,
+        "cost_source": usage.cost_source.value,
+        "cost_gateway": costs.gateway,
+        "cost_price_table": costs.price_table,
+        "cost_harness": costs.harness,
+    }
+
+
+def grader_rows(trial: TrialResult) -> list[dict[str, Any]]:
+    return [
+        {
+            "trial_id": trial.trial_id,
+            "position": position,
+            "grader": g.grader,
+            "grader_version": g.grader_version,
+            "passed": int(g.passed),
+            "score": g.score,
+            "timed_out": int(g.timed_out),
+            "judge": g.judge,
+        }
+        for position, g in enumerate(trial.graders)
+    ]
+
+
+class SqliteSink:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._db: sqlite3.Connection | None = None
+
+    @classmethod
+    def from_section(cls, section: Mapping[str, Any], base: Path) -> Self:
+        path = section.get("path")
+        if not isinstance(path, str) or not path:
+            raise SinkError("a sqlite sink needs a path: a non-empty string, relative to the config")
+        return cls(base / path)
+
+    def _connection(self) -> sqlite3.Connection:
+        if self._db is None:
+            raise SinkError("the sqlite sink is not open")
+        return self._db
+
+    def open(self, info: RunInfo) -> None:
+        try:
+            schema = SCHEMA_PATH.read_text()
+        except OSError as e:
+            raise SinkError(f"cannot read the schema {SCHEMA_PATH}: {e}") from e
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        db = sqlite3.connect(self.path)
+        self._db = db
+        db.executescript(schema)
+        with db:
+            db.execute(_UPSERT_RUN, run_row(info))
+
+    def write(self, trial: TrialResult) -> None:
+        db = self._connection()
+        with db:  # one transaction: a trial is never half there
+            db.execute(_UPSERT_TRIAL, trial_row(trial))
+            db.execute("DELETE FROM grader_results WHERE trial_id = ?", (trial.trial_id,))
+            db.executemany(_INSERT_GRADER, grader_rows(trial))
+
+    def close(self, info: RunInfo) -> None:
+        db = self._connection()
+        try:
+            with db:
+                db.execute(_UPSERT_RUN, run_row(info))
+        finally:
+            db.close()
+            self._db = None
+```
+
+`hbench/sinks/otlp.py`:
+
+```python
+"""The `otlp` sink: OpenTelemetry traces in the OTLP/JSON encoding, with no OpenTelemetry package (ADR 0011).
+
+Each trial is one span, child of the span of the run; the trace id is the run id. Spans go to
+`<run_dir>/traces.otlp.jsonl` (one `ExportTraceServiceRequest` per line, each span id once) and, when `endpoint` is
+set, to `POST <endpoint>/v1/traces`. A span holds ids, status, times, the model, token counts and the cost, and
+nothing else: no prompt, response, transcript, artifact or log content, and there is no option to add it. An unknown
+number is absent from the span, never 0.
+"""
+
+import hashlib
+import json
+import os
+import re
+import urllib.error
+from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any, Self
+
+from hbench.core.models import RunInfo, TrialResult, TrialStatus
+from hbench.net import NetError, post_bounded, url_allowed
+from hbench.sinks.base import SinkError
+
+TRACES_FILE = "traces.otlp.jsonl"
+DEFAULT_TIMEOUT = 10.0
+_ENV_REF = re.compile(r"\$\{(\w+)\}")
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+_SPAN_KIND_INTERNAL = 1
+_STATUS_UNSET = 0
+_STATUS_ERROR = 2
+
+
+def run_span_id(run_id: str) -> str:
+    """The span id of the run: the first 16 hex characters of `sha256("run:" + run_id)`."""
+    return hashlib.sha256(f"run:{run_id}".encode()).hexdigest()[:16]
+
+
+def _unix_nano(moment: datetime) -> int:
+    """Nanoseconds since the epoch, by integer arithmetic (a float has no room for them)."""
+    return (moment - _EPOCH) // timedelta(microseconds=1) * 1000
+
+
+def _attribute(key: str, value: str | bool | int | float) -> dict[str, Any]:
+    if isinstance(value, bool):
+        encoded: dict[str, Any] = {"boolValue": value}
+    elif isinstance(value, int):
+        encoded = {"intValue": str(value)}  # OTLP/JSON carries 64-bit integers as strings
+    elif isinstance(value, float):
+        encoded = {"doubleValue": value}
+    else:
+        encoded = {"stringValue": value}
+    return {"key": key, "value": encoded}
+
+
+def trial_attributes(trial: TrialResult, sandbox: str) -> dict[str, str | bool | int | float]:
+    """The attributes of a trial span. Token counts only when the harness output was parsed, the cache count only
+    when it is above 0 (a harness that does not report it reads 0), the cost only when known."""
+    usage = trial.usage
+    attributes: dict[str, str | bool | int | float] = {
+        "eval.run_id": trial.run_id,
+        "eval.trial_id": trial.trial_id,
+        "eval.target_id": f"{trial.target.harness}/{trial.target.model}",
+        "eval.task_id": trial.task_id,
+        "eval.rep": trial.rep,
+        "eval.status": trial.status.value,
+        "eval.passed": trial.passed,
+        "eval.suite_version": trial.suite_version,
+        "eval.sandbox": sandbox,
+        "gen_ai.request.model": trial.target.model,
+    }
+    if usage.parsed:
+        attributes["gen_ai.usage.input_tokens"] = usage.input_tokens
+        attributes["gen_ai.usage.output_tokens"] = usage.output_tokens
+        if usage.cache_read_tokens > 0:
+            attributes["gen_ai.usage.cache_read.input_tokens"] = usage.cache_read_tokens
+    if usage.cost_usd is not None:
+        attributes["eval.cost_usd"] = usage.cost_usd
+    return attributes
+
+
+def _request(info: RunInfo, span: Mapping[str, Any]) -> dict[str, Any]:
+    resource = [("service.name", "harness-bench"), ("service.version", info.harness_bench_version)]
+    return {
+        "resourceSpans": [
+            {
+                "resource": {"attributes": [_attribute(k, v) for k, v in resource]},
+                "scopeSpans": [{"scope": {"name": "hbench.sinks.otlp"}, "spans": [span]}],
+            }
+        ]
+    }
+
+
+def trial_request(info: RunInfo, trial: TrialResult) -> dict[str, Any]:
+    """The `ExportTraceServiceRequest` of one trial. Start and end come from `started_at` and `latency_s`."""
+    start = _unix_nano(trial.started_at)
+    failed = trial.status is TrialStatus.ERROR
+    span = {
+        "traceId": trial.run_id,
+        "spanId": trial.trial_id,
+        "parentSpanId": run_span_id(trial.run_id),
+        "name": "eval.trial",
+        "kind": _SPAN_KIND_INTERNAL,
+        "startTimeUnixNano": str(start),
+        "endTimeUnixNano": str(start + round(trial.latency_s * 1_000_000_000)),
+        "attributes": [_attribute(k, v) for k, v in trial_attributes(trial, info.sandbox).items()],
+        "status": {"code": _STATUS_ERROR if failed else _STATUS_UNSET},
+    }
+    return _request(info, span)
+
+
+def run_request(info: RunInfo, end: datetime) -> dict[str, Any]:
+    """The `ExportTraceServiceRequest` of the run span, which ends at `end`."""
+    attributes = {"eval.run_id": info.run_id, "eval.suite_version": info.suite_version, "eval.sandbox": info.sandbox}
+    span = {
+        "traceId": info.run_id,
+        "spanId": run_span_id(info.run_id),
+        "name": "eval.run",
+        "kind": _SPAN_KIND_INTERNAL,
+        "startTimeUnixNano": str(_unix_nano(info.started_at)),
+        "endTimeUnixNano": str(_unix_nano(end)),
+        "attributes": [_attribute(k, v) for k, v in attributes.items()],
+        "status": {"code": _STATUS_UNSET},
+    }
+    return _request(info, span)
+
+
+def _span_ids(request: object) -> set[str]:
+    """The span ids of one request line; anything that does not have the OTLP shape holds none."""
+    found: set[str] = set()
+    if not isinstance(request, dict):
+        return found
+    for resource in _items(request.get("resourceSpans")):
+        for scope in _items(resource.get("scopeSpans")):
+            found |= {s["spanId"] for s in _items(scope.get("spans")) if isinstance(s.get("spanId"), str)}
+    return found
+
+
+def _items(value: object) -> list[dict[str, Any]]:
+    """The objects of a JSON array; anything else (a missing key, a string, a number inside) holds none."""
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+class OtlpSink:
+    def __init__(self, out_dir: Path, endpoint: str | None, headers: Mapping[str, str], timeout: float) -> None:
+        self.out_dir = out_dir
+        self.endpoint = endpoint
+        self.headers = dict(headers)
+        self.timeout = timeout
+        self._opened: tuple[RunInfo, Path] | None = None
+        self._known: set[str] = set()  # the span ids already in the file
+        self._glue = ""  # a newline when the file ends in a line cut short by a crash
+        self._post_failed = False  # after one failed POST the file is still written but nothing is sent again
+
+    @classmethod
+    def from_section(cls, section: Mapping[str, Any], out_dir: Path) -> Self:
+        endpoint = section.get("endpoint")
+        if endpoint is not None and (not isinstance(endpoint, str) or not url_allowed(endpoint)):
+            raise SinkError("an otlp endpoint must be a URL that uses https (http only for localhost)")
+        headers = _headers(section.get("headers", {}))
+        if headers and endpoint is None:
+            raise SinkError("otlp headers need an endpoint: they are only sent with the POST")
+        timeout = section.get("timeout", DEFAULT_TIMEOUT)
+        if isinstance(timeout, bool) or not isinstance(timeout, int | float) or timeout <= 0:
+            raise SinkError(f"an otlp timeout must be a number of seconds above 0, got {timeout!r}")
+        return cls(out_dir, endpoint, headers, float(timeout))
+
+    def open(self, info: RunInfo) -> None:
+        run_dir = self.out_dir / info.run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        path = run_dir / TRACES_FILE
+        text = path.read_text() if path.exists() else ""
+        self._known = set()
+        for line in text.splitlines():
+            try:
+                self._known |= _span_ids(json.loads(line))
+            except ValueError:  # a line cut short by a crash holds no span
+                continue
+        self._glue = "\n" if text and not text.endswith("\n") else ""
+        self._post_failed = False
+        self._opened = (info, path)
+
+    def _state(self) -> tuple[RunInfo, Path]:
+        if self._opened is None:
+            raise SinkError("the otlp sink is not open")
+        return self._opened
+
+    def _append(self, span_id: str, request: Mapping[str, Any]) -> None:
+        """Add the request to the file unless its span is already there (one `write` call: one line)."""
+        if span_id in self._known:
+            return
+        with self._state()[1].open("a") as f:
+            f.write(f"{self._glue}{json.dumps(request)}\n")
+        self._glue = ""
+        self._known.add(span_id)
+
+    def _send(self, request: Mapping[str, Any]) -> None:
+        """POST the request when there is an endpoint. A failure raises a `SinkError` that holds no header."""
+        if self.endpoint is None or self._post_failed:
+            return
+        self._post_failed = True  # cleared below once the POST succeeds, so any failure leaves it set
+        url = self.endpoint.rstrip("/") + "/v1/traces"
+        headers = {"Content-Type": "application/json", **self.headers}
+        try:
+            post_bounded(url, headers, json.dumps(request).encode(), self.timeout)
+        except urllib.error.HTTPError as e:
+            raise SinkError(f"the collector answered HTTP {e.code}") from None
+        except (TimeoutError, NetError) as e:
+            raise SinkError(f"the collector exchange failed: {e}") from None
+        except Exception as e:
+            raise SinkError(f"the collector exchange failed: {type(e).__name__}") from None
+        self._post_failed = False
+
+    def write(self, trial: TrialResult) -> None:
+        info = self._state()[0]
+        request = trial_request(info, trial)
+        self._append(trial.trial_id, request)
+        self._send(request)
+
+    def close(self, info: RunInfo) -> None:
+        """Write and send the run span of a finished run. An unfinished run (Ctrl-C, an error, a dropped sink) has no
+        end yet: its span would be written with a wrong one and `_append` would then keep it, so nothing is written
+        and a later close (resume, `export`) adds the right one."""
+        self._state()
+        if info.finished_at is None:
+            return
+        request = run_request(info, info.finished_at)
+        self._append(run_span_id(info.run_id), request)
+        self._send(request)
+
+
+def _headers(raw: object) -> dict[str, str]:
+    """The headers of the section with every `${VAR}` expanded from the environment. A value must be exactly one
+    reference, so the redaction of logs knows the secret it stands for."""
+    if not isinstance(raw, Mapping):
+        raise SinkError("otlp headers must be an object of name: ${VAR}")
+    headers: dict[str, str] = {}
+    for name, value in raw.items():
+        match = _ENV_REF.fullmatch(value) if isinstance(value, str) else None
+        if not name or match is None:
+            raise SinkError(
+                f"otlp header {name!r}: the value must be an environment variable, written exactly ${{VAR}}"
+            )
+        expanded = os.environ.get(match.group(1), "")
+        if not expanded:
+            raise SinkError(f"otlp header {name!r} is empty: set the environment variable {match.group(1)}")
+        headers[name] = expanded
+    return headers
 ```
 
 `hbench/sandboxes/__init__.py`:
@@ -5874,6 +6603,21 @@ class RunWriter:
 
     def _write_info(self) -> None:
         _atomic_write(self.run_dir / "run.json", json.dumps(self.info.to_dict(), indent=2) + "\n")
+
+
+def read_run(run_dir: Path) -> tuple[RunInfo, list[TrialResult]]:
+    """The run in `run_dir` as it is on disk, without changing a file (`export` may read a run that is still going):
+    its `run.json` and its trials. A last line without a newline is a write in progress or cut short by a crash,
+    so it is left out. Raises `ResumeError` for a directory that is not a run or holds invalid contract data."""
+    try:
+        info = RunInfo.from_dict(json.loads((run_dir / "run.json").read_text()))
+        text = (run_dir / "trials.jsonl").read_text()
+        lines = text.splitlines() if text.endswith("\n") else text.splitlines()[:-1]
+        return info, [TrialResult.from_dict(json.loads(line)) for line in lines if line.strip()]
+    except FileNotFoundError as e:
+        raise ResumeError(f"{run_dir} is not a run directory: {e.filename} does not exist") from e
+    except ValueError as e:  # ContractError and json.JSONDecodeError are both ValueErrors
+        raise ResumeError(f"{run_dir} is not valid run data: {e}") from e
 
 
 def read_trials(out_dir: Path, warn: Callable[[str], None] = print) -> list[TrialResult]:
@@ -7048,6 +7792,7 @@ profile (see `hbench.profiles`) and, for `run`, waits for the spend logs and rec
 import argparse
 import importlib
 import json
+import os
 import shutil
 import sys
 import time
@@ -7061,6 +7806,8 @@ from hbench.core.schema import schema_document
 from hbench.doctor import run_checks
 from hbench.judge import JudgeError
 from hbench.profiles import apply_litellm_profile
+from hbench.results import ResumeError, read_run
+from hbench.sinks.feed import SinkFeed
 from hbench.suites import Suite, SuiteError, load_suite, suite_label, suite_tasks
 
 _DESCRIPTION = (
@@ -7073,6 +7820,7 @@ _DESCRIPTION = (
     "  python3 -m hbench suite list     [--config C | PATH...]\n"
     "  python3 -m hbench suite validate [--config C] [--run [--allow-unsandboxed]] [PATH...]\n"
     "  python3 -m hbench judge calibrate --config C --labels LABELS.jsonl --out calibration.json\n"
+    "  python3 -m hbench export    --config C --run RUN_DIR   # replay a run into the configured sinks\n"
     "  python3 -m hbench doctor    --config C [--network]   # check env, CLIs, image and network; spends nothing\n\n"
     "Add --litellm to run, report or reconcile for the LiteLLM-only benchmark."
 )
@@ -7169,6 +7917,9 @@ def build_parser(epilog: str | None = None) -> argparse.ArgumentParser:
         action="store_true",
         help="also GET the LiteLLM health endpoint and one page of spend logs (the spend key's permission)",
     )
+    export_cmd = sub.add_parser("export", help="replay a run into the configured sinks (idempotent)")
+    export_cmd.add_argument("--config", required=True)
+    export_cmd.add_argument("--run", required=True, metavar="RUN_DIR", help="the run directory: <output_dir>/<run_id>")
     judge = sub.add_parser("judge", help="LLM judge tools")
     judge_sub = judge.add_subparsers(dest="judge_cmd", required=True)
     calibrate_cmd = judge_sub.add_parser(
@@ -7316,6 +8067,36 @@ def _doctor(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def _export(args: argparse.Namespace) -> None:
+    """`export`: send `run.json` and `trials.jsonl` of a finished or interrupted run to the sinks of the config."""
+    engine = _engine()
+    cfg_path = Path(args.config).resolve()
+    try:
+        cfg: dict[str, Any] = json.loads(cfg_path.read_text())
+    except (OSError, ValueError) as e:
+        sys.exit(f"export: cannot read the config {cfg_path}: {e}")
+    run_dir = Path(args.run).resolve()
+    try:
+        info, trials = read_run(run_dir)
+    except ResumeError as e:
+        sys.exit(f"export: {e}")
+    if run_dir.name != info.run_id:
+        sys.exit(f"export: {run_dir} is not the directory of run {info.run_id}")
+    # The trace file of the otlp sink lives in the run directory, wherever the config says output goes.
+    sinks = engine.make_sinks(dict(cfg, output_dir=str(run_dir.parent)), cfg_path.parent)
+    if not sinks:
+        sys.exit("export: the config has no sinks")
+    secrets = [os.environ.get(v, "") for v in engine.spend_key_vars(cfg)]
+    feed = SinkFeed(sinks, lambda message: print(engine.redact(message, secrets), file=sys.stderr))
+    feed.open(info)
+    for trial in trials:
+        feed.write(trial)
+    feed.close(info)
+    print(f"exported {len(trials)} trial(s) of run {info.run_id} to {len(sinks) - feed.failed} of {len(sinks)} sink(s)")
+    if feed.failed:
+        sys.exit(1)
+
+
 def _run_litellm(engine: ModuleType, args: argparse.Namespace, cfg: dict[str, Any], base: Path) -> None:
     """`run` under the LiteLLM profile: report only after reconcile, when the gateway cost exists."""
     engine.cmd_run(args, cfg, base)
@@ -7340,6 +8121,9 @@ def main(argv: Sequence[str] | None = None, *, epilog: str | None = None) -> Non
         return
     if args.cmd == "judge":
         _judge_calibrate(args)
+        return
+    if args.cmd == "export":
+        _export(args)
         return
     if args.cmd == "doctor":
         _doctor(args)
@@ -7369,6 +8153,287 @@ from hbench.cli import main
 
 if __name__ == "__main__":
     main()
+```
+
+`hbench/sinks/schema.sql`:
+
+```sql
+-- Reference schema of the results database (ADR 0011). Portable SQL: it runs on SQLite (the `sqlite` sink) and on
+-- PostgreSQL, so a Postgres sink plugin can reuse it. Booleans are 0/1 integers. An unknown cost, token count or
+-- tool-call count is NULL, never 0.
+
+CREATE TABLE IF NOT EXISTS runs (
+    run_id TEXT PRIMARY KEY,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    harness_bench_version TEXT NOT NULL,
+    config_sha256 TEXT NOT NULL,
+    suite_version TEXT NOT NULL,
+    sandbox TEXT NOT NULL,
+    sandboxed INTEGER NOT NULL,
+    schema_version TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS trials (
+    trial_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs (run_id),
+    task_id TEXT NOT NULL,
+    suite_version TEXT NOT NULL,
+    harness TEXT NOT NULL,
+    harness_version TEXT NOT NULL,
+    model TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    rep INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    passed INTEGER NOT NULL,
+    latency_s REAL NOT NULL,
+    started_at TEXT NOT NULL,
+    agent_exit_code INTEGER,
+    sandboxed INTEGER NOT NULL,
+    image_digest TEXT,
+    run_tag TEXT,
+    usage_parsed INTEGER NOT NULL,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    reasoning_tokens INTEGER,
+    cache_read_tokens INTEGER,
+    cache_write_tokens INTEGER,
+    turns INTEGER,
+    tool_calls INTEGER,
+    cost_usd REAL,
+    cost_source TEXT NOT NULL,
+    cost_gateway REAL,
+    cost_price_table REAL,
+    cost_harness REAL
+);
+
+CREATE TABLE IF NOT EXISTS grader_results (
+    trial_id TEXT NOT NULL REFERENCES trials (trial_id),
+    position INTEGER NOT NULL,
+    grader TEXT NOT NULL,
+    grader_version TEXT NOT NULL,
+    passed INTEGER NOT NULL,
+    score REAL,
+    timed_out INTEGER NOT NULL,
+    judge TEXT,
+    PRIMARY KEY (trial_id, position)
+);
+
+CREATE INDEX IF NOT EXISTS trials_by_run ON trials (run_id);
+CREATE INDEX IF NOT EXISTS trials_by_target ON trials (target_id);
+```
+
+`docs/sql/scorecard.sql`:
+
+```sql
+-- Scorecard queries over the reference schema (ADR 0011). Each query starts with a `-- name:` line and ends with a
+-- semicolon; they run on SQLite and PostgreSQL. A target is `harness/model`. Unknown stays unknown: a cost is NULL
+-- when any trial of the target has no cost (as in the markdown report), never 0, and it sorts last, never as the
+-- cheapest target (`ORDER BY x IS NULL, x`: SQLite sorts NULL first).
+--
+-- Every query aggregates over ALL runs in the database. To score one run, add `WHERE run_id = ?` before the `GROUP BY` of a query
+-- (in `pass_hat_k`, inside the subquery).
+
+-- name: pass_rate
+-- Share of trials that passed, per target.
+SELECT target_id,
+       COUNT(*) AS trials,
+       SUM(passed) AS passed,
+       1.0 * SUM(passed) / COUNT(*) AS pass_rate
+FROM trials
+GROUP BY target_id
+ORDER BY pass_rate DESC, target_id;
+
+-- name: pass_hat_k
+-- pass^k with k equal to the number of reps of a task: the share of tasks that passed on every rep, per target.
+SELECT target_id,
+       COUNT(*) AS tasks,
+       SUM(all_passed) AS tasks_always_passed,
+       1.0 * SUM(all_passed) / COUNT(*) AS pass_hat_k
+FROM (
+    SELECT target_id, task_id, MIN(passed) AS all_passed
+    FROM trials
+        GROUP BY target_id, task_id
+) AS per_task
+GROUP BY target_id
+ORDER BY pass_hat_k DESC, target_id;
+
+-- name: cost_per_success
+-- Total cost divided by solved trials, per target. NULL when any trial has an unknown cost or nothing was solved.
+SELECT target_id,
+       SUM(passed) AS solved,
+       CASE WHEN COUNT(cost_usd) = COUNT(*) THEN SUM(cost_usd) END AS total_cost_usd,
+       CASE WHEN COUNT(cost_usd) = COUNT(*) AND SUM(passed) > 0 THEN SUM(cost_usd) / SUM(passed) END AS cost_per_success
+FROM trials
+GROUP BY target_id
+ORDER BY cost_per_success IS NULL, cost_per_success, target_id;
+
+-- Joining the spend logs of the gateway (not run by the tests; it needs a `spend_logs` table that you load from
+-- LiteLLM, with one row per request and the request tag as `request_tag`). `trials.run_tag` is the tag the harness
+-- sent in `x-litellm-tags` (`BENCH_TAG`), so the spend of a trial is the sum of the rows with its tag:
+--
+--   SELECT t.trial_id, t.target_id, SUM(s.spend) AS gateway_cost_usd
+--   FROM trials AS t
+--   JOIN spend_logs AS s ON s.request_tag = t.run_tag
+--   GROUP BY t.trial_id, t.target_id;
+```
+
+`docs/dashboards/grafana-scorecard.json`:
+
+```json
+{
+  "__inputs": [
+    {
+      "name": "DS_BENCH",
+      "label": "Benchmark SQLite",
+      "description": "The SQLite file of the sqlite sink",
+      "type": "datasource",
+      "pluginId": "frser-sqlite-datasource",
+      "pluginName": "SQLite"
+    }
+  ],
+  "__requires": [
+    {
+      "type": "datasource",
+      "id": "frser-sqlite-datasource",
+      "name": "SQLite",
+      "version": "3.5.0"
+    },
+    {
+      "type": "grafana",
+      "id": "grafana",
+      "name": "Grafana",
+      "version": "10.0.0"
+    }
+  ],
+  "title": "harness-bench scorecard",
+  "description": "Pass rate, pass^k and cost per success per target, from the sqlite sink (docs/sql/scorecard.sql). Load scripts/synthetic_db.py output to try it.",
+  "uid": "harness-bench-scorecard",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "tags": [
+    "harness-bench"
+  ],
+  "time": {
+    "from": "now-90d",
+    "to": "now"
+  },
+  "timepicker": {},
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": []
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Pass rate per target",
+      "description": "Share of trials that passed.",
+      "type": "barchart",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "${DS_BENCH}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "${DS_BENCH}"
+          },
+          "queryType": "table",
+          "queryText": "SELECT target_id,\n       COUNT(*) AS trials,\n       SUM(passed) AS passed,\n       1.0 * SUM(passed) / COUNT(*) AS pass_rate\nFROM trials\nGROUP BY target_id\nORDER BY pass_rate DESC, target_id;",
+          "rawQueryText": "SELECT target_id,\n       COUNT(*) AS trials,\n       SUM(passed) AS passed,\n       1.0 * SUM(passed) / COUNT(*) AS pass_rate\nFROM trials\nGROUP BY target_id\nORDER BY pass_rate DESC, target_id;"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "unknown",
+          "unit": "percentunit"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 2,
+      "title": "pass^k per target",
+      "description": "Share of tasks that passed on every rep.",
+      "type": "barchart",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "${DS_BENCH}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "${DS_BENCH}"
+          },
+          "queryType": "table",
+          "queryText": "SELECT target_id,\n       COUNT(*) AS tasks,\n       SUM(all_passed) AS tasks_always_passed,\n       1.0 * SUM(all_passed) / COUNT(*) AS pass_hat_k\nFROM (\n    SELECT target_id, task_id, MIN(passed) AS all_passed\n    FROM trials\n    GROUP BY target_id, task_id\n) AS per_task\nGROUP BY target_id\nORDER BY pass_hat_k DESC, target_id;",
+          "rawQueryText": "SELECT target_id,\n       COUNT(*) AS tasks,\n       SUM(all_passed) AS tasks_always_passed,\n       1.0 * SUM(all_passed) / COUNT(*) AS pass_hat_k\nFROM (\n    SELECT target_id, task_id, MIN(passed) AS all_passed\n    FROM trials\n    GROUP BY target_id, task_id\n) AS per_task\nGROUP BY target_id\nORDER BY pass_hat_k DESC, target_id;"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "unknown",
+          "unit": "percentunit"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "title": "Cost per success per target",
+      "description": "Total cost / solved trials, in USD. Unknown when any trial of the target has no cost.",
+      "type": "table",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "${DS_BENCH}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 9,
+        "w": 24,
+        "h": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "${DS_BENCH}"
+          },
+          "queryType": "table",
+          "queryText": "SELECT target_id,\n       SUM(passed) AS solved,\n       CASE WHEN COUNT(cost_usd) = COUNT(*) THEN SUM(cost_usd) END AS total_cost_usd,\n       CASE WHEN COUNT(cost_usd) = COUNT(*) AND SUM(passed) > 0 THEN SUM(cost_usd) / SUM(passed) END AS cost_per_success\nFROM trials\nGROUP BY target_id\nORDER BY cost_per_success IS NULL, cost_per_success, target_id;",
+          "rawQueryText": "SELECT target_id,\n       SUM(passed) AS solved,\n       CASE WHEN COUNT(cost_usd) = COUNT(*) THEN SUM(cost_usd) END AS total_cost_usd,\n       CASE WHEN COUNT(cost_usd) = COUNT(*) AND SUM(passed) > 0 THEN SUM(cost_usd) / SUM(passed) END AS cost_per_success\nFROM trials\nGROUP BY target_id\nORDER BY cost_per_success IS NULL, cost_per_success, target_id;"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "unknown",
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      }
+    }
+  ]
+}
 ```
 
 ## `config.litellm.example.json`
@@ -7565,6 +8630,7 @@ if __name__ == "__main__":
   "timeout": 1800,
   "cost_source": "auto",
   "output_dir": "results",
+  "_comment_sinks": "Optional. Send each trial to a database and traces besides trials.jsonl: add \"sinks\": [{\"type\": \"sqlite\", \"path\": \"results/bench.sqlite\"}, {\"type\": \"otlp\", \"endpoint\": \"https://collector:4318\", \"headers\": {\"x-key\": \"${OTLP_KEY}\"}}] (a header value must be exactly ${VAR}). Replay a run with python3 -m hbench export --config config.json --run results/<run_id>. See docs/running-a-benchmark.md.",
   "sandbox": {
     "_comment": "Image from sandbox/Dockerfile. Without Docker, leave prefix empty and use --allow-unsandboxed only inside a disposable VM. Alternative with limits, no network by default and a recorded image digest: replace this section with {\"type\": \"docker\", \"image\": \"harness-bench-agents@sha256:<digest of docker image inspect --format '{{.Id}}'>\", \"network\": \"none\", \"limits\": {\"cpus\": 2, \"memory\": \"4g\", \"pids\": 512}}; the agents then reach nothing unless you name an internal Docker network that holds only LiteLLM (docs/machine-setup.md).",
     "prefix": [
@@ -8059,6 +9125,7 @@ Run: python3 tests/smoke.py   (exit 0 = pass)
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -8070,9 +9137,11 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tests"))
 sys.path.insert(0, str(ROOT))
+import fake_collector  # noqa: E402
 import fake_litellm  # noqa: E402
 import fixtures  # noqa: E402
 import harness_bench as hb  # noqa: E402
+from hbench.sinks import otlp as hb_otlp  # noqa: E402
 
 PY = fixtures.PY
 API_KEY = "sk-test-agent-key-0123456789"
@@ -8543,6 +9612,72 @@ def main() -> None:
             "process group: it was gone before grading, and it never held the agent step up",
         )
 
+        # --- sinks: the trial id joins trials.jsonl, SQLite and the spans; a failing collector changes nothing
+        collector_srv, collector_port, collector = fake_collector.serve()
+        threading.Thread(target=collector_srv.serve_forever, daemon=True).start()
+        header_secret = fixtures.fake_secret("sink")
+        os.environ["HB_SINK_KEY"] = header_secret
+        sink_cfg = dict(
+            cfg,
+            output_dir="results-sinks",
+            harnesses={"claude": fixtures.harness("claude", harness_env, "fix")},
+            matrix=[{"harness": "claude", "model": "m"}],
+            sinks=[
+                {"type": "sqlite", "path": "results-sinks/bench.sqlite"},
+                {
+                    "type": "otlp",
+                    "endpoint": f"http://127.0.0.1:{collector_port}",
+                    "headers": {"x-key": "${HB_SINK_KEY}"},
+                },
+            ],
+        )
+        (tmp / "config-sinks.json").write_text(json.dumps(sink_cfg))
+        p = run(tmp, "harness_bench.py", "run", "--allow-unsandboxed", config="config-sinks.json")
+        (sink_run,) = (tmp / "results-sinks").glob("*/trials.jsonl")
+        sink_trials = results(sink_run)
+        trial_ids = {t["trial_id"] for t in sink_trials}
+        db = sqlite3.connect(tmp / "results-sinks/bench.sqlite")
+        db_ids = {r[0] for r in db.execute("SELECT trial_id FROM trials")}
+        db.close()
+        file_spans = [
+            json.loads(line)["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+            for line in (sink_run.parent / "traces.otlp.jsonl").read_text().splitlines()
+        ]
+        run_span = hb_otlp.run_span_id(sink_trials[0]["run_id"])
+        check(
+            len(trial_ids) == 1 and db_ids == trial_ids and {s["spanId"] for s in file_spans} == trial_ids | {run_span},
+            "sinks: one trial_id in trials.jsonl, SQLite and the spans",
+        )
+        check(
+            set(collector.span_ids()) == trial_ids | {run_span}
+            and all(r.headers["x-key"] == header_secret for r in collector.requests),
+            "sinks: the collector got every span, with the header from the environment",
+        )
+        check(
+            trial_ids <= {json.loads(x)["bench_trial_id"] for x in probe_file.read_text().splitlines()},
+            "sinks: the agent got BENCH_TRIAL_ID, the same id",
+        )
+        check(
+            header_secret not in p.stdout + p.stderr
+            and all(
+                header_secret.encode() not in f.read_bytes() for f in (tmp / "results-sinks").rglob("*") if f.is_file()
+            ),
+            "sinks: the header secret is in no log, result or trace file",
+        )
+
+        collector.mode = "http500"
+        collector.requests.clear()
+        (tmp / "config-sinks500.json").write_text(json.dumps(dict(sink_cfg, output_dir="results-sinks500")))
+        p = run(tmp, "harness_bench.py", "run", "--allow-unsandboxed", config="config-sinks500.json")
+        check(
+            len(results(tmp / "results-sinks500/results.jsonl")) == 1
+            and len(collector.requests) == 1
+            and p.stderr.count("warning: sink OtlpSink failed") == 1
+            and header_secret not in p.stdout + p.stderr,
+            "sinks: a collector that answers 500 costs one warning and no result",
+        )
+        collector_srv.shutdown()
+
         # --- config validation and URL policy
         for bad, why in (
             (dict(fizz, id="/etc"), "absolute task id"),
@@ -8686,6 +9821,8 @@ if os.environ.get("FAKE_PROBE_FILE"):
                     "sandbox": os.environ.get("FAKE_SANDBOX", ""),
                     "home": os.environ.get("HOME", ""),
                     "uid": os.getuid(),
+                    "bench_run_id": os.environ.get("BENCH_RUN_ID"),
+                    "bench_trial_id": os.environ.get("BENCH_TRIAL_ID"),
                 }
             )
             + "\n"
@@ -9206,7 +10343,7 @@ def fake_config(extra_env: Mapping[str, str]) -> dict[str, Any]:
 
 
 def copy_engine(dest: Path) -> None:
-    """Copy the engine scripts and the `hbench` package into `dest`, so they run as a standalone checkout."""
+    """Copy the engine scripts and the `hbench` package into `dest`, so they run as a checkout."""
     for name in ("harness_bench.py", "harness_bench_litellm.py"):
         shutil.copy(ROOT / name, dest)
     shutil.copytree(ROOT / "hbench", dest / "hbench", ignore=shutil.ignore_patterns("__pycache__"))
@@ -18626,6 +19763,1419 @@ class CommandTests(DoctorCase):
     def test_doctor_writes_no_results(self) -> None:
         self.assertEqual(self.call()[0], 0)
         self.assertEqual(list(Path(self.base).glob("results*")), [])
+```
+
+`tests/sink_helpers.py`:
+
+```python
+"""Builders of contract objects for the sink tests: a run and trials with known ids, times and costs."""
+
+import dataclasses
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+from hbench.core.ids import trial_id
+from hbench.core.models import Costs, GraderResult, RunInfo, Target, TrialResult, TrialStatus, Usage
+
+RUN_ID = "0123456789abcdef0123456789abcdef"
+STARTED = datetime(2026, 11, 24, 12, 0, 0, tzinfo=UTC)
+
+
+def make_info(run_id: str = RUN_ID, finished: bool = True, **overrides: Any) -> RunInfo:
+    fields: dict[str, Any] = {
+        "run_id": run_id,
+        "started_at": STARTED,
+        "finished_at": STARTED + timedelta(minutes=5) if finished else None,
+        "harness_bench_version": "0.0.0",
+        "config_sha256": "c" * 64,
+        "suite_version": "demo@1",
+        "python": "3.12.0",
+        "platform": "linux",
+        "sandboxed": True,
+        "targets": (Target(harness="claude", harness_version="1.0", model="fix", params={}),),
+        "sandbox": "local-tmp",
+    }
+    return RunInfo(**{**fields, **overrides})
+
+
+def make_trial(
+    task_id: str = "fizzbuzz",
+    harness: str = "claude",
+    model: str = "fix",
+    rep: int = 1,
+    status: TrialStatus = TrialStatus.PASSED,
+    cost: float | None = 0.5,
+    run_id: str = RUN_ID,
+    **overrides: Any,
+) -> TrialResult:
+    """A trial; `cost=None` is an unknown cost. The trial id is the one the engine computes."""
+    target = Target(harness=harness, harness_version="1.0", model=model, params={})
+    fields: dict[str, Any] = {
+        "run_id": run_id,
+        "trial_id": trial_id(run_id, task_id, f"{harness}/{model}", rep),
+        "task_id": task_id,
+        "suite_version": "demo@1",
+        "target": target,
+        "rep": rep,
+        "status": status,
+        "graders": (GraderResult(grader="hidden_tests", grader_version="1", passed=status is TrialStatus.PASSED),),
+        "usage": Usage(
+            input_tokens=100,
+            output_tokens=20,
+            cache_read_tokens=40,
+            turns=2,
+            parsed=True,
+            costs=Costs(gateway=cost),
+            tool_calls=3,
+        ),
+        "latency_s": 12.5,
+        "started_at": STARTED + timedelta(seconds=30 * rep),
+        "agent_exit_code": 0,
+        "sandboxed": True,
+        "trace_id": f"bench-20261124120000-{task_id}__{harness}__{model}__r{rep}",
+    }
+    return TrialResult(**{**fields, **overrides})
+
+
+def with_usage(trial: TrialResult, **changes: Any) -> TrialResult:
+    return dataclasses.replace(trial, usage=dataclasses.replace(trial.usage, **changes))
+```
+
+`tests/fake_collector.py`:
+
+```python
+"""Fake OTLP/HTTP collector for tests.
+
+POST /v1/traces: every request is recorded in `Collector.requests` as a `Recorded` (path, headers, parsed JSON body).
+The reply is scripted by `Collector.mode`: `ok` (200, the default), `http500`, `redirect` (302 to
+`Collector.redirect_url`), `slow` (answers after 2 seconds), `drip` (sends the reply one byte every 50 ms) and `big`
+(a 2 MB reply). The server runs in the process of the test, so the engine in a subprocess reaches it over the loopback.
+"""
+
+import json
+import time
+from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+
+
+@dataclass(frozen=True)
+class Recorded:
+    path: str
+    headers: dict[str, str]
+    body: dict[str, Any]
+
+
+@dataclass
+class Collector:
+    requests: list[Recorded] = field(default_factory=list)
+    mode: str = "ok"
+    redirect_url: str = ""
+
+    def span_ids(self) -> list[str]:
+        """The id of every span received, in order (a span received twice is listed twice)."""
+        return [
+            span["spanId"]
+            for r in self.requests
+            for resource in r.body["resourceSpans"]
+            for scope in resource["scopeSpans"]
+            for span in scope["spans"]
+        ]
+
+
+def serve() -> tuple[ThreadingHTTPServer, int, Collector]:
+    """Start a collector on a free loopback port; the caller runs `serve_forever` in a thread."""
+    collector = Collector()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            headers = {k.lower(): v for k, v in self.headers.items()}
+            collector.requests.append(Recorded(self.path, headers, json.loads(body)))
+            if self.path != "/v1/traces":
+                self.send_response(404)
+                self.end_headers()
+            elif collector.mode == "http500":
+                self.send_response(500)
+                self.end_headers()
+            elif collector.mode == "redirect":
+                self.send_response(302)
+                self.send_header("Location", collector.redirect_url)
+                self.end_headers()
+            else:
+                self.reply()
+
+        def reply(self) -> None:
+            if collector.mode == "slow":
+                time.sleep(2)
+            out = b"x" * 2_000_000 if collector.mode == "big" else b"{}"
+            self.send_response(200)
+            self.end_headers()
+            try:
+                if collector.mode == "drip":
+                    for i in range(len(out)):
+                        self.wfile.write(out[i : i + 1])
+                        self.wfile.flush()
+                        time.sleep(0.05)
+                else:
+                    self.wfile.write(out)
+            except (BrokenPipeError, ConnectionResetError):  # the client gave up
+                pass
+
+        def log_message(self, format: str, *args: Any) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    return server, server.server_address[1], collector
+```
+
+`tests/test_sinks.py`:
+
+```python
+"""The `sinks` config section, the registry, plugin sinks and `SinkFeed` (ADR 0011, decisions 2, 4 and 5)."""
+
+import unittest
+from pathlib import Path
+from typing import Any
+
+import fixtures
+import harness_bench as hb
+from hbench.core.models import RunInfo, TrialResult
+from hbench.plugins import SINK_GROUP, PluginError
+from hbench.sinks import Sink, SinkError, sink_secret_vars, sinks_for
+from hbench.sinks.feed import SinkFeed
+from hbench.sinks.otlp import OtlpSink
+from hbench.sinks.sqlite import SqliteSink
+from sink_helpers import make_info, make_trial
+from test_plugins import installed
+
+SINK_MODULE = """
+class DemoSink:
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+    def open(self, info):
+        pass
+
+    def write(self, trial):
+        pass
+
+    def close(self, info):
+        pass
+
+
+def sink_factory(cfg):
+    return DemoSink(cfg)
+
+
+def not_a_sink(cfg):
+    return object()
+"""
+
+
+def build(entries: object, base: Path | None = None, **extra: Any) -> list[Sink]:
+    return sinks_for({"sinks": entries, **extra}, base or Path("/base"))
+
+
+class RegistryTests(unittest.TestCase):
+    def test_no_sinks_section_means_no_sinks(self) -> None:
+        self.assertEqual(sinks_for({}, Path("/base")), [])
+
+    def test_the_built_in_types_are_built_without_io_and_paths_are_relative_to_the_config(self) -> None:
+        sqlite, otlp = build(
+            [{"type": "sqlite", "path": "out/bench.sqlite"}, {"type": "otlp"}], output_dir="res", base=None
+        )
+        assert isinstance(sqlite, SqliteSink) and isinstance(otlp, OtlpSink)
+        self.assertEqual(sqlite.path, Path("/base/out/bench.sqlite"))
+        self.assertEqual((otlp.out_dir, otlp.endpoint), (Path("/base/res"), None))
+
+    def test_a_comment_key_is_allowed(self) -> None:
+        self.assertEqual(len(build([{"type": "sqlite", "path": "a.db", "_comment": "x"}])), 1)
+
+    def test_sinks_must_be_a_list_of_objects_with_a_type(self) -> None:
+        for bad, text in (
+            ({"type": "sqlite"}, "must be a list"),
+            (["sqlite"], "sinks[0]: must be an object"),
+            ([{"path": "a"}], "type must be a non-empty string"),
+            ([{"type": 3}], "type must be a non-empty string"),
+        ):
+            with self.subTest(bad=bad), self.assertRaises(SinkError) as cm:
+                build(bad)
+            self.assertIn(text, str(cm.exception))
+
+    def test_an_unknown_key_names_the_sink_and_the_allowed_keys(self) -> None:
+        with self.assertRaises(SinkError) as cm:
+            build([{"type": "sqlite", "path": "a.db"}, {"type": "otlp", "endpont": "https://x"}])
+        self.assertIn("sinks[1]: unknown keys ['endpont']", str(cm.exception))
+        self.assertIn("'endpoint'", str(cm.exception))
+
+    def test_a_sqlite_sink_needs_a_path(self) -> None:
+        for entry in ({"type": "sqlite"}, {"type": "sqlite", "path": ""}, {"type": "sqlite", "path": 3}):
+            with self.subTest(entry=entry), self.assertRaises(SinkError) as cm:
+                build([entry])
+            self.assertIn("needs a path", str(cm.exception))
+
+    def test_an_unknown_type_is_a_plugin_error_naming_the_group(self) -> None:
+        with self.assertRaises(PluginError) as cm:
+            build([{"type": "postgres"}])
+        message = str(cm.exception)
+        self.assertTrue(message.startswith("sinks[0]: unknown sink type 'postgres'"), message)
+        self.assertIn(SINK_GROUP, message)
+
+    def test_a_plugin_sink_gets_its_entry_and_is_a_sink(self) -> None:
+        ep = f"[{SINK_GROUP}]\ndemo = demo_plugin:sink_factory\n"
+        with installed(self, ep, SINK_MODULE):
+            with fixtures.quiet():
+                (sink,) = build([{"type": "demo", "dsn": "x"}])
+        self.assertIsInstance(sink, Sink)
+        self.assertEqual(getattr(sink, "cfg", None), {"type": "demo", "dsn": "x"})
+
+    def test_a_plugin_that_returns_something_else_is_refused(self) -> None:
+        ep = f"[{SINK_GROUP}]\ndemo = demo_plugin:not_a_sink\n"
+        with installed(self, ep, SINK_MODULE), self.assertRaises(PluginError) as cm:
+            with fixtures.quiet():
+                build([{"type": "demo"}])
+        self.assertIn("not a Sink", str(cm.exception))
+
+    def test_a_built_in_name_cannot_be_taken_by_a_plugin(self) -> None:
+        ep = f"[{SINK_GROUP}]\nsqlite = demo_plugin:sink_factory\n"
+        with installed(self, ep, SINK_MODULE), self.assertRaises(PluginError) as cm:
+            build([{"type": "other"}])
+        self.assertIn("built-in name", str(cm.exception))
+
+
+class OtlpSectionTests(unittest.TestCase):
+    def test_an_endpoint_over_plain_http_to_a_remote_host_is_refused(self) -> None:
+        for endpoint in ("http://collector.example.com:4318", "ftp://x", 7):
+            with self.subTest(endpoint=endpoint), self.assertRaises(SinkError) as cm:
+                build([{"type": "otlp", "endpoint": endpoint}])
+            self.assertIn("https (http only for localhost)", str(cm.exception))
+
+    def test_https_and_localhost_endpoints_are_accepted(self) -> None:
+        for endpoint in ("https://collector.example.com", "http://localhost:4318", "http://127.0.0.1:4318"):
+            with self.subTest(endpoint=endpoint):
+                (sink,) = build([{"type": "otlp", "endpoint": endpoint}])
+                assert isinstance(sink, OtlpSink)
+                self.assertEqual(sink.endpoint, endpoint)
+
+    def test_a_header_value_must_be_exactly_one_env_reference(self) -> None:
+        literal = fixtures.fake_secret("header")
+        for value in (literal, f"Bearer ${{{'X_KEY'}}}", "${A}${B}", 5):
+            with self.subTest(value=value), self.assertRaises(SinkError) as cm:
+                build([{"type": "otlp", "endpoint": "https://c.example.com", "headers": {"x-key": value}}])
+            self.assertIn("exactly ${VAR}", str(cm.exception))
+            self.assertNotIn(literal, str(cm.exception))
+
+    def test_a_header_name_must_not_be_empty_and_headers_must_be_an_object(self) -> None:
+        for headers in ({"": "${X_HB_KEY}"}, ["x"]):
+            with self.subTest(headers=headers), self.assertRaises(SinkError):
+                build([{"type": "otlp", "endpoint": "https://c.example.com", "headers": headers}])
+
+    def test_a_header_whose_variable_is_not_set_is_an_error_naming_the_variable(self) -> None:
+        with self.assertRaises(SinkError) as cm:
+            build([{"type": "otlp", "endpoint": "https://c.example.com", "headers": {"x-key": "${HB_NO_SUCH_VAR}"}}])
+        self.assertIn("HB_NO_SUCH_VAR", str(cm.exception))
+
+    def test_headers_without_an_endpoint_are_refused(self) -> None:
+        with self.assertRaises(SinkError) as cm:
+            build([{"type": "otlp", "headers": {"x-key": "${PATH}"}}])
+        self.assertIn("need an endpoint", str(cm.exception))
+
+    def test_the_timeout_must_be_a_positive_number(self) -> None:
+        for timeout in (0, -1, "10", True):
+            with self.subTest(timeout=timeout), self.assertRaises(SinkError) as cm:
+                build([{"type": "otlp", "timeout": timeout}])
+            self.assertIn("timeout", str(cm.exception))
+
+    def test_the_header_variables_are_secrets_of_the_config(self) -> None:
+        cfg = {
+            "sinks": [
+                {"type": "otlp", "headers": {"a": "${HB_ONE}", "b": "${HB_TWO}", "c": 3}},
+                "x",
+                {"type": "sqlite"},
+            ]
+        }
+        self.assertEqual(sink_secret_vars(cfg), {"HB_ONE", "HB_TWO"})
+        self.assertEqual(sink_secret_vars({"sinks": [{"type": "otlp", "headers": "x"}]}), set())
+        self.assertEqual(sink_secret_vars({}), set())
+        self.assertEqual(hb.spend_key_vars(cfg), {"HB_ONE", "HB_TWO"})
+
+
+class Recording:
+    """A sink that records its calls and can be told to fail on one of them."""
+
+    def __init__(self, fail_on: str | None = None) -> None:
+        self.calls: list[str] = []
+        self.fail_on = fail_on
+
+    def _call(self, name: str) -> None:
+        self.calls.append(name)
+        if name == self.fail_on:
+            raise OSError("disk full")
+
+    def open(self, info: RunInfo) -> None:
+        self._call("open")
+
+    def write(self, trial: TrialResult) -> None:
+        self._call("write")
+
+    def close(self, info: RunInfo) -> None:
+        self._call("close")
+
+
+class SinkFeedTests(unittest.TestCase):
+    def test_every_sink_gets_the_run_and_each_trial(self) -> None:
+        a, b = Recording(), Recording()
+        feed = SinkFeed([a, b], lambda message: self.fail(message))
+        feed.open(make_info())
+        feed.write(make_trial())
+        feed.close(make_info())
+        self.assertEqual((a.calls, b.calls, feed.failed), (["open", "write", "close"],) * 2 + (0,))
+
+    def test_a_sink_that_raises_is_reported_once_and_dropped_while_the_others_go_on(self) -> None:
+        bad, good = Recording(fail_on="write"), Recording()
+        warnings: list[str] = []
+        feed = SinkFeed([bad, good], warnings.append)
+        feed.open(make_info())
+        feed.write(make_trial(rep=1))
+        feed.write(make_trial(rep=2))
+        feed.close(make_info())
+        self.assertEqual(bad.calls, ["open", "write", "close"])  # dropped, then closed best effort
+        self.assertEqual(good.calls, ["open", "write", "write", "close"])
+        self.assertEqual(feed.failed, 1)
+        (warning,) = warnings
+        self.assertIn("Recording failed and is off for this run", warning)
+        self.assertIn("OSError: disk full", warning)
+        self.assertIn("python3 -m hbench export", warning)
+
+    def test_a_sink_that_fails_to_open_is_dropped_too(self) -> None:
+        warnings: list[str] = []
+        sink = Recording(fail_on="open")
+        feed = SinkFeed([sink], warnings.append)
+        feed.open(make_info())
+        feed.write(make_trial())
+        feed.close(make_info())
+        self.assertEqual((sink.calls, len(warnings)), (["open", "close"], 1))
+
+    def test_a_dropped_sink_is_closed_best_effort(self) -> None:
+        sink = Recording(fail_on="write")
+        feed = SinkFeed([sink], lambda message: None)
+        feed.open(make_info())
+        feed.write(make_trial())
+        self.assertEqual(sink.calls, ["open", "write", "close"])
+
+    def test_a_dropped_sink_whose_close_also_fails_stays_quiet(self) -> None:
+        class Broken(Recording):
+            def _call(self, name: str) -> None:
+                self.calls.append(name)
+                raise OSError("gone")
+
+        warnings: list[str] = []
+        sink = Broken()
+        feed = SinkFeed([sink], warnings.append)
+        feed.open(make_info())
+        self.assertEqual((sink.calls, len(warnings), feed.failed), (["open", "close"], 1, 1))
+
+    def test_a_sink_dropped_before_the_run_is_opened_is_not_closed(self) -> None:
+        sink = Recording(fail_on="write")
+        feed = SinkFeed([sink], lambda message: None)
+        feed.write(make_trial())
+        self.assertEqual(sink.calls, ["write"])
+```
+
+`tests/test_sqlite_sink.py`:
+
+```python
+"""The `sqlite` sink and the reference SQL of `docs/sql` (ADR 0011, decisions 3 and 9)."""
+
+import dataclasses
+import re
+import sqlite3
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import fixtures
+from hbench.core.models import GraderResult, TrialStatus
+from hbench.sinks.base import SinkError
+from hbench.sinks.sqlite import SCHEMA_PATH, SqliteSink
+from sink_helpers import make_info, make_trial, with_usage
+
+SCORECARD = Path(__file__).resolve().parent.parent / "docs" / "sql" / "scorecard.sql"
+
+
+def queries() -> dict[str, str]:
+    """The named queries of `scorecard.sql`: the text after each `-- name:` line up to its semicolon."""
+    found = re.findall(r"^-- name: (\w+)\n(.*?;)\n", SCORECARD.read_text(), flags=re.S | re.M)
+    return {name: "\n".join(line for line in body.splitlines() if not line.startswith("--")) for name, body in found}
+
+
+class SqliteTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = fixtures.tmpdir(self)
+        self.path = self.dir / "sub" / "bench.sqlite"
+        self.sink = SqliteSink(self.path)
+
+    def db(self) -> sqlite3.Connection:
+        con = sqlite3.connect(self.path)
+        self.addCleanup(con.close)
+        return con
+
+    def count(self, table: str) -> int:
+        return int(self.db().execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+
+
+class SqliteSinkTests(SqliteTestCase):
+    def test_open_creates_the_tables_of_the_reference_schema_and_the_run_row(self) -> None:
+        self.sink.open(make_info(finished=False))
+        names = {r[0] for r in self.db().execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        self.assertEqual(names, {"runs", "trials", "grader_results"})
+        self.assertEqual(
+            self.db().execute("SELECT run_id, finished_at, sandbox, sandboxed FROM runs").fetchall(),
+            [(make_info().run_id, None, "local-tmp", 1)],
+        )
+
+    def test_a_trial_is_one_row_with_its_graders_and_the_run_is_finished_on_close(self) -> None:
+        trial = dataclasses.replace(
+            make_trial(),
+            graders=(
+                GraderResult(grader="hidden_tests", grader_version="1", passed=True),
+                GraderResult(grader="llm_rubric", grader_version="2", passed=False, score=0.25, judge="j-1"),
+            ),
+        )
+        self.sink.open(make_info(finished=False))
+        self.sink.write(trial)
+        self.sink.close(make_info())
+        row = (
+            self.db()
+            .execute(
+                "SELECT target_id, status, passed, input_tokens, tool_calls, cost_usd, cost_source, run_tag FROM trials"
+            )
+            .fetchone()
+        )
+        self.assertEqual(row, ("claude/fix", "passed", 1, 100, 3, 0.5, "gateway", trial.trace_id))
+        self.assertEqual(
+            self.db()
+            .execute("SELECT position, grader, passed, score, judge FROM grader_results ORDER BY position")
+            .fetchall(),
+            [(0, "hidden_tests", 1, None, None), (1, "llm_rubric", 0, 0.25, "j-1")],
+        )
+        self.assertIsNotNone(self.db().execute("SELECT finished_at FROM runs").fetchone()[0])
+
+    def test_sending_a_trial_again_updates_it_and_never_duplicates_it(self) -> None:
+        trial = make_trial()
+        self.sink.open(make_info())
+        self.sink.write(trial)
+        self.sink.write(dataclasses.replace(trial, status=TrialStatus.FAILED))
+        self.sink.close(make_info())
+        self.sink = SqliteSink(self.path)  # a replay opens the same file again
+        self.sink.open(make_info())
+        self.sink.write(trial)
+        self.sink.close(make_info())
+        self.assertEqual((self.count("runs"), self.count("trials"), self.count("grader_results")), (1, 1, 1))
+        self.assertEqual(self.db().execute("SELECT status, passed FROM trials").fetchall(), [("passed", 1)])
+
+    def test_unknown_costs_tokens_and_tool_calls_stay_null(self) -> None:
+        unparsed = with_usage(make_trial(cost=None), parsed=False, input_tokens=0, output_tokens=0, tool_calls=None)
+        self.sink.open(make_info())
+        self.sink.write(unparsed)
+        self.sink.close(make_info())
+        columns = "usage_parsed, input_tokens, output_tokens, turns, tool_calls, cost_usd, cost_gateway, cost_source"
+        row = self.db().execute(f"SELECT {columns} FROM trials").fetchone()
+        self.assertEqual(row, (0, None, None, None, None, None, None, "unknown"))
+
+    def test_sql_like_text_in_a_field_is_data(self) -> None:
+        nasty = "x'); DROP TABLE trials;--"
+        self.sink.open(make_info())
+        self.sink.write(make_trial(task_id=nasty))
+        self.sink.close(make_info())
+        self.assertEqual(self.db().execute("SELECT task_id FROM trials").fetchall(), [(nasty,)])
+        self.assertEqual(self.count("grader_results"), 1)
+
+    def test_write_before_open_is_an_error(self) -> None:
+        with self.assertRaises(SinkError):
+            self.sink.write(make_trial())
+
+    def test_a_missing_schema_file_is_a_sink_error(self) -> None:
+        with mock.patch("hbench.sinks.sqlite.SCHEMA_PATH", self.dir / "none.sql"), self.assertRaises(SinkError) as cm:
+            self.sink.open(make_info())
+        self.assertIn("cannot read the schema", str(cm.exception))
+
+    def test_the_runtime_schema_is_in_the_package(self) -> None:
+        self.assertEqual(SCHEMA_PATH.parts[-3:], ("hbench", "sinks", "schema.sql"))
+
+    def test_the_reference_schema_in_the_docs_is_the_same_file(self) -> None:
+        docs = fixtures.ROOT / "docs" / "sql" / "schema.sql"
+        self.assertEqual(docs.read_text(), SCHEMA_PATH.read_text())
+
+
+class ScorecardTests(SqliteTestCase):
+    """Two targets, two tasks, two reps each. `good` always passes at $0.5 a trial; `flaky` passes `a` once and never
+    `b`, and the cost of one of its trials is unknown."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.sink.open(make_info())
+        for task in ("a", "b"):
+            for rep in (1, 2):
+                self.sink.write(make_trial(task_id=task, harness="good", rep=rep))
+        flaky = (
+            ("a", 1, TrialStatus.PASSED, 1.0),
+            ("a", 2, TrialStatus.FAILED, 1.0),
+            ("b", 1, TrialStatus.FAILED, None),
+            ("b", 2, TrialStatus.FAILED, 1.0),
+        )
+        for task, rep, status, cost in flaky:
+            self.sink.write(make_trial(task_id=task, harness="flaky", rep=rep, status=status, cost=cost))
+        self.sink.close(make_info())
+
+    def run_query(self, name: str) -> dict[str, tuple[object, ...]]:
+        rows = self.db().execute(queries()[name]).fetchall()
+        return {r[0]: tuple(r[1:]) for r in rows}
+
+    def test_every_query_of_the_file_is_found_and_runs(self) -> None:
+        self.assertEqual(set(queries()), {"pass_rate", "pass_hat_k", "cost_per_success"})
+
+    def test_pass_rate(self) -> None:
+        self.assertEqual(self.run_query("pass_rate"), {"good/fix": (4, 4, 1.0), "flaky/fix": (4, 1, 0.25)})
+
+    def test_pass_hat_k_counts_the_tasks_that_passed_on_every_rep(self) -> None:
+        self.assertEqual(self.run_query("pass_hat_k"), {"good/fix": (2, 2, 1.0), "flaky/fix": (2, 0, 0.0)})
+
+    def test_cost_per_success_is_unknown_when_any_cost_is_unknown_and_never_zero(self) -> None:
+        result = self.run_query("cost_per_success")
+        self.assertEqual(result["good/fix"], (4, 2.0, 0.5))
+        self.assertEqual(result["flaky/fix"], (1, None, None))
+
+    def test_a_target_with_an_unknown_cost_sorts_last_never_cheapest(self) -> None:
+        rows = self.db().execute(queries()["cost_per_success"]).fetchall()
+        self.assertEqual([r[0] for r in rows], ["good/fix", "flaky/fix"])
+
+    def test_cost_per_success_is_null_when_nothing_was_solved(self) -> None:
+        con = self.db()
+        con.execute("UPDATE trials SET passed = 0, cost_usd = 1.0")
+        self.assertEqual(con.execute(queries()["cost_per_success"]).fetchall()[0][1:], (0, 4.0, None))
+```
+
+`tests/test_otlp_sink.py`:
+
+```python
+"""The `otlp` sink: span ids, attributes, the trace file, the POST to a collector and its failure modes (ADR 0011)."""
+
+import dataclasses
+import json
+import os
+import threading
+import unittest
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+from unittest import mock
+
+import fake_collector
+import fixtures
+from hbench import net
+from hbench.core.ids import trial_id
+from hbench.core.models import TrialStatus
+from hbench.sinks import SinkError, sinks_for
+from hbench.sinks.feed import SinkFeed
+from hbench.sinks.otlp import TRACES_FILE, OtlpSink, run_span_id
+from sink_helpers import RUN_ID, STARTED, make_info, make_trial, with_usage
+
+TRIAL_KEYS = {
+    "eval.run_id",
+    "eval.trial_id",
+    "eval.target_id",
+    "eval.task_id",
+    "eval.rep",
+    "eval.status",
+    "eval.passed",
+    "eval.suite_version",
+    "eval.sandbox",
+    "gen_ai.request.model",
+    "gen_ai.usage.input_tokens",
+    "gen_ai.usage.output_tokens",
+    "gen_ai.usage.cache_read.input_tokens",
+    "eval.cost_usd",
+}
+
+
+def span_of(request: dict[str, Any]) -> dict[str, Any]:
+    (resource,) = request["resourceSpans"]
+    (scope,) = resource["scopeSpans"]
+    (span,) = scope["spans"]
+    assert isinstance(span, dict)
+    return span
+
+
+def attributes_of(span: dict[str, Any]) -> dict[str, Any]:
+    return {a["key"]: a["value"] for a in span["attributes"]}
+
+
+def file_requests(path: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+class OtlpTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.out = fixtures.tmpdir(self)
+        self.trace_file = self.out / RUN_ID / TRACES_FILE
+
+    def sink(self, **section: Any) -> OtlpSink:
+        (sink,) = sinks_for({"output_dir": str(self.out), "sinks": [{"type": "otlp", **section}]}, self.out)
+        assert isinstance(sink, OtlpSink)
+        return sink
+
+    def start_collector(self, mode: str = "ok") -> tuple[fake_collector.Collector, str]:
+        server, port, collector = fake_collector.serve()
+        collector.mode = mode
+        threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return collector, f"http://127.0.0.1:{port}"
+
+
+class SpanTests(OtlpTestCase):
+    def test_ids_follow_the_adr_and_a_trial_is_a_child_of_the_run_span(self) -> None:
+        sink, trial = self.sink(), make_trial()
+        sink.open(make_info())
+        sink.write(trial)
+        sink.close(make_info())
+        trial_span, run_span = (span_of(r) for r in file_requests(self.trace_file))
+        self.assertEqual(
+            (trial_span["traceId"], trial_span["spanId"], trial_span["parentSpanId"]),
+            (RUN_ID, trial.trial_id, run_span["spanId"]),
+        )
+        self.assertEqual(run_span["traceId"], RUN_ID)
+        self.assertEqual(run_span["spanId"], run_span_id(RUN_ID))
+        self.assertRegex(run_span["spanId"], r"^[0-9a-f]{16}$")
+        self.assertNotIn("parentSpanId", run_span)
+        self.assertEqual(trial.trial_id, trial_id(RUN_ID, "fizzbuzz", "claude/fix", 1))
+
+    def test_the_attributes_are_exactly_the_documented_set_with_their_types(self) -> None:
+        sink, trial = self.sink(), make_trial()
+        sink.open(make_info())
+        sink.write(trial)
+        attributes = attributes_of(span_of(file_requests(self.trace_file)[0]))
+        self.assertEqual(set(attributes), TRIAL_KEYS)
+        self.assertEqual(
+            attributes,
+            {
+                "eval.run_id": {"stringValue": RUN_ID},
+                "eval.trial_id": {"stringValue": trial.trial_id},
+                "eval.target_id": {"stringValue": "claude/fix"},
+                "eval.task_id": {"stringValue": "fizzbuzz"},
+                "eval.rep": {"intValue": "1"},
+                "eval.status": {"stringValue": "passed"},
+                "eval.passed": {"boolValue": True},
+                "eval.suite_version": {"stringValue": "demo@1"},
+                "eval.sandbox": {"stringValue": "local-tmp"},
+                "gen_ai.request.model": {"stringValue": "fix"},
+                "gen_ai.usage.input_tokens": {"intValue": "100"},
+                "gen_ai.usage.output_tokens": {"intValue": "20"},
+                "gen_ai.usage.cache_read.input_tokens": {"intValue": "40"},
+                "eval.cost_usd": {"doubleValue": 0.5},
+            },
+        )
+
+    def test_unknown_values_are_absent_never_zero(self) -> None:
+        unknown = with_usage(make_trial(cost=None), parsed=False, input_tokens=0, output_tokens=0, cache_read_tokens=0)
+        sink = self.sink()
+        sink.open(make_info())
+        sink.write(unknown)
+        sink.write(with_usage(make_trial(rep=2), cache_read_tokens=0))
+        first, second = (attributes_of(span_of(r)) for r in file_requests(self.trace_file))
+        self.assertEqual(
+            TRIAL_KEYS - set(first),
+            {
+                "gen_ai.usage.input_tokens",
+                "gen_ai.usage.output_tokens",
+                "gen_ai.usage.cache_read.input_tokens",
+                "eval.cost_usd",
+            },
+        )
+        self.assertEqual(TRIAL_KEYS - set(second), {"gen_ai.usage.cache_read.input_tokens"})
+
+    def test_only_an_error_trial_has_the_error_status(self) -> None:
+        sink = self.sink()
+        sink.open(make_info())
+        for rep, status in enumerate(TrialStatus, start=1):
+            sink.write(make_trial(rep=rep, status=status))
+        codes = {
+            attributes_of(span)["eval.status"]["stringValue"]: span["status"]["code"]
+            for span in (span_of(r) for r in file_requests(self.trace_file))
+        }
+        self.assertEqual(codes, {"passed": 0, "failed": 0, "error": 2, "timeout": 0})
+
+    def test_times_come_from_started_at_and_latency(self) -> None:
+        sink, trial = self.sink(), make_trial(rep=1, latency_s=12.5)
+        sink.open(make_info())
+        sink.write(trial)
+        span = span_of(file_requests(self.trace_file)[0])
+        self.assertEqual(int(span["startTimeUnixNano"]), int(trial.started_at.timestamp()) * 1_000_000_000)
+        self.assertEqual(int(span["endTimeUnixNano"]) - int(span["startTimeUnixNano"]), 12_500_000_000)
+
+    def test_the_run_span_runs_from_the_start_of_the_run_to_its_end(self) -> None:
+        sink = self.sink()
+        sink.open(make_info(finished=False))
+        sink.write(make_trial(rep=2, latency_s=100.0))
+        sink.close(make_info())
+        sink.close(make_info())
+        _, run_span = (span_of(r) for r in file_requests(self.trace_file))
+        self.assertEqual(int(run_span["startTimeUnixNano"]), int(STARTED.timestamp()) * 1_000_000_000)
+        end = make_info().finished_at
+        assert end is not None
+        self.assertEqual(int(run_span["endTimeUnixNano"]), int(end.timestamp()) * 1_000_000_000)
+        self.assertEqual(len(file_requests(self.trace_file)), 2)  # the second close did not add a second run span
+
+    def test_closing_an_unfinished_run_writes_no_run_span_and_a_later_finished_close_writes_it_once(self) -> None:
+        collector, url = self.start_collector()
+        sink = self.sink(endpoint=url)
+        sink.open(make_info(finished=False))
+        sink.write(make_trial())
+        sink.close(make_info(finished=False))  # Ctrl-C, an error, or a dropped sink
+        self.assertEqual(len(file_requests(self.trace_file)), 1)
+        self.assertEqual(len(collector.requests), 1)
+        later = self.sink(endpoint=url)  # resume or export
+        later.open(make_info(finished=False))
+        later.close(make_info())
+        self.assertEqual(
+            sorted(span_of(r)["spanId"] for r in file_requests(self.trace_file)),
+            sorted([make_trial().trial_id, run_span_id(RUN_ID)]),
+        )
+        self.assertEqual(len(collector.requests), 2)
+
+    def test_no_span_holds_the_agent_output_or_a_grader_log_line(self) -> None:
+        canary_out, canary_log = "AGENT-STDOUT-CANARY", "GRADER-LOG-CANARY"
+        trial = dataclasses.replace(make_trial(), artifact_uri=f"logs/{canary_out}")  # references only, never content
+        sink = self.sink()
+        sink.open(make_info())
+        sink.write(trial)
+        sink.close(make_info())
+        text = self.trace_file.read_text()
+        self.assertTrue(canary_out not in text and canary_log not in text and "artifact" not in text)
+        span_keys = {"traceId", "spanId", "parentSpanId", "name", "kind", "startTimeUnixNano", "endTimeUnixNano"}
+        for request in file_requests(self.trace_file):
+            self.assertLessEqual(set(span_of(request)), span_keys | {"attributes", "status"})
+
+    def test_the_file_has_one_request_per_line(self) -> None:
+        sink = self.sink()
+        sink.open(make_info())
+        for rep in (1, 2, 3):
+            sink.write(make_trial(rep=rep))
+        sink.close(make_info())
+        lines = self.trace_file.read_text().splitlines()
+        self.assertEqual(len(lines), 4)
+        self.assertTrue(all(len(json.loads(line)["resourceSpans"]) == 1 for line in lines))
+
+
+class ReplayTests(OtlpTestCase):
+    def test_a_replay_leaves_each_span_id_once_in_the_file(self) -> None:
+        trials = [make_trial(rep=rep) for rep in (1, 2)]
+        for _ in range(2):
+            sink = self.sink()
+            sink.open(make_info())
+            for trial in trials:
+                sink.write(trial)
+            sink.close(make_info())
+        ids = [span_of(r)["spanId"] for r in file_requests(self.trace_file)]
+        self.assertEqual(sorted(ids), sorted([t.trial_id for t in trials] + [run_span_id(RUN_ID)]))
+
+    def test_a_resumed_run_adds_only_the_new_trials(self) -> None:
+        first = self.sink()
+        first.open(make_info(finished=False))
+        first.write(make_trial(rep=1))  # the run was killed here: no close
+        second = self.sink()
+        second.open(make_info(finished=False))
+        second.write(make_trial(rep=2))
+        second.close(make_info())
+        self.assertEqual(len(file_requests(self.trace_file)), 3)
+
+    def test_a_last_line_cut_short_by_a_crash_is_not_a_span_and_the_next_line_starts_on_its_own(self) -> None:
+        self.trace_file.parent.mkdir()
+        self.trace_file.write_text('{"resourceSpans": [{"scopeSp')
+        sink = self.sink()
+        sink.open(make_info())
+        sink.write(make_trial())
+        lines = self.trace_file.read_text().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(span_of(json.loads(lines[1]))["spanId"], make_trial().trial_id)
+
+    def test_lines_that_are_not_requests_hold_no_span_ids(self) -> None:
+        self.trace_file.parent.mkdir()
+        self.trace_file.write_text(
+            "[1]\n{}\n" + json.dumps({"resourceSpans": [{"scopeSpans": [{"spans": [{"x": 1}]}]}]}) + "\n"
+        )
+        sink = self.sink()
+        sink.open(make_info())
+        sink.write(make_trial())
+        self.assertEqual(len(self.trace_file.read_text().splitlines()), 4)
+
+    def test_nested_entries_of_the_wrong_type_hold_no_span_ids(self) -> None:
+        shapes: list[object] = [
+            {"resourceSpans": [1]},
+            {"resourceSpans": "abc"},
+            {"resourceSpans": [{"scopeSpans": [2]}]},
+            {"resourceSpans": [{"scopeSpans": "abc"}]},
+            {"resourceSpans": [{"scopeSpans": [{"spans": [3]}]}]},
+            {"resourceSpans": [{"scopeSpans": [{"spans": "abc"}]}]},
+        ]
+        self.trace_file.parent.mkdir()
+        self.trace_file.write_text("".join(json.dumps(shape) + "\n" for shape in shapes))
+        sink = self.sink()
+        sink.open(make_info())
+        sink.write(make_trial())
+        self.assertEqual(len(self.trace_file.read_text().splitlines()), len(shapes) + 1)
+
+    def test_write_before_open_is_an_error(self) -> None:
+        with self.assertRaises(SinkError):
+            self.sink().write(make_trial())
+
+    def test_close_before_open_is_an_error(self) -> None:
+        with self.assertRaises(SinkError):
+            self.sink().close(make_info())
+
+
+class CollectorTests(OtlpTestCase):
+    def test_every_span_is_posted_to_v1_traces_with_the_json_content_type_and_the_headers(self) -> None:
+        secret = fixtures.fake_secret("otlp")
+        collector, url = self.start_collector()
+        with mock.patch.dict(os.environ, {"HB_OTLP_KEY": secret}):
+            sink = self.sink(endpoint=url + "/", headers={"x-key": "${HB_OTLP_KEY}"})
+        trial = make_trial()
+        sink.open(make_info())
+        sink.write(trial)
+        sink.close(make_info())
+        self.assertEqual([r.path for r in collector.requests], ["/v1/traces"] * 2)
+        self.assertEqual(collector.span_ids(), [trial.trial_id, run_span_id(RUN_ID)])
+        first = collector.requests[0]
+        self.assertEqual((first.headers["content-type"], first.headers["x-key"]), ("application/json", secret))
+        self.assertNotIn(secret, self.trace_file.read_text())
+
+    def test_a_replay_posts_again_but_the_file_keeps_each_span_once(self) -> None:
+        collector, url = self.start_collector()
+        for _ in range(2):
+            sink = self.sink(endpoint=url)
+            sink.open(make_info())
+            sink.write(make_trial())
+            sink.close(make_info())
+        self.assertEqual(len(collector.span_ids()), 4)
+        self.assertEqual(len(file_requests(self.trace_file)), 2)
+
+    def test_a_collector_that_fails_raises_a_sink_error_with_no_header_in_it(self) -> None:
+        secret = fixtures.fake_secret("otlp")
+        collector, url = self.start_collector("http500")
+        with mock.patch.dict(os.environ, {"HB_OTLP_KEY": secret}):
+            sink = self.sink(endpoint=url, headers={"x-key": "${HB_OTLP_KEY}"})
+        sink.open(make_info())
+        with self.assertRaises(SinkError) as cm:
+            sink.write(make_trial())
+        self.assertEqual(str(cm.exception), "the collector answered HTTP 500")
+        self.assertEqual(len(file_requests(self.trace_file)), 1)  # the file is written first
+        self.assertEqual(len(collector.requests), 1)
+
+    def test_a_redirect_is_not_followed(self) -> None:
+        elsewhere, elsewhere_url = self.start_collector()
+        collector, url = self.start_collector("redirect")
+        collector.redirect_url = elsewhere_url + "/v1/traces"
+        sink = self.sink(endpoint=url)
+        sink.open(make_info())
+        with self.assertRaises(SinkError) as cm:
+            sink.write(make_trial())
+        self.assertIn("HTTP 302", str(cm.exception))
+        self.assertEqual(elsewhere.requests, [])
+
+    def test_a_collector_that_answers_too_slowly_times_out(self) -> None:
+        _, url = self.start_collector("slow")
+        sink = self.sink(endpoint=url, timeout=0.3)
+        sink.open(make_info())
+        with self.assertRaises(SinkError) as cm:
+            sink.write(make_trial())
+        self.assertIn("took too long", str(cm.exception))
+
+    def test_a_collector_that_drips_its_reply_hits_the_total_deadline(self) -> None:
+        _, url = self.start_collector("drip")
+        sink = self.sink(endpoint=url, timeout=0.06)
+        sink.open(make_info())
+        with self.assertRaises(SinkError) as cm:
+            sink.write(make_trial())
+        self.assertIn("took too long", str(cm.exception))
+
+    def test_a_reply_above_the_cap_is_refused(self) -> None:
+        _, url = self.start_collector("big")
+        sink = self.sink(endpoint=url)
+        sink.open(make_info())
+        with self.assertRaises(SinkError) as cm:
+            sink.write(make_trial())
+        self.assertIn("too large", str(cm.exception))
+
+    def test_a_connection_that_fails_names_only_the_error_type(self) -> None:
+        sink = self.sink(endpoint="http://127.0.0.1:1")
+        sink.open(make_info())
+        with self.assertRaises(SinkError) as cm:
+            sink.write(make_trial())
+        self.assertEqual(str(cm.exception), "the collector exchange failed: URLError")
+
+    def test_after_a_failed_post_close_writes_the_run_span_to_the_file_and_sends_nothing(self) -> None:
+        collector, url = self.start_collector("http500")
+        sink = self.sink(endpoint=url)
+        sink.open(make_info())
+        with self.assertRaises(SinkError):
+            sink.write(make_trial())
+        sink.close(make_info())
+        self.assertEqual(len(collector.requests), 1)
+        self.assertEqual(len(file_requests(self.trace_file)), 2)
+
+    def test_the_feed_warns_once_and_the_warning_holds_no_secret(self) -> None:
+        secret = fixtures.fake_secret("otlp")
+        collector, url = self.start_collector("http500")
+        with mock.patch.dict(os.environ, {"HB_OTLP_KEY": secret}):
+            sink = self.sink(endpoint=url, headers={"x-key": "${HB_OTLP_KEY}"})
+        warnings: list[str] = []
+        feed = SinkFeed([sink], warnings.append)
+        feed.open(make_info())
+        feed.write(make_trial(rep=1))
+        feed.write(make_trial(rep=2))
+        feed.close(make_info())
+        self.assertEqual((len(warnings), len(collector.requests), feed.failed), (1, 1, 1))
+        self.assertNotIn(secret, warnings[0])
+        self.assertEqual(len(file_requests(self.trace_file)), 2)  # trial + close run span
+
+
+class NetTests(unittest.TestCase):
+    def test_the_url_rule(self) -> None:
+        self.assertEqual(
+            [
+                net.url_allowed(u)
+                for u in ("https://a.example", "http://localhost:1", "http://[::1]:1", "http://a.example", "file:///x")
+            ],
+            [True, True, True, False, False],
+        )
+
+    def test_post_bounded_refuses_a_url_that_breaks_the_rule(self) -> None:
+        with self.assertRaises(ValueError):
+            net.post_bounded("http://a.example/v1/traces", {}, b"{}", 1)
+
+    def test_a_reply_that_is_read_after_the_caller_gave_up_stops_the_read(self) -> None:
+        server, port, collector = fake_collector.serve()
+        collector.mode = "drip"
+        threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        request = urllib.request.Request(f"http://127.0.0.1:{port}/v1/traces", data=b"{}", method="POST")
+        abandoned = threading.Event()
+        abandoned.set()
+        with self.assertRaises(TimeoutError):
+            net._exchange(request, 5, abandoned)
+
+    def test_an_http_error_status_is_raised_as_it_is(self) -> None:
+        server, port, collector = fake_collector.serve()
+        collector.mode = "http500"
+        threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        with self.assertRaises(urllib.error.HTTPError):
+            net.post_bounded(f"http://127.0.0.1:{port}/v1/traces", {}, b"{}", 5)
+```
+
+`tests/test_sink_run.py`:
+
+```python
+"""Sinks in a real run and `export` (ADR 0011, decisions 5 and 8): a failing sink never changes a result, the same
+`trial_id` joins `trials.jsonl`, SQLite and the spans, and a replay adds nothing twice."""
+
+import contextlib
+import json
+import os
+import re
+import shutil
+import sqlite3
+import threading
+from pathlib import Path
+from typing import Any
+from unittest import mock
+
+import fake_collector
+import fixtures
+import harness_bench as hb
+from hbench import cli
+from hbench.core.models import TrialResult
+from hbench.sinks.otlp import TRACES_FILE, run_span_id
+from test_run import RunTestCase, args, rows_of
+from test_sinks import Recording
+
+VOLATILE = {"ts", "wall_s", "t_start", "t_end", "run_tag"}
+
+
+class SinkRunTestCase(RunTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.probe = self.base / "probe.jsonl"
+        self.cfg = fixtures.fake_config(
+            {"FAKE_TAGS_FILE": str(self.base / "tags.txt"), "FAKE_PROBE_FILE": str(self.probe)}
+        )
+        self.cfg["matrix"] = [{"harness": "claude", "model": "fix"}, {"harness": "pi", "model": "p/nofix"}]
+
+    def start_collector(self, mode: str = "ok") -> tuple[fake_collector.Collector, str]:
+        server, port, collector = fake_collector.serve()
+        collector.mode = mode
+        threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return collector, f"http://127.0.0.1:{port}"
+
+    def run_dir(self, base: Path | None = None) -> Path:
+        (path,) = ((base or self.base) / "results").glob("*/run.json")
+        return path.parent
+
+    def trials(self, base: Path | None = None) -> list[TrialResult]:
+        lines = (self.run_dir(base) / "trials.jsonl").read_text().splitlines()
+        return [TrialResult.from_dict(json.loads(line)) for line in lines]
+
+    def sqlite_trial_ids(self, path: Path) -> list[str]:
+        con = sqlite3.connect(path)
+        with contextlib.closing(con):
+            return [r[0] for r in con.execute("SELECT trial_id FROM trials ORDER BY trial_id")]
+
+
+def outcome(base: Path) -> dict[str, Any]:
+    """What a run produced, without its ids and clocks: results rows, trial statuses and graders, the report."""
+    rows = [{k: v for k, v in r.items() if k not in VOLATILE} for r in rows_of(base)]
+    (run_json,) = (base / "results").glob("*/trials.jsonl")
+    trials = [json.loads(line) for line in run_json.read_text().splitlines()]
+    shape = [
+        (t["task_id"], t["status"], t["rep"], [g["passed"] for g in t["graders"]], t["usage"]["input_tokens"])
+        for t in trials
+    ]
+    report = (base / "results" / "summary.md").read_text()
+    report = re.sub(r"^(# Harness x model — )\d{4}-\d{2}-\d{2} \d{2}:\d{2}", r"\1<masked>", report)  # minute clock
+    return {"rows": rows, "trials": shape, "report": report}
+
+
+class WithoutSinksTests(SinkRunTestCase):
+    def test_a_run_without_sinks_writes_no_sink_file(self) -> None:
+        fixtures.call_quiet(hb.cmd_run, args(only=["claude"]), self.cfg, self.base)
+        self.assertEqual([p.name for p in self.run_dir().iterdir()], ["run.json", "trials.jsonl"])
+
+    def test_the_agent_gets_the_run_and_trial_ids_and_still_not_the_spend_key(self) -> None:
+        self.cfg["litellm"] = {"base_url": "http://127.0.0.1:1", "api_key": "${HB_SPEND_KEY}"}
+        with mock.patch.dict(os.environ, {"HB_SPEND_KEY": fixtures.fake_secret("spend")}):
+            fixtures.call_quiet(hb.cmd_run, args(only=["claude"]), self.cfg, self.base)
+        (probe,) = [json.loads(line) for line in self.probe.read_text().splitlines()]
+        (trial,) = self.trials()
+        self.assertEqual((probe["bench_run_id"], probe["bench_trial_id"]), (trial.run_id, trial.trial_id))
+        self.assertEqual([r["agent_rc"] for r in rows_of(self.base)], [0])  # the fake agent exits 9 on a leaked key
+
+
+class BothSinksTests(SinkRunTestCase):
+    """The acceptance: one `trial_id` in `trials.jsonl`, in SQLite and in the spans."""
+
+    def configure(self, collector_url: str) -> None:
+        self.cfg["sinks"] = [
+            {"type": "sqlite", "path": "out/bench.sqlite"},
+            {"type": "otlp", "endpoint": collector_url},
+        ]
+
+    def test_the_trial_id_joins_the_jsonl_the_database_and_the_spans(self) -> None:
+        collector, url = self.start_collector()
+        self.configure(url)
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        run_dir = self.run_dir()
+        ids = sorted(t.trial_id for t in self.trials())
+        self.assertEqual(len(ids), 2)
+        self.assertEqual(self.sqlite_trial_ids(self.base / "out" / "bench.sqlite"), ids)
+        spans = [
+            json.loads(line)["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+            for line in (run_dir / TRACES_FILE).read_text().splitlines()
+        ]
+        run_id = self.trials()[0].run_id
+        self.assertEqual(sorted(s["spanId"] for s in spans if s["spanId"] != run_span_id(run_id)), ids)
+        self.assertEqual({s["traceId"] for s in spans}, {run_id})
+        self.assertEqual(sorted(collector.span_ids()), sorted(ids + [run_span_id(run_id)]))
+        con = sqlite3.connect(self.base / "out" / "bench.sqlite")
+        with contextlib.closing(con):
+            self.assertIsNotNone(con.execute("SELECT finished_at FROM runs").fetchone()[0])
+
+    def test_the_run_tag_stays_in_trace_id_so_reconcile_still_matches(self) -> None:
+        _, url = self.start_collector()
+        self.configure(url)
+        fixtures.call_quiet(hb.cmd_run, args(only=["claude"]), self.cfg, self.base)
+        (trial,) = self.trials()
+        (row,) = rows_of(self.base)
+        self.assertEqual(trial.trace_id, row["run_tag"])
+
+
+class InterruptedRunTests(SinkRunTestCase):
+    def test_the_sinks_are_closed_when_a_trial_raises(self) -> None:
+        sink = Recording()
+        with (
+            mock.patch.object(hb, "make_sinks", return_value=[sink]),
+            mock.patch.object(hb, "_run_trial", side_effect=KeyboardInterrupt),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            fixtures.call_quiet(hb.cmd_run, args(only=["claude"]), self.cfg, self.base)
+        self.assertEqual(sink.calls, ["open", "close"])
+
+
+class FailingSinkTests(SinkRunTestCase):
+    """A sink that cannot work changes nothing: same results, same report, one warning."""
+
+    def baseline(self) -> dict[str, Any]:
+        base = fixtures.tmpdir(self)
+        shutil.copytree(fixtures.FIZZBUZZ, base / "tasks" / "fizzbuzz")
+        fixtures.call_quiet(hb.cmd_run, args(no_report=False), dict(self.cfg), base)
+        return outcome(base)
+
+    def run_with(self, sinks: list[dict[str, Any]]) -> tuple[dict[str, Any], str]:
+        err = fixtures.tmpdir(self) / "stderr.txt"
+        with err.open("w") as f, contextlib.redirect_stderr(f):
+            fixtures.call_quiet(hb.cmd_run, args(no_report=False), dict(self.cfg, sinks=sinks), self.base)
+        return outcome(self.base), err.read_text()
+
+    def test_a_collector_that_answers_500_leaves_the_results_as_they_are(self) -> None:
+        collector, url = self.start_collector("http500")
+        got, warnings = self.run_with([{"type": "otlp", "endpoint": url}])
+        self.assertEqual(got, self.baseline())
+        self.assertEqual(warnings.count("warning: sink OtlpSink failed"), 1)
+        self.assertEqual(len(collector.requests), 1)  # dropped after the first failure
+
+    def test_a_redirect_is_not_followed_and_changes_nothing(self) -> None:
+        elsewhere, elsewhere_url = self.start_collector()
+        collector, url = self.start_collector("redirect")
+        collector.redirect_url = elsewhere_url + "/v1/traces"
+        got, warnings = self.run_with([{"type": "otlp", "endpoint": url}])
+        self.assertEqual(got, self.baseline())
+        self.assertEqual((warnings.count("warning: sink"), elsewhere.requests), (1, []))
+
+    def test_a_collector_that_times_out_leaves_the_results_as_they_are(self) -> None:
+        _, url = self.start_collector("slow")
+        got, warnings = self.run_with([{"type": "otlp", "endpoint": url, "timeout": 0.2}])
+        self.assertEqual(got, self.baseline())
+        self.assertIn("took too long", warnings)
+
+    def test_a_database_that_cannot_be_opened_is_one_warning(self) -> None:
+        (self.base / "bench.sqlite").mkdir()  # a directory where the file should be
+        got, warnings = self.run_with([{"type": "sqlite", "path": "bench.sqlite"}])
+        self.assertEqual(got, self.baseline())
+        self.assertEqual(warnings.count("warning: sink SqliteSink failed"), 1)
+
+    def test_a_sink_that_fails_does_not_stop_the_sink_after_it(self) -> None:
+        (self.base / "bad.sqlite").mkdir()
+        got, warnings = self.run_with(
+            [{"type": "sqlite", "path": "bad.sqlite"}, {"type": "sqlite", "path": "good.sqlite"}]
+        )
+        self.assertEqual(got, self.baseline())
+        self.assertEqual(len(self.sqlite_trial_ids(self.base / "good.sqlite")), 2)
+        self.assertEqual(warnings.count("warning: sink"), 1)
+
+    def test_the_warning_redacts_a_header_secret(self) -> None:
+        secret = fixtures.fake_secret("otlp")
+        _, url = self.start_collector("http500")
+        with mock.patch.dict(os.environ, {"HB_OTLP_KEY": secret}):
+            _, warnings = self.run_with([{"type": "otlp", "endpoint": url, "headers": {"x-key": "${HB_OTLP_KEY}"}}])
+        self.assertTrue(warnings and secret not in warnings)
+
+    def test_a_header_secret_is_never_passed_to_the_agent(self) -> None:
+        secret = fixtures.fake_secret("otlp")
+        _, url = self.start_collector()
+        self.cfg["env_passthrough"] = ["HB_OTLP_KEY"]
+        self.cfg["sinks"] = [{"type": "otlp", "endpoint": url, "headers": {"x-key": "${HB_OTLP_KEY}"}}]
+        with mock.patch.dict(os.environ, {"HB_OTLP_KEY": secret}), self.assertRaises(SystemExit) as cm:
+            fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        self.assertIn("must not be passed to agents", str(cm.exception.code))
+
+    def test_an_invalid_sink_entry_exits_before_any_agent_runs(self) -> None:
+        self.cfg["sinks"] = [{"type": "sqlite"}]
+        with self.assertRaises(SystemExit) as cm:
+            fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        self.assertIn("sinks: sinks[0]:", str(cm.exception.code))
+        self.assertFalse((self.base / "results" / "results.jsonl").exists())
+
+
+class ResumeAndExportTests(SinkRunTestCase):
+    def test_resume_does_not_send_a_finished_trial_again(self) -> None:
+        collector, url = self.start_collector()
+        self.cfg["sinks"] = [{"type": "sqlite", "path": "bench.sqlite"}, {"type": "otlp", "endpoint": url}]
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        run_id = self.trials()[0].run_id
+        before = len(collector.requests)
+        fixtures.call_quiet(hb.cmd_run, args(resume=run_id), self.cfg, self.base)
+        self.assertEqual(len(collector.requests) - before, 1)  # only the run span, again
+        spans = (self.run_dir() / TRACES_FILE).read_text().splitlines()
+        self.assertEqual(len(spans), 3)
+        self.assertEqual(len(self.sqlite_trial_ids(self.base / "bench.sqlite")), 2)
+
+    def export(self, *extra: str) -> str:
+        argv = ["export", "--config", str(self.base / "config.json"), "--run", str(self.run_dir()), *extra]
+        with fixtures.quiet() as out:
+            cli.main(argv)
+        return out.getvalue()
+
+    def write_config(self, sinks: list[dict[str, Any]]) -> None:
+        (self.base / "config.json").write_text(json.dumps(dict(self.cfg, sinks=sinks)))
+
+    def test_export_replays_a_run_into_the_sinks_and_twice_adds_nothing(self) -> None:
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)  # a run without sinks
+        _, url = self.start_collector()
+        self.write_config([{"type": "sqlite", "path": "late.sqlite"}, {"type": "otlp", "endpoint": url}])
+        first = self.export()
+        self.assertIn("exported 2 trial(s)", first)
+        self.assertIn("to 2 of 2 sink(s)", first)
+        self.export()
+        ids = sorted(t.trial_id for t in self.trials())
+        self.assertEqual(self.sqlite_trial_ids(self.base / "late.sqlite"), ids)
+        spans = [
+            json.loads(x)["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["spanId"]
+            for x in (self.run_dir() / TRACES_FILE).read_text().splitlines()
+        ]
+        self.assertEqual(sorted(spans), sorted([*ids, run_span_id(self.trials()[0].run_id)]))
+
+    def test_export_of_an_interrupted_run_replays_what_it_has(self) -> None:
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        run_dir = self.run_dir()
+        lines = (run_dir / "trials.jsonl").read_text().splitlines()
+        (run_dir / "trials.jsonl").write_text(lines[0] + "\n" + lines[1][:30])  # the second write was cut short
+        self.write_config([{"type": "sqlite", "path": "late.sqlite"}])
+        self.assertIn("exported 1 trial(s)", self.export())
+        self.assertEqual(len(self.sqlite_trial_ids(self.base / "late.sqlite")), 1)
+
+    def test_export_exits_1_when_a_sink_fails_and_warns_without_the_secret(self) -> None:
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        secret = fixtures.fake_secret("otlp")
+        _, url = self.start_collector("http500")
+        self.write_config([{"type": "otlp", "endpoint": url, "headers": {"x-key": "${HB_OTLP_KEY}"}}])
+        err = fixtures.tmpdir(self) / "stderr.txt"
+        with mock.patch.dict(os.environ, {"HB_OTLP_KEY": secret}), err.open("w") as f, contextlib.redirect_stderr(f):
+            with self.assertRaises(SystemExit) as cm:
+                self.export()
+        self.assertEqual(cm.exception.code, 1)
+        self.assertTrue("warning: sink OtlpSink failed" in err.read_text() and secret not in err.read_text())
+
+    def test_export_reports_an_unreadable_or_invalid_config_without_a_traceback(self) -> None:
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        bad = self.base / "bad.json"
+        bad.write_text("{not json")
+        for config, text in ((self.base / "nowhere.json", "export: "), (bad, "export: ")):
+            with self.subTest(config=config.name), self.assertRaises(SystemExit) as cm:
+                cli.main(["export", "--config", str(config), "--run", str(self.run_dir())])
+            self.assertTrue(str(cm.exception.code).startswith(text))
+            self.assertIn(config.name, str(cm.exception.code))
+
+    def test_export_refuses_what_it_cannot_replay(self) -> None:
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        self.write_config([])
+        with self.assertRaises(SystemExit) as cm:
+            self.export()
+        self.assertIn("the config has no sinks", str(cm.exception.code))
+        self.write_config([{"type": "sqlite", "path": "late.sqlite"}])
+        elsewhere = fixtures.tmpdir(self) / "not-the-run-id"
+        shutil.copytree(self.run_dir(), elsewhere)
+        for run, text in (
+            (elsewhere, "is not the directory of run"),
+            (self.base / "nowhere", "is not a run directory"),
+        ):
+            with self.subTest(run=run), self.assertRaises(SystemExit) as cm:
+                cli.main(["export", "--config", str(self.base / "config.json"), "--run", str(run)])
+            self.assertIn(text, str(cm.exception.code))
+        (self.run_dir() / "run.json").write_text("{}")
+        with self.assertRaises(SystemExit) as cm:
+            self.export()
+        self.assertIn("is not valid run data", str(cm.exception.code))
+```
+
+`tests/test_dashboard.py`:
+
+```python
+"""The example dashboard and its synthetic data (ADR 0011, decision 10): the JSON loads, every panel runs the
+scorecard query on the synthetic database, and the database is the same on every run."""
+
+import contextlib
+import io
+import json
+import re
+import sqlite3
+import unittest
+
+import fixtures
+from scripts import synthetic_db
+from test_sqlite_sink import queries
+
+DASHBOARD = fixtures.ROOT / "docs" / "dashboards" / "grafana-scorecard.json"
+
+
+def squash(sql: str) -> str:
+    return re.sub(r"\s+", " ", sql).strip()
+
+
+class DashboardTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.path = fixtures.tmpdir(self) / "synthetic.sqlite"
+        synthetic_db.write_database(self.path)
+        self.db = sqlite3.connect(self.path)
+        self.addCleanup(self.db.close)
+        self.dashboard = json.loads(DASHBOARD.read_text())
+
+    def test_the_dashboard_loads_and_has_panels_with_one_query_each(self) -> None:
+        panels = self.dashboard["panels"]
+        self.assertGreaterEqual(len(panels), 3)
+        self.assertTrue(all(len(p["targets"]) == 1 for p in panels))
+
+    def test_every_panel_runs_a_scorecard_query_on_the_synthetic_database(self) -> None:
+        scorecard = {squash(q) for q in queries().values()}
+        for panel in self.dashboard["panels"]:
+            sql = panel["targets"][0]["queryText"]
+            with self.subTest(panel=panel["title"]):
+                self.assertIn(squash(sql), scorecard)
+                self.assertEqual(sql, panel["targets"][0]["rawQueryText"])
+                self.assertEqual(len(self.db.execute(sql).fetchall()), len(synthetic_db.TARGETS))
+
+    def test_every_scorecard_query_is_on_the_dashboard(self) -> None:
+        on_dashboard = {squash(p["targets"][0]["queryText"]) for p in self.dashboard["panels"]}
+        self.assertEqual({squash(q) for q in queries().values()}, on_dashboard)
+
+    def test_the_target_without_a_cost_is_unknown_not_zero(self) -> None:
+        rows = {r[0]: r for r in self.db.execute(queries()["cost_per_success"])}
+        self.assertIsNone(rows["cursor/small"][3])
+        self.assertGreater(rows["claude/large"][3], 0)
+        self.assertEqual(
+            self.db.execute(
+                "SELECT COUNT(*) FROM trials WHERE target_id = 'cursor/small' AND cost_usd IS NULL"
+            ).fetchone(),
+            (len(synthetic_db.TASKS) * synthetic_db.REPS,),
+        )
+
+    def test_the_unknown_cost_target_is_ranked_last(self) -> None:
+        rows = self.db.execute(queries()["cost_per_success"]).fetchall()
+        self.assertEqual(rows[-1][0], "cursor/small")
+
+    def test_the_same_seed_writes_the_same_rows_and_a_rewrite_adds_none(self) -> None:
+        other = fixtures.tmpdir(self) / "other.sqlite"
+        synthetic_db.write_database(other)
+        again = sqlite3.connect(other)
+        self.addCleanup(again.close)
+        query = "SELECT * FROM trials ORDER BY trial_id"
+        self.assertEqual(self.db.execute(query).fetchall(), again.execute(query).fetchall())
+        self.assertEqual(synthetic_db.write_database(other), len(synthetic_db.TARGETS) * 18)
+        self.assertEqual(again.execute("SELECT COUNT(*) FROM trials").fetchone(), (54,))
+
+    def test_a_different_seed_changes_the_outcomes(self) -> None:
+        other = fixtures.tmpdir(self) / "other.sqlite"
+        synthetic_db.write_database(other, seed=8)
+        again = sqlite3.connect(other)
+        self.addCleanup(again.close)
+        query = "SELECT passed FROM trials ORDER BY trial_id"
+        self.assertNotEqual(self.db.execute(query).fetchall(), again.execute(query).fetchall())
+
+    def test_main_writes_the_database_and_checks_its_arguments(self) -> None:
+        out = fixtures.tmpdir(self) / "main.sqlite"
+        with fixtures.quiet() as printed:
+            self.assertEqual(synthetic_db.main(["synthetic_db", str(out)]), 0)
+        self.assertIn("wrote 54 synthetic trials", printed.getvalue())
+        self.assertTrue(out.exists())
+        with contextlib.redirect_stderr(io.StringIO()) as usage:
+            self.assertEqual(synthetic_db.main(["synthetic_db"]), 2)
+        self.assertIn("usage:", usage.getvalue())
 ```
 
 ## Sandbox

@@ -121,7 +121,7 @@ graders never open a socket, they receive a `judge` through `GradeContext`.
 | `hbench/judge.py` | `Rubric`, `JudgeVerdict`, the `Judge` protocol and `GatewayJudge`, which builds the chat request (fixed system prompt, random delimiters, redaction, size limit) and validates the reply. It takes the engine's `post`, so it opens no socket. |
 | `hbench/calibration.py` | `calibrate`, `cohens_kappa`, labels and calibration files, `calibration_status` (calibrated or the reason it is experimental). |
 | `hbench/core/schema.py` `check_schema` | Checks that a schema uses only the keywords `validate` supports (a config error otherwise). |
-| `harness_bench.py` | `judge_post` (the only `POST`: `check_litellm_url`, `_NoRedirect`, reply size limit), `make_judge` (secret redaction, then the `harness_bench.redactors` plugin), `grader_logger` (redacted grader logs), `validate_judge`. |
+| `harness_bench.py` | `judge_post` (the judge `POST`: `check_litellm_url`, `NoRedirect` from `hbench/net.py`, reply size limit), `make_judge` (secret redaction, then the `harness_bench.redactors` plugin), `grader_logger` (redacted grader logs), `validate_judge`. |
 
 `report.py` adds `## Judges` from the trials in `trials.jsonl` and the calibration file named by `judge.calibration`.
 Plan: [`superpowers/plans/2026-11-24-phase-5-artifact-graders.md`](superpowers/plans/2026-11-24-phase-5-artifact-graders.md).
@@ -145,3 +145,23 @@ apply to every sandbox the same way.
 Order of the two result files for a trial: `trials.jsonl` first (flushed to disk), then the legacy row of `results.jsonl`;
 resume rewrites the legacy row of a trial that has none (`row_from_trial`). Contract 1.3.0 adds `RunInfo.sandbox`.
 Plan: [`superpowers/plans/2026-11-24-phase-6-sandbox-resume.md`](superpowers/plans/2026-11-24-phase-6-sandbox-resume.md).
+
+## Phase 7: sinks and telemetry
+
+Decisions: [ADR 0011](adr/0011-sinks-and-telemetry.md). `trials.jsonl` stays the source of truth and is written first;
+a sink only receives the contract objects, so it cannot leak content, and a sink that fails never changes a result.
+
+| Module | Role |
+|---|---|
+| `hbench/sinks/base.py` | The `Sink` protocol (`open`, `write`, `close`) and `SinkError`. |
+| `hbench/sinks/__init__.py` | `sinks_for(cfg, base)`: the built-in type of each `sinks` entry, else a plugin of `harness_bench.sinks`; `sink_secret_vars` (the `${VAR}` of the `otlp` headers, secrets that never reach an agent). |
+| `hbench/sinks/sqlite.py` | `SqliteSink`: tables from `docs/sql/schema.sql`, parameterized upserts by `run_id` and `trial_id`; unknown values are NULL. |
+| `hbench/sinks/otlp.py` | `OtlpSink`: OTLP/JSON spans (trace id = `run_id`, run span id from `sha256("run:" + run_id)`, trial span id = `trial_id`) in `<run_dir>/traces.otlp.jsonl`, each span id once, and a `POST <endpoint>/v1/traces` when `endpoint` is set. |
+| `hbench/sinks/feed.py` | `SinkFeed`: sends the run and each trial to every sink; a sink that raises is warned about once and dropped for the run. |
+| `hbench/net.py` | The URL rule (`url_allowed`), `NoRedirect` and `post_bounded` (total deadline, 1 MB reply cap). |
+| `hbench/results.py` | `read_run`: a run as it is on disk, without changing a file (what `export` replays). |
+| `harness_bench.py` | `make_sinks`; `_run_matrix` opens the sinks after `run.json` and closes them after `writer.close`; `_run_trial` writes the trial to them after the `trials.jsonl` append and exports `BENCH_RUN_ID` and `BENCH_TRIAL_ID` to the agent. |
+| `docs/sql/`, `docs/dashboards/`, `scripts/synthetic_db.py` | Reference schema and scorecard queries, an example Grafana dashboard and a seeded synthetic database to try it. |
+
+`TrialResult.trace_id` keeps the run tag: `reconcile` matches the spend logs by it. The OTLP trace id is the `run_id`.
+Plan: [`superpowers/plans/2026-11-24-phase-7-sinks-telemetry.md`](superpowers/plans/2026-11-24-phase-7-sinks-telemetry.md).

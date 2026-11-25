@@ -32,9 +32,8 @@ import urllib.request
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from email.message import Message
 from pathlib import Path
-from typing import IO, Any
+from typing import Any
 
 if sys.version_info < (3, 12):
     sys.exit("Python 3.12+ required")
@@ -52,8 +51,12 @@ from hbench.runners import PARSERS as PARSERS, empty_usage as empty_usage, json_
 from hbench.runners import num as num, runner_for  # noqa: E402
 from hbench.graders.base import LogStep, RunStep, discard_log  # noqa: E402
 from hbench.judge import GatewayJudge, Judge, JudgeError  # noqa: E402
+from hbench.net import NoRedirect, url_allowed  # noqa: E402
 from hbench.plugins import PluginError, redactor_for  # noqa: E402
 from hbench.runners.base import HarnessRunner, ParseUsage, build_argv  # noqa: E402
+from hbench.sinks import sink_secret_vars, sinks_for  # noqa: E402
+from hbench.sinks.base import Sink  # noqa: E402
+from hbench.sinks.feed import SinkFeed  # noqa: E402
 from hbench.sandboxes import Sandbox, SandboxError, SandboxSession, sandbox_for  # noqa: E402
 from hbench.safe_copy import safe_copy_into  # noqa: E402
 from hbench.suites import SUITE_ONLY_KEYS, SUITE_PATH_KEYS, Suite, SuiteError, load_suite, suite_tasks  # noqa: E402
@@ -100,7 +103,6 @@ def computed_cost(u: Mapping[str, Any], price: Mapping[str, Any] | None) -> floa
 # names it explicitly in its "env" block.
 BASE_ENV = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ", "TMPDIR")
 SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]")
-LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 # Stale bytecode in a task source must not reach the workdir (a diff of the agent's work would show it).
 PYCACHE = shutil.ignore_patterns("__pycache__")
 
@@ -125,12 +127,14 @@ def base_env(cfg: Mapping[str, Any]) -> dict[str, str]:
 
 
 def spend_key_vars(cfg: Mapping[str, Any]) -> set[str]:
-    """The environment variables that hold a gateway key (LiteLLM spend key, judge key): never given to an agent,
-    always redacted."""
+    """The environment variables that hold a gateway key (LiteLLM spend key, judge key, the header values of the sinks):
+    never given to an agent, always redacted."""
     judge = cfg.get("judge")
     judge_key = judge.get("api_key") if isinstance(judge, Mapping) else None
-    return env_var_names((cfg.get("litellm") or {}).get("api_key")) | env_var_names(
-        judge_key if isinstance(judge_key, str) else None
+    return (
+        env_var_names((cfg.get("litellm") or {}).get("api_key"))
+        | env_var_names(judge_key if isinstance(judge_key, str) else None)
+        | sink_secret_vars(cfg)
     )
 
 
@@ -320,6 +324,7 @@ def validate_config(cfg: Mapping[str, Any]) -> None:
             sys.exit(f"harness {name}: {e}")
     validate_judge(cfg)
     make_sandbox(cfg)  # exits with a message for a bad `sandbox` section (a tag instead of a digest, bad limits)
+    make_sinks(cfg, Path())  # likewise for `sinks`; building a sink does no I/O, so the base only matters to `run`
     leaked = spend_key_vars(cfg) & (
         set(cfg.get("env_passthrough", []))
         | {v for h in cfg["harnesses"].values() for val in h.get("env", {}).values() for v in env_var_names(val)}
@@ -335,6 +340,14 @@ def make_sandbox(cfg: Mapping[str, Any]) -> Sandbox:
         return sandbox_for(cfg, run_proc, base_env(cfg))
     except ValueError as e:  # SandboxError and PluginError
         sys.exit(f"sandbox: {e}")
+
+
+def make_sinks(cfg: Mapping[str, Any], base: Path) -> list[Sink]:
+    """The sinks of the config (ADR 0011); exits with a message when a `sinks` entry is invalid."""
+    try:
+        return sinks_for(cfg, base)
+    except ValueError as e:  # SinkError and PluginError
+        sys.exit(f"sinks: {e}")
 
 
 def is_sandboxed(cfg: Mapping[str, Any]) -> bool:
@@ -1057,6 +1070,7 @@ class _Matrix:
     secrets: Sequence[str]
     keep: bool
     resuming: bool
+    sinks: SinkFeed
 
 
 @dataclass(frozen=True)
@@ -1163,6 +1177,7 @@ def _run_matrix(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path, gi
     finished = done_keys(results_path)
     finished_ids = writer.finished_trial_ids() if writer else set()
     shared = None
+    secrets = [os.environ.get(v, "") for v in spend_key_vars(cfg)]
     if work_root and writer:  # a dry run has neither
         # The temp dirs a killed run leaves are found again by resume through these paths and tokens.
         paths = {"git_root": str(git_root), "git_token": (git_root / OWNER_MARK_FILE).read_text()}
@@ -1180,29 +1195,38 @@ def _run_matrix(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path, gi
             sandbox=sandbox,
             plans={task["id"]: grade_plan(task) for task in cfg["tasks"]},
             redactor=load_redactor(cfg["judge"]) if uses_judge(cfg) else None,
-            secrets=[os.environ.get(v, "") for v in spend_key_vars(cfg)],
+            secrets=secrets,
             keep=args.keep,
             resuming=bool(resume_id),
+            sinks=SinkFeed(
+                make_sinks(cfg, base),
+                lambda message: print(redact(message, secrets), file=sys.stderr),
+            ),
         )
+        shared.sinks.open(writer.info)
 
     try:
-        with shared.heartbeat if shared else contextlib.nullcontext():
-            for planned in _planned_trials(cfg, args.only, reps):
-                task, hname, model, rep = planned.task, planned.hname, planned.model, planned.rep
-                key = (task["id"], hname, model, rep)
-                tid = planned_trial_id(writer.info.run_id, planned) if writer else ""
-                if (key in finished or tid in finished_ids) and not args.dry_run:
-                    print(f"skip  {key} (done)")
-                    continue
-                if shared is None:  # dry run: no work dir and no writer
-                    print(shlex.join(planned.runner.command(model, task["prompt"])))
-                    continue
-                _run_trial(shared, planned, tid)
-    finally:  # also when a trial raises: the private work dir is never left behind
-        if work_root and not args.keep and not cfg.get("work_dir"):
-            shutil.rmtree(work_root, ignore_errors=True)
-    if writer:
-        writer.close(datetime.now(UTC))
+        try:
+            with shared.heartbeat if shared else contextlib.nullcontext():
+                for planned in _planned_trials(cfg, args.only, reps):
+                    task, hname, model, rep = planned.task, planned.hname, planned.model, planned.rep
+                    key = (task["id"], hname, model, rep)
+                    tid = planned_trial_id(writer.info.run_id, planned) if writer else ""
+                    if (key in finished or tid in finished_ids) and not args.dry_run:
+                        print(f"skip  {key} (done)")
+                        continue
+                    if shared is None:  # dry run: no work dir and no writer
+                        print(shlex.join(planned.runner.command(model, task["prompt"])))
+                        continue
+                    _run_trial(shared, planned, tid)
+        finally:  # also when a trial raises: the private work dir is never left behind
+            if work_root and not args.keep and not cfg.get("work_dir"):
+                shutil.rmtree(work_root, ignore_errors=True)
+        if writer:
+            writer.close(datetime.now(UTC))
+    finally:  # the sinks see the run as `writer.close` left it (unfinished after an error or Ctrl-C) and are released
+        if shared:
+            shared.sinks.close(shared.writer.info)
     if not args.dry_run and not getattr(args, "no_report", False):
         cmd_report(args, cfg, base)
 
@@ -1221,7 +1245,8 @@ def _run_trial(m: _Matrix, planned: _Planned, tid: str) -> None:
     workdir = m.work_root / tag
     run_tag = f"bench-{datetime.now().strftime('%Y%m%d%H%M%S')}-{tag}"
     cmd_env = base_env(m.cfg)
-    agent_env = dict(cmd_env, BENCH_TAG=run_tag)  # Pi/OpenCode/Codex send it as x-litellm-tags
+    # Pi/OpenCode/Codex send BENCH_TAG as x-litellm-tags; the ids let a harness config send them as headers too
+    agent_env = dict(cmd_env, BENCH_TAG=run_tag, BENCH_RUN_ID=m.writer.info.run_id, BENCH_TRIAL_ID=tid)
     harness_env = {k: expand_env(v).replace("{run_tag}", run_tag) for k, v in h.get("env", {}).items()}
     agent_env.update(harness_env)
     secrets = list(m.secrets) + [v for v in harness_env.values() if v != run_tag]
@@ -1338,6 +1363,7 @@ def _run_trial(m: _Matrix, planned: _Planned, tid: str) -> None:
         image_digest=m.sandbox.image_digest(),
     )
     m.writer.append(trial)
+    m.sinks.write(trial)  # after `trials.jsonl`, which is the source of truth; a failing sink never stops the run
     with m.results_path.open("a") as f:
         f.write(json.dumps(row) + "\n")
     tokens = sum(usage[k] for k in ("input", "output", "reasoning", "cache_read", "cache_write"))
@@ -1353,25 +1379,9 @@ def _run_trial(m: _Matrix, planned: _Planned, tid: str) -> None:
 # ---------------------------------------------------------------- LiteLLM
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Never follow redirects: the Authorization header must not reach another host."""
-
-    def redirect_request(
-        self,
-        req: urllib.request.Request,
-        fp: IO[bytes],
-        code: int,
-        msg: str,
-        headers: Message,
-        newurl: str,
-    ) -> None:
-        return None
-
-
 def check_litellm_url(base_url: str, name: str = "litellm.base_url") -> None:
     """Exits unless `base_url` is https, or http to localhost. `name` is the setting shown in the message."""
-    u = urllib.parse.urlparse(base_url)
-    if u.scheme == "https" or (u.scheme == "http" and u.hostname in LOCAL_HOSTS):
+    if url_allowed(base_url):
         return
     sys.exit(f"{name} must use https (http only for localhost): {base_url}")
 
@@ -1380,7 +1390,7 @@ def litellm_get(base_url: str, key: str, path: str, params: Mapping[str, Any]) -
     check_litellm_url(base_url)
     url = base_url.rstrip("/") + path + "?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"})
-    opener = urllib.request.build_opener(_NoRedirect)
+    opener = urllib.request.build_opener(NoRedirect)
     with opener.open(req, timeout=120) as r:
         return json.loads(r.read().decode())
 
@@ -1424,7 +1434,7 @@ def _judge_exchange(request: urllib.request.Request, timeout: float, abandoned: 
     chunks: list[bytes] = []
     size = 0
     try:
-        with urllib.request.build_opener(_NoRedirect).open(request, timeout=timeout) as r:
+        with urllib.request.build_opener(NoRedirect).open(request, timeout=timeout) as r:
             while chunk := r.read1(min(65_536, MAX_JUDGE_REPLY_BYTES + 1 - size)):  # one socket read at a time
                 chunks.append(chunk)
                 size += len(chunk)

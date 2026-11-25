@@ -99,6 +99,8 @@ Import tasks from Exercism (MIT) and Terminal-Bench (Apache-2.0), with provenanc
 
 Optional: export each run as an OTLP trace (`LENS_TRACE_ENDPOINT`) with the run tag, to investigate failures in Lens. Or document how to use the Lens plugin for Claude Code and Codex inside the sandbox.
 
+Done in Phase 7 ([ADR 0011](adr/0011-sinks-and-telemetry.md)): the `otlp` sink writes one span per trial (child of a run span, trace id = `run_id`, span id = `trial_id`) to `traces.otlp.jsonl` and, with an `endpoint`, posts it as OTLP/JSON to `<endpoint>/v1/traces`. Spans carry ids, status, model, tokens and cost, never content. What is left: the transcript of an agent inside a trace (not exported on purpose), and the Lens plugins inside the sandbox.
+
 ## M14. Transcript hygiene (O)
 
 A `scrub` command that removes emails, home paths, hostnames and key-shaped strings from logs, and a `publish` mode that builds a shareable bundle (report and filtered results) **without** raw transcripts.

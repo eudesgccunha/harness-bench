@@ -365,20 +365,25 @@ Acceptance: kill the process mid-run and resume without repeating finished trial
 
 ### Phase 7 — Sinks and telemetry (optional)
 
-- [ ] Sinks: `jsonl` and `markdown` (default); `postgres`, `s3`, `parquet` as adapters.
-- [ ] Reference SQL schema in `docs/sql/` with scorecard queries (pass rate, pass^k,
+- [x] Sinks: `jsonl` and `markdown` (default); `sqlite` and `otlp` built in; `postgres`, `s3`,
+      `parquet` as plugins (entry-point group `harness_bench.sinks`).
+- [x] Reference SQL schema in `docs/sql/` with scorecard queries (pass rate, pass^k,
       cost per success per target).
-- [ ] Optional OpenTelemetry:
+- [x] Optional OpenTelemetry:
   - span per run and per trial, attributes `eval.run_id`, `eval.trial_id`,
     `eval.target_id`, `eval.status`, and `gen_ai.*` from the semantic conventions
   - **no** prompt/response content in spans by default
-  - no-op when not installed
-- [ ] Propagate `run_id` as metadata on the gateway call, to join with spend logs.
-- [ ] Example dashboard (importable JSON) for an open source dashboard tool, with
+  - no-op when not installed (OTLP/JSON by the standard library: nothing to install, no SDK)
+- [x] Propagate `run_id` as metadata on the gateway call, to join with spend logs
+      (`BENCH_RUN_ID`, `BENCH_TRIAL_ID` in the agent env; the run tag joins the spend logs).
+- [x] Example dashboard (importable JSON) for an open source dashboard tool, with
       synthetic data.
 
 Acceptance: the same run feeds JSONL, a database and traces, and `trial_id` links the
-three.
+three (`tests/smoke.py`, `tests/test_sink_run.py`).
+
+Decisions: [ADR 0011](adr/0011-sinks-and-telemetry.md). Plan:
+[`superpowers/plans/2026-11-24-phase-7-sinks-telemetry.md`](superpowers/plans/2026-11-24-phase-7-sinks-telemetry.md).
 
 ### Phase 8 — Orchestrator integration (optional)
 

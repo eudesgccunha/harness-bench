@@ -7,6 +7,7 @@ profile (see `hbench.profiles`) and, for `run`, waits for the spend logs and rec
 import argparse
 import importlib
 import json
+import os
 import shutil
 import sys
 import time
@@ -20,6 +21,8 @@ from hbench.core.schema import schema_document
 from hbench.doctor import run_checks
 from hbench.judge import JudgeError
 from hbench.profiles import apply_litellm_profile
+from hbench.results import ResumeError, read_run
+from hbench.sinks.feed import SinkFeed
 from hbench.suites import Suite, SuiteError, load_suite, suite_label, suite_tasks
 
 _DESCRIPTION = (
@@ -32,6 +35,7 @@ _DESCRIPTION = (
     "  python3 -m hbench suite list     [--config C | PATH...]\n"
     "  python3 -m hbench suite validate [--config C] [--run [--allow-unsandboxed]] [PATH...]\n"
     "  python3 -m hbench judge calibrate --config C --labels LABELS.jsonl --out calibration.json\n"
+    "  python3 -m hbench export    --config C --run RUN_DIR   # replay a run into the configured sinks\n"
     "  python3 -m hbench doctor    --config C [--network]   # check env, CLIs, image and network; spends nothing\n\n"
     "Add --litellm to run, report or reconcile for the LiteLLM-only benchmark."
 )
@@ -128,6 +132,9 @@ def build_parser(epilog: str | None = None) -> argparse.ArgumentParser:
         action="store_true",
         help="also GET the LiteLLM health endpoint and one page of spend logs (the spend key's permission)",
     )
+    export_cmd = sub.add_parser("export", help="replay a run into the configured sinks (idempotent)")
+    export_cmd.add_argument("--config", required=True)
+    export_cmd.add_argument("--run", required=True, metavar="RUN_DIR", help="the run directory: <output_dir>/<run_id>")
     judge = sub.add_parser("judge", help="LLM judge tools")
     judge_sub = judge.add_subparsers(dest="judge_cmd", required=True)
     calibrate_cmd = judge_sub.add_parser(
@@ -275,6 +282,36 @@ def _doctor(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def _export(args: argparse.Namespace) -> None:
+    """`export`: send `run.json` and `trials.jsonl` of a finished or interrupted run to the sinks of the config."""
+    engine = _engine()
+    cfg_path = Path(args.config).resolve()
+    try:
+        cfg: dict[str, Any] = json.loads(cfg_path.read_text())
+    except (OSError, ValueError) as e:
+        sys.exit(f"export: cannot read the config {cfg_path}: {e}")
+    run_dir = Path(args.run).resolve()
+    try:
+        info, trials = read_run(run_dir)
+    except ResumeError as e:
+        sys.exit(f"export: {e}")
+    if run_dir.name != info.run_id:
+        sys.exit(f"export: {run_dir} is not the directory of run {info.run_id}")
+    # The trace file of the otlp sink lives in the run directory, wherever the config says output goes.
+    sinks = engine.make_sinks(dict(cfg, output_dir=str(run_dir.parent)), cfg_path.parent)
+    if not sinks:
+        sys.exit("export: the config has no sinks")
+    secrets = [os.environ.get(v, "") for v in engine.spend_key_vars(cfg)]
+    feed = SinkFeed(sinks, lambda message: print(engine.redact(message, secrets), file=sys.stderr))
+    feed.open(info)
+    for trial in trials:
+        feed.write(trial)
+    feed.close(info)
+    print(f"exported {len(trials)} trial(s) of run {info.run_id} to {len(sinks) - feed.failed} of {len(sinks)} sink(s)")
+    if feed.failed:
+        sys.exit(1)
+
+
 def _run_litellm(engine: ModuleType, args: argparse.Namespace, cfg: dict[str, Any], base: Path) -> None:
     """`run` under the LiteLLM profile: report only after reconcile, when the gateway cost exists."""
     engine.cmd_run(args, cfg, base)
@@ -299,6 +336,9 @@ def main(argv: Sequence[str] | None = None, *, epilog: str | None = None) -> Non
         return
     if args.cmd == "judge":
         _judge_calibrate(args)
+        return
+    if args.cmd == "export":
+        _export(args)
         return
     if args.cmd == "doctor":
         _doctor(args)

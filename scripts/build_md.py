@@ -74,6 +74,12 @@ HBENCH_SOURCES = [
     "hbench/calibration.py",
     "hbench/graders/registry.py",
     "hbench/plugins.py",
+    "hbench/net.py",
+    "hbench/sinks/__init__.py",
+    "hbench/sinks/base.py",
+    "hbench/sinks/feed.py",
+    "hbench/sinks/sqlite.py",
+    "hbench/sinks/otlp.py",
     "hbench/sandboxes/__init__.py",
     "hbench/sandboxes/base.py",
     "hbench/sandboxes/prefix.py",
@@ -108,6 +114,13 @@ HBENCH_TESTS = [
     "tests/test_docker_sandbox.py",
     "tests/test_resume.py",
     "tests/test_doctor.py",
+    "tests/sink_helpers.py",
+    "tests/fake_collector.py",
+    "tests/test_sinks.py",
+    "tests/test_sqlite_sink.py",
+    "tests/test_otlp_sink.py",
+    "tests/test_sink_run.py",
+    "tests/test_dashboard.py",
 ]
 
 
@@ -135,7 +148,15 @@ def suite_tree() -> str:
     )
 
 
-hbench_md = file_blocks(HBENCH_SOURCES)
+SQL_FILES = ["hbench/sinks/schema.sql", "docs/sql/scorecard.sql", "docs/dashboards/grafana-scorecard.json"]
+
+
+def sql_blocks(paths: list[str]) -> str:
+    """One `path` + fenced block per SQL or dashboard file (the sqlite sink loads its schema at runtime)."""
+    return "".join(f"`{p}`:\n\n```{'json' if p.endswith('.json') else 'sql'}\n{R(p)}```\n\n" for p in paths)
+
+
+hbench_md = file_blocks(HBENCH_SOURCES) + sql_blocks(SQL_FILES)
 hbench_tests_md = file_blocks(HBENCH_TESTS)
 md = f"""# harness-bench: cost per solved task (harness × model)
 
@@ -193,7 +214,9 @@ If a run shows cost `n/a`, its tag did not reach LiteLLM. See the "LiteLLM: what
 harness-bench/
 ├── harness_bench.py
 ├── harness_bench_litellm.py     # LiteLLM-only variant (no Cursor)
-├── hbench/                      # data contract, report, suites and single CLI (ADR 0005, 0008)
+├── hbench/                      # data contract, report, suites, sinks and single CLI (ADR 0005, 0008, 0011)
+├── docs/sql/                    # reference schema and scorecard queries of the sqlite sink (ADR 0011)
+├── docs/dashboards/             # example Grafana dashboard; scripts/synthetic_db.py writes demo data
 ├── README.md / AGENTS.md
 ├── scripts/build_md.py          # generates this HARNESS_BENCH.md
 ├── sandbox/Dockerfile           # sandbox image with the CLIs
@@ -252,6 +275,8 @@ Outputs in `results/`:
 - `results.jsonl`: one line per run, with raw data;
 - `summary.md` and `summary.csv`: table sorted by cost per solved task, the statistics sections described in [Reading the report](#reading-the-report) and the per-task pass matrix;
 - `logs/`: each agent's JSON output, stderr, setup, tests, and the `.diff` of everything the agent changed. Known secrets show as `***REDACTED***`.
+
+To also send each trial to a SQLite database and OTLP traces, add a `sinks` list to the config (see `docs/running-a-benchmark.md` and `config.example.json`): `{{"type": "sqlite", "path": "results/bench.sqlite"}}` and `{{"type": "otlp", "endpoint": "https://collector:4318", "headers": {{"x-key": "${{OTLP_KEY}}"}}}}`. `trials.jsonl` is written first and stays the source of truth; a sink that fails is warned about once and left out for that run, and `python3 -m hbench export --config config.json --run results/<run_id>` sends a run again (idempotent by `trial_id`). Spans hold ids, status, model, tokens and cost, never a prompt, response or log. The agent gets `BENCH_RUN_ID` and `BENCH_TRIAL_ID` in its environment.
 
 `run` only starts with a sandbox configured (`sandbox.type` `docker`, or a `sandbox.prefix`; see [Security](#security)). Inside a disposable VM, add `--allow-unsandboxed`. To continue a run that was killed, use `run --resume RUN_ID` (see [Sandbox types, limits, resume and doctor](#sandbox-types-limits-resume-and-doctor)).
 

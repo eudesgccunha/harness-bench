@@ -1,0 +1,153 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_BENCH",
+      "label": "Benchmark SQLite",
+      "description": "The SQLite file of the sqlite sink",
+      "type": "datasource",
+      "pluginId": "frser-sqlite-datasource",
+      "pluginName": "SQLite"
+    }
+  ],
+  "__requires": [
+    {
+      "type": "datasource",
+      "id": "frser-sqlite-datasource",
+      "name": "SQLite",
+      "version": "3.5.0"
+    },
+    {
+      "type": "grafana",
+      "id": "grafana",
+      "name": "Grafana",
+      "version": "10.0.0"
+    }
+  ],
+  "title": "harness-bench scorecard",
+  "description": "Pass rate, pass^k and cost per success per target, from the sqlite sink (docs/sql/scorecard.sql). Load scripts/synthetic_db.py output to try it.",
+  "uid": "harness-bench-scorecard",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "tags": [
+    "harness-bench"
+  ],
+  "time": {
+    "from": "now-90d",
+    "to": "now"
+  },
+  "timepicker": {},
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": []
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Pass rate per target",
+      "description": "Share of trials that passed.",
+      "type": "barchart",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "${DS_BENCH}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "${DS_BENCH}"
+          },
+          "queryType": "table",
+          "queryText": "SELECT target_id,\n       COUNT(*) AS trials,\n       SUM(passed) AS passed,\n       1.0 * SUM(passed) / COUNT(*) AS pass_rate\nFROM trials\nGROUP BY target_id\nORDER BY pass_rate DESC, target_id;",
+          "rawQueryText": "SELECT target_id,\n       COUNT(*) AS trials,\n       SUM(passed) AS passed,\n       1.0 * SUM(passed) / COUNT(*) AS pass_rate\nFROM trials\nGROUP BY target_id\nORDER BY pass_rate DESC, target_id;"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "unknown",
+          "unit": "percentunit"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 2,
+      "title": "pass^k per target",
+      "description": "Share of tasks that passed on every rep.",
+      "type": "barchart",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "${DS_BENCH}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "${DS_BENCH}"
+          },
+          "queryType": "table",
+          "queryText": "SELECT target_id,\n       COUNT(*) AS tasks,\n       SUM(all_passed) AS tasks_always_passed,\n       1.0 * SUM(all_passed) / COUNT(*) AS pass_hat_k\nFROM (\n    SELECT target_id, task_id, MIN(passed) AS all_passed\n    FROM trials\n    GROUP BY target_id, task_id\n) AS per_task\nGROUP BY target_id\nORDER BY pass_hat_k DESC, target_id;",
+          "rawQueryText": "SELECT target_id,\n       COUNT(*) AS tasks,\n       SUM(all_passed) AS tasks_always_passed,\n       1.0 * SUM(all_passed) / COUNT(*) AS pass_hat_k\nFROM (\n    SELECT target_id, task_id, MIN(passed) AS all_passed\n    FROM trials\n    GROUP BY target_id, task_id\n) AS per_task\nGROUP BY target_id\nORDER BY pass_hat_k DESC, target_id;"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "unknown",
+          "unit": "percentunit"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "title": "Cost per success per target",
+      "description": "Total cost / solved trials, in USD. Unknown when any trial of the target has no cost.",
+      "type": "table",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "${DS_BENCH}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 9,
+        "w": 24,
+        "h": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "${DS_BENCH}"
+          },
+          "queryType": "table",
+          "queryText": "SELECT target_id,\n       SUM(passed) AS solved,\n       CASE WHEN COUNT(cost_usd) = COUNT(*) THEN SUM(cost_usd) END AS total_cost_usd,\n       CASE WHEN COUNT(cost_usd) = COUNT(*) AND SUM(passed) > 0 THEN SUM(cost_usd) / SUM(passed) END AS cost_per_success\nFROM trials\nGROUP BY target_id\nORDER BY cost_per_success IS NULL, cost_per_success, target_id;",
+          "rawQueryText": "SELECT target_id,\n       SUM(passed) AS solved,\n       CASE WHEN COUNT(cost_usd) = COUNT(*) THEN SUM(cost_usd) END AS total_cost_usd,\n       CASE WHEN COUNT(cost_usd) = COUNT(*) AND SUM(passed) > 0 THEN SUM(cost_usd) / SUM(passed) END AS cost_per_success\nFROM trials\nGROUP BY target_id\nORDER BY cost_per_success IS NULL, cost_per_success, target_id;"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "unknown",
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      }
+    }
+  ]
+}

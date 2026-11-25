@@ -104,6 +104,8 @@ if os.environ.get("FAKE_PROBE_FILE"):
                     "sandbox": os.environ.get("FAKE_SANDBOX", ""),
                     "home": os.environ.get("HOME", ""),
                     "uid": os.getuid(),
+                    "bench_run_id": os.environ.get("BENCH_RUN_ID"),
+                    "bench_trial_id": os.environ.get("BENCH_TRIAL_ID"),
                 }
             )
             + "\n"

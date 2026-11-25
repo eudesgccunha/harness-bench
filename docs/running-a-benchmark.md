@@ -118,6 +118,24 @@ python3 harness_bench_litellm.py reconcile --config config.litellm.json
 - Add the `null` harness (see `config.example.json`) as a negative control: if it solves any task, the hidden tests are too lenient. The `Discrimination` section lists tasks every pair solves or none solves; `report --drop-saturated` leaves the saturated ones out.
 - Investigate failures through the `.diff` files and logs in `logs/`, and through Lens traces if you use Lens.
 
+### Send the results to a database and traces (optional)
+
+`trials.jsonl` always holds the results. A `sinks` list in the config also sends each trial, as it finishes, to a SQLite database and to OpenTelemetry traces (see [ADR 0011](adr/0011-sinks-and-telemetry.md)):
+
+```json
+"sinks": [
+  {"type": "sqlite", "path": "results/bench.sqlite"},
+  {"type": "otlp", "endpoint": "https://collector:4318", "headers": {"x-key": "${OTLP_KEY}"}, "timeout": 10}
+]
+```
+
+- `sqlite` creates the tables of [`sql/schema.sql`](sql/schema.sql); [`sql/scorecard.sql`](sql/scorecard.sql) has the queries for pass rate, pass^k and cost per success per target (an unknown cost stays NULL, never 0). `scripts/synthetic_db.py` and [`dashboards/grafana-scorecard.json`](dashboards/grafana-scorecard.json) give a Grafana dashboard (SQLite data source plugin) to try with invented data: `python3 -m scripts.synthetic_db synthetic.sqlite`.
+- `otlp` always writes `<run_id>/traces.otlp.jsonl`, and posts the spans to `<endpoint>/v1/traces` when `endpoint` is set (https, or http to localhost; no redirect is followed). A span holds ids, status, model, tokens and cost, never a prompt, a response or a log. A header value must be exactly `${VAR}`.
+- The `trial_id` is the same in `trials.jsonl`, in SQLite and as the id of the span. The agent also gets `BENCH_RUN_ID` and `BENCH_TRIAL_ID` in its environment.
+- A sink that fails (disk full, collector down) is warned about once and left out for that run; the results are not affected. Send a finished or interrupted run again, as many times as you like, with `python3 -m hbench export --config config.json --run results/<run_id>`. SQLite upserts by `trial_id`, so a replay adds nothing. The OTLP file does not repeat a span either, but a replay (`export`, or `--resume`) posts the spans to the collector again: deduplicating by span id is the backend's job. A sink that failed is also closed once, best effort, to release its files; a collector that failed is not sent anything again.
+- The queries of `docs/sql/scorecard.sql` aggregate over every run in the database. To score one run, add `WHERE run_id = ?` before the `GROUP BY` of a query (in `pass_hat_k`, inside the subquery). An unknown cost sorts last, never first.
+- Postgres, S3 or Parquet: a plugin package in the entry-point group `harness_bench.sinks` (the schema in `docs/sql/schema.sql` runs on PostgreSQL too).
+
 ## Checklist
 
 - [ ] `python3 tests/smoke.py` passes

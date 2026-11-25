@@ -111,6 +111,21 @@ class RunWriter:
         _atomic_write(self.run_dir / "run.json", json.dumps(self.info.to_dict(), indent=2) + "\n")
 
 
+def read_run(run_dir: Path) -> tuple[RunInfo, list[TrialResult]]:
+    """The run in `run_dir` as it is on disk, without changing a file (`export` may read a run that is still going):
+    its `run.json` and its trials. A last line without a newline is a write in progress or cut short by a crash,
+    so it is left out. Raises `ResumeError` for a directory that is not a run or holds invalid contract data."""
+    try:
+        info = RunInfo.from_dict(json.loads((run_dir / "run.json").read_text()))
+        text = (run_dir / "trials.jsonl").read_text()
+        lines = text.splitlines() if text.endswith("\n") else text.splitlines()[:-1]
+        return info, [TrialResult.from_dict(json.loads(line)) for line in lines if line.strip()]
+    except FileNotFoundError as e:
+        raise ResumeError(f"{run_dir} is not a run directory: {e.filename} does not exist") from e
+    except ValueError as e:  # ContractError and json.JSONDecodeError are both ValueErrors
+        raise ResumeError(f"{run_dir} is not valid run data: {e}") from e
+
+
 def read_trials(out_dir: Path, warn: Callable[[str], None] = print) -> list[TrialResult]:
     """Every trial of every run directory in `out_dir`, oldest file name first. A file that is not valid contract
     data is skipped with a `warn` message."""

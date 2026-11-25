@@ -7,6 +7,7 @@ Run: python3 tests/smoke.py   (exit 0 = pass)
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -18,9 +19,11 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tests"))
 sys.path.insert(0, str(ROOT))
+import fake_collector  # noqa: E402
 import fake_litellm  # noqa: E402
 import fixtures  # noqa: E402
 import harness_bench as hb  # noqa: E402
+from hbench.sinks import otlp as hb_otlp  # noqa: E402
 
 PY = fixtures.PY
 API_KEY = "sk-test-agent-key-0123456789"
@@ -490,6 +493,72 @@ def main() -> None:
             bg_row["passed"] and not bg_row["agent_timed_out"],
             "process group: it was gone before grading, and it never held the agent step up",
         )
+
+        # --- sinks: the trial id joins trials.jsonl, SQLite and the spans; a failing collector changes nothing
+        collector_srv, collector_port, collector = fake_collector.serve()
+        threading.Thread(target=collector_srv.serve_forever, daemon=True).start()
+        header_secret = fixtures.fake_secret("sink")
+        os.environ["HB_SINK_KEY"] = header_secret
+        sink_cfg = dict(
+            cfg,
+            output_dir="results-sinks",
+            harnesses={"claude": fixtures.harness("claude", harness_env, "fix")},
+            matrix=[{"harness": "claude", "model": "m"}],
+            sinks=[
+                {"type": "sqlite", "path": "results-sinks/bench.sqlite"},
+                {
+                    "type": "otlp",
+                    "endpoint": f"http://127.0.0.1:{collector_port}",
+                    "headers": {"x-key": "${HB_SINK_KEY}"},
+                },
+            ],
+        )
+        (tmp / "config-sinks.json").write_text(json.dumps(sink_cfg))
+        p = run(tmp, "harness_bench.py", "run", "--allow-unsandboxed", config="config-sinks.json")
+        (sink_run,) = (tmp / "results-sinks").glob("*/trials.jsonl")
+        sink_trials = results(sink_run)
+        trial_ids = {t["trial_id"] for t in sink_trials}
+        db = sqlite3.connect(tmp / "results-sinks/bench.sqlite")
+        db_ids = {r[0] for r in db.execute("SELECT trial_id FROM trials")}
+        db.close()
+        file_spans = [
+            json.loads(line)["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+            for line in (sink_run.parent / "traces.otlp.jsonl").read_text().splitlines()
+        ]
+        run_span = hb_otlp.run_span_id(sink_trials[0]["run_id"])
+        check(
+            len(trial_ids) == 1 and db_ids == trial_ids and {s["spanId"] for s in file_spans} == trial_ids | {run_span},
+            "sinks: one trial_id in trials.jsonl, SQLite and the spans",
+        )
+        check(
+            set(collector.span_ids()) == trial_ids | {run_span}
+            and all(r.headers["x-key"] == header_secret for r in collector.requests),
+            "sinks: the collector got every span, with the header from the environment",
+        )
+        check(
+            trial_ids <= {json.loads(x)["bench_trial_id"] for x in probe_file.read_text().splitlines()},
+            "sinks: the agent got BENCH_TRIAL_ID, the same id",
+        )
+        check(
+            header_secret not in p.stdout + p.stderr
+            and all(
+                header_secret.encode() not in f.read_bytes() for f in (tmp / "results-sinks").rglob("*") if f.is_file()
+            ),
+            "sinks: the header secret is in no log, result or trace file",
+        )
+
+        collector.mode = "http500"
+        collector.requests.clear()
+        (tmp / "config-sinks500.json").write_text(json.dumps(dict(sink_cfg, output_dir="results-sinks500")))
+        p = run(tmp, "harness_bench.py", "run", "--allow-unsandboxed", config="config-sinks500.json")
+        check(
+            len(results(tmp / "results-sinks500/results.jsonl")) == 1
+            and len(collector.requests) == 1
+            and p.stderr.count("warning: sink OtlpSink failed") == 1
+            and header_secret not in p.stdout + p.stderr,
+            "sinks: a collector that answers 500 costs one warning and no result",
+        )
+        collector_srv.shutdown()
 
         # --- config validation and URL policy
         for bad, why in (
