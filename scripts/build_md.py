@@ -74,6 +74,13 @@ HBENCH_SOURCES = [
     "hbench/calibration.py",
     "hbench/graders/registry.py",
     "hbench/plugins.py",
+    "hbench/sandboxes/__init__.py",
+    "hbench/sandboxes/base.py",
+    "hbench/sandboxes/prefix.py",
+    "hbench/sandboxes/local_tmp.py",
+    "hbench/sandboxes/limits.py",
+    "hbench/sandboxes/docker.py",
+    "hbench/doctor.py",
     "hbench/results.py",
     "hbench/stats.py",
     "hbench/report.py",
@@ -96,6 +103,11 @@ HBENCH_TESTS = [
     "tests/test_calibration.py",
     "tests/test_plugins.py",
     "tests/test_suites.py",
+    "tests/test_sandboxes.py",
+    "tests/fake_docker.py",
+    "tests/test_docker_sandbox.py",
+    "tests/test_resume.py",
+    "tests/test_doctor.py",
 ]
 
 
@@ -241,7 +253,7 @@ Outputs in `results/`:
 - `summary.md` and `summary.csv`: table sorted by cost per solved task, the statistics sections described in [Reading the report](#reading-the-report) and the per-task pass matrix;
 - `logs/`: each agent's JSON output, stderr, setup, tests, and the `.diff` of everything the agent changed. Known secrets show as `***REDACTED***`.
 
-`run` only starts with `sandbox.prefix` set (see [Security](#security)). Inside a disposable VM, add `--allow-unsandboxed`.
+`run` only starts with a sandbox configured (`sandbox.type` `docker`, or a `sandbox.prefix`; see [Security](#security)). Inside a disposable VM, add `--allow-unsandboxed`. To continue a run that was killed, use `run --resume RUN_ID` (see [Sandbox types, limits, resume and doctor](#sandbox-types-limits-resume-and-doctor)).
 
 ## Reading the report
 
@@ -365,7 +377,7 @@ What the script does on every run:
 9. **Copies never follow a link the agent planted**: the hidden tests (before grading) and the `solution` of `suite validate --run` are copied with `hbench/safe_copy.py`, which replaces any symlink (or hard-linked file) on the destination path with a regular file instead of writing through it. Otherwise an agent that plants `test_hidden.py -> ~/.bashrc` would make the grader overwrite a host file.
 10. **Git transports**: `git clone` of a task repo runs with `GIT_ALLOW_PROTOCOL`: `https:ssh:file` for the tasks of your config, `https` only for suite tasks, so a suite can never clone a private local repo or use your SSH keys. The clone from the local cache into the workdir allows `file` alone.
 
-What the script does **not** solve on its own: without a sandbox, the agent runs as your user and can read any of your files (including `~/.ssh`) and tamper with results. That is why `run` requires `sandbox.prefix` or `--allow-unsandboxed`.
+What the script does **not** solve on its own: without a sandbox, the agent runs as your user and can read any of your files (including `~/.ssh`) and tamper with results. That is why `run` requires a sandbox (`docker` or `sandbox.prefix`) or `--allow-unsandboxed`.
 
 ### Docker sandbox
 
@@ -399,7 +411,30 @@ The `prefix` in the example configs mounts only the workdir, at the same path, a
 - The CLIs authenticate through environment variables (LiteLLM). Your `~/.claude`, `~/.ssh` and similar do not enter the container. Each CLI starts with a clean configuration, which also makes the comparison fairer.
 - `.dockerignore` keeps everything not needed out of the build context (configs, results, tasks).
 - **Network**: besides the `reconcile` `GET`, the engine makes one `POST` per judged artifact to `judge.base_url`, and only when a task uses `llm_rubric` (see [Artifact graders and the LLM judge](#artifact-graders-and-the-llm-judge)). The container has open internet egress, because it must reach LiteLLM. To restrict egress to LiteLLM only, use a Docker network with an egress proxy, or OpenSandbox (below).
-- Validate with `python3 tests/docker_e2e.py`. The test runs fake agents inside the container and checks HOME, UID, secrets and the test results.
+- Validate with `python3 tests/docker_e2e.py`. The test runs fake agents inside the container, once with the `docker` sandbox type and once with a `sandbox.prefix`, and checks HOME, UID, secrets, the test results, the missing network, the removed containers and the recorded image digest.
+
+### Sandbox types, limits, resume and doctor
+
+`sandbox.type` picks how the commands of a trial run ([ADR 0010](docs/adr/0010-pluggable-sandbox-and-resume.md)). Without a `type`, a `prefix` means `prefix` and nothing means `local-tmp`. A sandbox only builds the command; the engine still starts every process, so the env allowlist, the timeout, the log redaction and the process-group kill are the same for all of them.
+
+| Type | What it does | Needs `--allow-unsandboxed` |
+|---|---|---|
+| `docker` | `docker run` of an image **pinned by digest** (`name@sha256:<64 hex>`; a tag is a config error). The workdir is mounted at `/work`. `--network none` by default (or the name of a Docker network), `--cap-drop ALL`, `--security-opt no-new-privileges`, the host user, and `limits`: `cpus`, `memory` (`512m`, `2g`; swap off) and `pids`. `mounts` (`["/host:/container[:ro]"]`) adds helpers such as a CA file; never at or under `/work`. Mount read-only: a writable mount of `docker.sock` or a home directory hands it to the agent and breaks the isolation. Each command is a container named `hb-<trial_id>-<n>`; killing the `docker run` client does not stop its container, so the engine runs `docker rm -f` on it as soon as the command ends or times out, before it reads the workdir or starts the next command. If the container cannot be shown to be gone (`rm` fails or times out, or it is still listed after a second `rm -f`), the trial fails closed: it is not graded and counts as not passed. | no |
+| `prefix` | The older `sandbox.prefix` template (`{{workdir}}`, `{{env_file}}`), unchanged. | no |
+| `local-tmp` | No isolation: commands run as your user. `limits` `memory` (`RLIMIT_AS`), `pids` (`RLIMIT_NPROC`, counted over all your processes) and `cpu_seconds` (`RLIMIT_CPU`) are best effort; `cpus` is ignored. | yes |
+
+```json
+"sandbox": {{"type": "docker", "image": "harness-bench-agents@sha256:<64 hex>", "network": "hb-egress",
+             "limits": {{"cpus": 2, "memory": "4g", "pids": 512}}}}
+```
+
+The digest of a local image is `docker image inspect harness-bench-agents --format '{{{{.Id}}}}'`. The run records the sandbox in `run.json` (`sandbox`) and the digest in every trial (`image_digest`). To let the agents reach only LiteLLM, create an internal network (`docker network create --internal hb-egress`) and attach only the gateway to it ([docs/machine-setup.md](docs/machine-setup.md)). Another package can add a type through the entry-point group `harness_bench.sandboxes` (a factory `(sandbox section) -> Sandbox`).
+
+**Process groups.** Every command runs as the leader of its own session and its whole process group is killed when it ends or times out, so a process the agent forked into the background (`sleep 600 &`) is gone before the graders run. This is best effort outside a container: with `prefix` and `local-tmp`, a process that leaves the group with `setsid` (or a double fork) survives into grading. With `docker` the container's removal stops everything in it.
+
+**Resume.** `run --resume RUN_ID` reopens `<output_dir>/RUN_ID/` (the directory name), keeps the run id and skips every trial already in its `trials.jsonl`; the others run. A trial is written to `trials.jsonl` (and flushed to disk) before its row in `results.jsonl`, so a crash between the two loses only the row, which resume rewrites. It refuses a run whose config changed, a run id that is not a run directory, and a run whose heartbeat (`heartbeat.json`, rewritten every 30 s) is fresh while its process is alive (`--force` overrides). It deletes only the temp dirs (`harness-bench-work-*`, `harness-bench-git-*`) that the killed run's own heartbeat names and whose random token file it still holds. A plain `run` without `--resume` still skips the `(task, harness, model, rep)` rows of `results.jsonl` and writes a new run directory.
+
+**Doctor.** `python3 -m hbench doctor --config config.json [--network]` spends nothing and starts no agent. It checks the config, that every `${{VAR}}` is set (by name, never by value), each harness CLI (`docker run <image> <cli> --version` for `docker`, with the limits and no network of an agent; `PATH` otherwise), the image and its digest, that the network is `none` or internal, and the LiteLLM and judge URLs. `--network` adds one `GET /health/liveliness` and one page of `/spend/logs/v2` to the configured LiteLLM, to see that the spend key can read. It exits 1 when any check fails; a warning does not fail it.
 
 ### Why not OpenSandbox (yet)
 
@@ -509,7 +544,7 @@ In `sandbox.prefix`: `{{workdir}}` and `{{env_file}}`.
 
 ## `hbench/` package
 
-New code lives in the `hbench/` package ([ADR 0005](docs/adr/0005-data-contract-and-package.md)); the two scripts above call into it.
+New code lives in the `hbench/` package ([ADR 0005](docs/adr/0005-data-contract-and-package.md)); the two scripts above call into it. `hbench/sandboxes/` holds the sandboxes and `hbench/doctor.py` the `doctor` checks.
 
 {hbench_md}## `config.litellm.example.json`
 

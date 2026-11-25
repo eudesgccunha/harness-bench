@@ -17,6 +17,7 @@ from typing import Any
 
 from hbench.calibration import calibrate, calibration_status, read_labels, write_calibration
 from hbench.core.schema import schema_document
+from hbench.doctor import run_checks
 from hbench.judge import JudgeError
 from hbench.profiles import apply_litellm_profile
 from hbench.suites import Suite, SuiteError, load_suite, suite_label, suite_tasks
@@ -24,12 +25,14 @@ from hbench.suites import Suite, SuiteError, load_suite, suite_label, suite_task
 _DESCRIPTION = (
     "harness-bench: compare coding-agent harness x model pairs. Main metric: cost per solved task.\n\n"
     "  python3 -m hbench run       --config config.json [--reps 3] [--only HARNESS] [--keep] [--dry-run]\n"
+    "  python3 -m hbench run       --config config.json --resume RUN_ID [--force]   # continue an interrupted run\n"
     "  python3 -m hbench reconcile --config config.json   # pull real spend from LiteLLM\n"
     "  python3 -m hbench report    --config config.json [--drop-saturated]\n"
     "  python3 -m hbench schema export [--out PATH]       # JSON Schema of trials.jsonl and run.json\n"
     "  python3 -m hbench suite list     [--config C | PATH...]\n"
     "  python3 -m hbench suite validate [--config C] [--run [--allow-unsandboxed]] [PATH...]\n"
-    "  python3 -m hbench judge calibrate --config C --labels LABELS.jsonl --out calibration.json\n\n"
+    "  python3 -m hbench judge calibrate --config C --labels LABELS.jsonl --out calibration.json\n"
+    "  python3 -m hbench doctor    --config C [--network]   # check env, CLIs, image and network; spends nothing\n\n"
     "Add --litellm to run, report or reconcile for the LiteLLM-only benchmark."
 )
 
@@ -73,7 +76,17 @@ def build_parser(epilog: str | None = None) -> argparse.ArgumentParser:
     run.add_argument("--keep", action="store_true", help="keep work directories")
     run.add_argument("--dry-run", action="store_true", help="print commands only")
     run.add_argument(
-        "--allow-unsandboxed", action="store_true", help="run without sandbox.prefix (only inside a disposable VM)"
+        "--allow-unsandboxed", action="store_true", help="run without a sandbox (only inside a disposable VM)"
+    )
+    run.add_argument(
+        "--resume",
+        metavar="RUN_ID",
+        help="continue the run RUN_ID (a directory of the output dir): trials already in its trials.jsonl are skipped",
+    )
+    run.add_argument(
+        "--force",
+        action="store_true",
+        help="with --resume: resume although the run's heartbeat says it may still be running",
     )
     run.add_argument(
         "--settle",
@@ -105,9 +118,16 @@ def build_parser(epilog: str | None = None) -> argparse.ArgumentParser:
         "--run", action="store_true", help="the graders must fail on the repo and pass with the solution"
     )
     validate.add_argument(
-        "--allow-unsandboxed", action="store_true", help="with --run: no sandbox.prefix (only inside a disposable VM)"
+        "--allow-unsandboxed", action="store_true", help="with --run: no sandbox (only inside a disposable VM)"
     )
     validate.add_argument("paths", nargs="*", metavar="PATH", help="suite directories")
+    doctor = sub.add_parser("doctor", help="check that the benchmark can run; starts no agent and spends nothing")
+    doctor.add_argument("--config", required=True)
+    doctor.add_argument(
+        "--network",
+        action="store_true",
+        help="also GET the LiteLLM health endpoint and one page of spend logs (the spend key's permission)",
+    )
     judge = sub.add_parser("judge", help="LLM judge tools")
     judge_sub = judge.add_subparsers(dest="judge_cmd", required=True)
     calibrate_cmd = judge_sub.add_parser(
@@ -240,6 +260,21 @@ def _judge_calibrate(args: argparse.Namespace) -> None:
     print(f"{'calibrated' if reason is None else f'experimental: {reason}'}; saved {args.out}")
 
 
+def _doctor(args: argparse.Namespace) -> None:
+    """`doctor`: print one line per check; exit 1 when any check failed."""
+    engine = _engine()
+    cfg_path = Path(args.config).resolve()
+    checks = run_checks(json.loads(cfg_path.read_text()), cfg_path.parent, args.network, engine)
+    for check in checks:
+        status = "warn " if check.warning else "ok   " if check.ok else "FAIL "
+        print(f"{status} {check.name}: {check.detail}")
+    failed = sum(not c.ok for c in checks)
+    warned = sum(c.warning for c in checks)
+    print(f"{len(checks)} checks, {failed} failed, {warned} warnings")
+    if failed:
+        sys.exit(1)
+
+
 def _run_litellm(engine: ModuleType, args: argparse.Namespace, cfg: dict[str, Any], base: Path) -> None:
     """`run` under the LiteLLM profile: report only after reconcile, when the gateway cost exists."""
     engine.cmd_run(args, cfg, base)
@@ -264,6 +299,9 @@ def main(argv: Sequence[str] | None = None, *, epilog: str | None = None) -> Non
         return
     if args.cmd == "judge":
         _judge_calibrate(args)
+        return
+    if args.cmd == "doctor":
+        _doctor(args)
         return
     engine = _engine()
     cfg_path = Path(args.config).resolve()

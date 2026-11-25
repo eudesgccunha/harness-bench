@@ -11,13 +11,16 @@ Usage:
 """
 
 import argparse
+import contextlib
 import functools
 import json
 import os
 import platform
 import re
+import secrets
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -26,8 +29,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from email.message import Message
 from pathlib import Path
@@ -39,17 +42,19 @@ if sys.version_info < (3, 12):
 from hbench import cli, report  # noqa: E402
 from hbench import runners as _runners  # noqa: E402
 from hbench.calibration import Calibration, read_calibration  # noqa: E402
-from hbench.core.convert import trial_from_row_lenient, trials_from_rows  # noqa: E402
-from hbench.core.ids import new_run_id, sha256_json  # noqa: E402
+from hbench.core.convert import row_from_trial, trial_from_row_lenient, trials_from_rows  # noqa: E402
+from hbench.core.ids import new_run_id, sha256_json, trial_id  # noqa: E402
 from hbench.core.models import GraderResult, RunInfo, Target  # noqa: E402
 from hbench.graders import GRADERS as GRADERS, Change, GradeContext, GradePlan, compose, grade_plan  # noqa: E402
-from hbench.results import RunWriter, apply_gateway_costs, read_trials  # noqa: E402
+from hbench.results import HEARTBEAT_FILE, Heartbeat, ResumeError, RunWriter, apply_gateway_costs  # noqa: E402
+from hbench.results import heartbeat_is_live, read_heartbeat, read_trials  # noqa: E402
 from hbench.runners import PARSERS as PARSERS, empty_usage as empty_usage, json_lines as json_lines  # noqa: E402
 from hbench.runners import num as num, runner_for  # noqa: E402
 from hbench.graders.base import LogStep, RunStep, discard_log  # noqa: E402
 from hbench.judge import GatewayJudge, Judge, JudgeError  # noqa: E402
 from hbench.plugins import PluginError, redactor_for  # noqa: E402
-from hbench.runners.base import ParseUsage, build_argv  # noqa: E402
+from hbench.runners.base import HarnessRunner, ParseUsage, build_argv  # noqa: E402
+from hbench.sandboxes import Sandbox, SandboxError, SandboxSession, sandbox_for  # noqa: E402
 from hbench.safe_copy import safe_copy_into  # noqa: E402
 from hbench.suites import SUITE_ONLY_KEYS, SUITE_PATH_KEYS, Suite, SuiteError, load_suite, suite_tasks  # noqa: E402
 
@@ -314,6 +319,7 @@ def validate_config(cfg: Mapping[str, Any]) -> None:
         except ValueError as e:
             sys.exit(f"harness {name}: {e}")
     validate_judge(cfg)
+    make_sandbox(cfg)  # exits with a message for a bad `sandbox` section (a tag instead of a digest, bad limits)
     leaked = spend_key_vars(cfg) & (
         set(cfg.get("env_passthrough", []))
         | {v for h in cfg["harnesses"].values() for val in h.get("env", {}).values() for v in env_var_names(val)}
@@ -322,8 +328,17 @@ def validate_config(cfg: Mapping[str, Any]) -> None:
         sys.exit(f"LiteLLM spend key {sorted(leaked)} must not be passed to agents")
 
 
+def make_sandbox(cfg: Mapping[str, Any]) -> Sandbox:
+    """The sandbox of the config (ADR 0010); exits with a message when its section is invalid. Its helper commands
+    (`docker rm`) go through `run_proc` with the env allowlist, like every other command."""
+    try:
+        return sandbox_for(cfg, run_proc, base_env(cfg))
+    except ValueError as e:  # SandboxError and PluginError
+        sys.exit(f"sandbox: {e}")
+
+
 def is_sandboxed(cfg: Mapping[str, Any]) -> bool:
-    return bool((cfg.get("sandbox") or {}).get("prefix"))
+    return make_sandbox(cfg).isolated
 
 
 def require_sandbox(cfg: Mapping[str, Any], allow_unsandboxed: bool) -> None:
@@ -332,8 +347,8 @@ def require_sandbox(cfg: Mapping[str, Any], allow_unsandboxed: bool) -> None:
     if not is_sandboxed(cfg) and not allow_unsandboxed:
         sys.exit(
             "No sandbox configured. Agents run without approval prompts and the test\n"
-            "command executes agent-written code as your user. Set sandbox.prefix in the\n"
-            "config (see HARNESS_BENCH.md) or pass --allow-unsandboxed inside a disposable VM."
+            "command executes agent-written code as your user. Set sandbox (type docker, or a\n"
+            "prefix) in the config (see HARNESS_BENCH.md) or pass --allow-unsandboxed inside a disposable VM."
         )
 
 
@@ -344,13 +359,10 @@ def rmtree_inside(path: Path | str, root: Path | str) -> None:
     shutil.rmtree(path, ignore_errors=True)
 
 
-def wrap(cfg: Mapping[str, Any], argv: list[str], workdir: Path | str, env_file: Path | str) -> list[str]:
-    """Prefix a command with the configured sandbox (e.g. docker run ...)."""
-    prefix = (cfg.get("sandbox") or {}).get("prefix")
-    if not prefix:
-        return argv
-    fields = {"workdir": str(workdir), "env_file": str(env_file)}
-    return [p.format(**fields) for p in prefix] + argv
+def wrap(session: SandboxSession, argv: list[str], env_file: Path) -> list[str]:
+    """The command that runs `argv` in the trial's sandbox. Every command that executes agent or task code goes
+    through here."""
+    return session.argv(argv, env_file)
 
 
 # Host-specific values that would break a container (host PATH, home, user, temp dir).
@@ -370,17 +382,50 @@ def write_env_file(env: Mapping[str, str], path: Path) -> None:
 # ---------------------------------------------------------------- run
 
 
+def _kill_group(pgid: int) -> None:
+    """SIGKILL every process of the group. Its leader has not been reaped, so the group exists even if every
+    process in it has ended (a zombie leader is still a member)."""
+    os.killpg(pgid, signal.SIGKILL)
+
+
+def _wait_unreaped(pid: int, timeout: float) -> bool:
+    """Wait until the child `pid` has exited, without reaping it (`WNOWAIT`), so that its process group id stays
+    reserved until the caller has killed the group. False when `timeout` seconds pass first."""
+    deadline = time.monotonic() + timeout
+    while os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG) is None:
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
 def run_proc(argv: list[str], cwd: Path | None, env: Mapping[str, str], timeout: float) -> tuple[int, bool, str, str]:
-    """Run argv without a shell; return (rc, timed_out, stdout, stderr)."""
-    try:
-        p = subprocess.run(
-            argv, cwd=cwd, env=env, timeout=timeout, stdin=subprocess.DEVNULL, capture_output=True, text=True
+    """Run argv without a shell; return (rc, timed_out, stdout, stderr).
+
+    The command is the leader of its own session, and its whole process group is killed when it ends or times out, so
+    nothing the agent forked into the background survives into grading (ADR 0010). Output goes to private temp files,
+    not pipes: a background child that still holds stdout cannot keep this call waiting. A process that leaves the
+    group with `setsid` is out of reach; only a container (`end_step`) stops that."""
+    with (
+        tempfile.TemporaryFile("w+", errors="replace") as out_file,
+        tempfile.TemporaryFile("w+", errors="replace") as err_file,
+    ):
+        proc = subprocess.Popen(
+            argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=out_file, stderr=err_file, start_new_session=True
         )
-        return p.returncode, False, p.stdout, p.stderr
-    except subprocess.TimeoutExpired as e:
-        out = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
-        err = e.stderr.decode() if isinstance(e.stderr, bytes) else (e.stderr or "")
-        return -1, True, out, err
+        try:
+            timed_out = not _wait_unreaped(proc.pid, timeout)
+        finally:
+            # The leader is not reaped yet, so its pid cannot name another process group: kill, then reap. The group
+            # can be gone only if `waitid` failed because someone else reaped the leader; that error must not be
+            # replaced by a lookup error.
+            with contextlib.suppress(ProcessLookupError):
+                _kill_group(proc.pid)
+            status = proc.wait()
+        rc = -1 if timed_out else status
+        out_file.seek(0)
+        err_file.seek(0)
+        return rc, timed_out, out_file.read(), err_file.read()
 
 
 def git_bin() -> str:
@@ -706,11 +751,34 @@ def resolve_work_root(cfg: Mapping[str, Any], base: Path) -> Path:
             sys.exit(f"work_dir {root} is inside the benchmark repo; use a path outside it")
         root.mkdir(parents=True, exist_ok=True)
         return root
-    return Path(tempfile.mkdtemp(prefix="harness-bench-work-"))
+    root = Path(tempfile.mkdtemp(prefix="harness-bench-work-"))
+    plant_token(root)
+    return root
+
+
+OWNER_MARK_FILE = ".hb-owner"
+
+
+def plant_token(directory: Path) -> str:
+    """Put a random token in a private temp dir the engine made, and return it. A killed run's heartbeat names the
+    token, and resume deletes only a dir that still holds it: a heartbeat file cannot make it delete another dir."""
+    token = secrets.token_hex(16)
+    fd = os.open(directory / OWNER_MARK_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(token)
+    return token
+
+
+def holds_token(directory: Path, token: object) -> bool:
+    """Whether `directory` holds exactly the (non-empty) `token`."""
+    try:
+        return isinstance(token, str) and bool(token) and (directory / OWNER_MARK_FILE).read_text() == token
+    except OSError:
+        return False
 
 
 def run_step(
-    cfg: Mapping[str, Any],
+    session: SandboxSession,
     command: str,
     env: Mapping[str, str],
     timeout: float,
@@ -718,27 +786,53 @@ def run_step(
     workdir: Path,
     env_file: Path,
     secrets: Iterable[str],
+    lost: list[str] | None = None,
 ) -> tuple[int, bool, str, str]:
     """Run a setup or grader command in the sandbox wrapper and write its redacted log (stdout, then stderr).
-    Returns `(rc, timed_out, stdout, stderr)`, both redacted and kept apart: a score is only read from stdout."""
+    Returns `(rc, timed_out, stdout, stderr)`, both redacted and kept apart: a score is only read from stdout.
+    When the sandbox cannot end the step (its container is not shown to be gone), the reason goes to `lost`; without
+    a `lost` list it raises `SandboxError`."""
     write_env_file(env, env_file)
     try:
-        rc, to, out, err = run_proc(wrap(cfg, ["sh", "-c", command], workdir, env_file), workdir, env, timeout)
+        rc, to, out, err = run_proc(wrap(session, ["sh", "-c", command], env_file), workdir, env, timeout)
     finally:
         env_file.unlink(missing_ok=True)
+        end_step_or_record(session, lost)
     out, err = redact(out, secrets), redact(err, secrets)
     log_path.write_text(out + "\n--- stderr ---\n" + err)
     return rc, to, out, err
 
 
+def end_step_or_record(session: SandboxSession, lost: list[str] | None) -> None:
+    """End the step of the session. A failure (a container that cannot be shown to be gone) is recorded in `lost`
+    and printed, so the engine can fail the trial closed; without a `lost` list it is raised."""
+    try:
+        session.end_step()
+    except SandboxError as e:
+        if lost is None:
+            raise
+        print(f"warning: {e}")
+        lost.append(str(e))
+
+
+def destroy_or_warn(session: SandboxSession, what: str) -> None:
+    """Destroy the session at the end of a trial. The verdict is already decided, so a container that cannot be
+    removed is a warning."""
+    try:
+        session.destroy()
+    except SandboxError as e:
+        print(f"warning: could not remove the sandbox of {what}: {e}")
+
+
 def step_runner(
-    cfg: Mapping[str, Any],
+    session: SandboxSession,
     logs_dir: Path,
     tag: str,
     workdir: Path,
     env_file: Path,
     secrets: Iterable[str],
     env: Mapping[str, str],
+    lost: list[str] | None = None,
 ) -> Callable[[str], RunStep]:
     """`run_for(prefix)` for `grade_trial`: a `RunStep` that goes through `run_step` (sandbox wrapper, env allowlist,
     redacted log named `<tag>.<prefix><log name>.log` in `logs_dir`)."""
@@ -747,7 +841,7 @@ def step_runner(
     def run_for(prefix: str) -> RunStep:
         def run(command: str, timeout: int, log_name: str) -> tuple[int, bool, str, str]:
             log = logs_dir / f"{tag}.{prefix}{safe(log_name)}.log"
-            return run_step(cfg, command, env, timeout, log, workdir, env_file, secret_list)
+            return run_step(session, command, env, timeout, log, workdir, env_file, secret_list, lost)
 
         return run
 
@@ -870,24 +964,28 @@ def run_task_attempt(
     prepare_workdir(task, base, workdir)
     env = base_env(cfg)
     secrets = [os.environ.get(v, "") for v in spend_key_vars(cfg)]
-    run_for = step_runner(cfg, logs_dir, tag, workdir, work_root / f".{tag}.env", secrets, env)
-    if task.get("setup"):
-        run_for("")(task["setup"], task.get("setup_timeout", 900), "setup")
-    git_dir = git_root / f"{tag}.git"
-    baseline = make_baseline(workdir, git_dir)
-    snap = Path(tempfile.mkdtemp(prefix=f".{tag}.protected-", dir=work_root))
-    snapshot_protected(task, workdir, snap)
-    if solution is not None:
-        safe_copy_into(solution, workdir, ignore=PYCACHE)  # never through a link the repo left in the workdir
-    changes = collect_changes(baseline)
-    rmtree_inside(git_dir, git_root)
-    restore_protected(task, workdir, snap)
-    rmtree_inside(snap, work_root)
-    with_task = {**cfg, "tasks": [task]}
-    judge = make_judge(with_task, secrets, load_redactor(cfg["judge"]) if uses_judge(with_task) else None)
-    passed, _ = grade_trial(
-        grade_plan(task), task, base, workdir, changes, run_for, judge, grader_logger(logs_dir, tag, secrets)
-    )
+    session = make_sandbox(cfg).create(workdir, safe(tag))
+    try:
+        run_for = step_runner(session, logs_dir, tag, workdir, work_root / f".{tag}.env", secrets, env)
+        if task.get("setup"):
+            run_for("")(task["setup"], task.get("setup_timeout", 900), "setup")
+        git_dir = git_root / f"{tag}.git"
+        baseline = make_baseline(workdir, git_dir)
+        snap = Path(tempfile.mkdtemp(prefix=f".{tag}.protected-", dir=work_root))
+        snapshot_protected(task, workdir, snap)
+        if solution is not None:
+            safe_copy_into(solution, workdir, ignore=PYCACHE)  # never through a link the repo left in the workdir
+        changes = collect_changes(baseline)
+        rmtree_inside(git_dir, git_root)
+        restore_protected(task, workdir, snap)
+        rmtree_inside(snap, work_root)
+        with_task = {**cfg, "tasks": [task]}
+        judge = make_judge(with_task, secrets, load_redactor(cfg["judge"]) if uses_judge(with_task) else None)
+        passed, _ = grade_trial(
+            grade_plan(task), task, base, workdir, changes, run_for, judge, grader_logger(logs_dir, tag, secrets)
+        )
+    finally:
+        session.destroy()
     rmtree_inside(workdir, work_root)
     return passed
 
@@ -905,7 +1003,7 @@ def validate_task_behavior(cfg: Mapping[str, Any], task: Mapping[str, Any], base
     return TaskCheck(task_id=task["id"], untouched_passed=untouched, solution_passed=solved)
 
 
-def make_run_info(cfg: Mapping[str, Any], only: Sequence[str] | None, sandboxed: bool) -> RunInfo:
+def make_run_info(cfg: Mapping[str, Any], only: Sequence[str] | None, sandbox: Sandbox) -> RunInfo:
     """Metadata of this `run`. The config hash covers `${VAR}` references, never expanded values, and the
     config as written: the tasks that came from suites are not part of it."""
     targets = tuple(
@@ -923,11 +1021,12 @@ def make_run_info(cfg: Mapping[str, Any], only: Sequence[str] | None, sandboxed:
         started_at=datetime.now(UTC),
         finished_at=None,
         harness_bench_version=VERSION,
-        config_sha256=sha256_json({**cfg, "tasks": [t for t in cfg["tasks"] if "suite" not in t]}),
+        config_sha256=config_hash(cfg),
         suite_version=suite_version_of(cfg["tasks"]),
         python=platform.python_version(),
         platform=platform.platform(),
-        sandboxed=sandboxed,
+        sandboxed=sandbox.isolated,
+        sandbox=sandbox.describe(),
         targets=targets,
     )
 
@@ -936,13 +1035,113 @@ def cmd_run(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path) -> Non
     """Run the matrix. The baseline git dirs of the trials live in a private temp dir that is always removed: not in
     `work_dir`, whose names an unsandboxed agent could guess."""
     with tempfile.TemporaryDirectory(prefix="harness-bench-git-") as git_root:
+        plant_token(Path(git_root))
         _run_matrix(args, cfg, base, Path(git_root))
+
+
+@dataclass(frozen=True)
+class _Matrix:
+    """What every trial of one `run` shares."""
+
+    cfg: Mapping[str, Any]
+    base: Path
+    work_root: Path
+    git_root: Path
+    logs_dir: Path
+    results_path: Path
+    writer: RunWriter
+    heartbeat: Heartbeat
+    sandbox: Sandbox
+    plans: Mapping[str, GradePlan]
+    redactor: Callable[[str], str] | None
+    secrets: Sequence[str]
+    keep: bool
+    resuming: bool
+
+
+@dataclass(frozen=True)
+class _Planned:
+    """One trial of the matrix, before it runs."""
+
+    task: Mapping[str, Any]
+    harness: Mapping[str, Any]
+    hname: str
+    model: str
+    rep: int
+    runner: HarnessRunner
+    price: Mapping[str, Any] | None
+
+
+def _planned_trials(cfg: Mapping[str, Any], only: Sequence[str] | None, reps: int) -> Iterator[_Planned]:
+    """Every trial of the matrix in run order: pairs, then tasks, then repetitions."""
+    prices = cfg.get("prices", {})
+    for pair in cfg["matrix"]:
+        hname, model = pair["harness"], pair["model"]
+        if only and hname not in only:
+            continue
+        for task in cfg["tasks"]:
+            for rep in range(1, reps + 1):
+                harness = cfg["harnesses"][hname]
+                price = prices.get(pair.get("price", model))
+                yield _Planned(task, harness, hname, model, rep, runner_for(harness), price)
+
+
+def planned_trial_id(run_id: str, planned: _Planned) -> str:
+    """The `trial_id` the trial will have in `trials.jsonl`: known before it runs, so resume can match it."""
+    target = Target(harness=planned.hname, harness_version=planned.runner.version(), model=planned.model, params={})
+    return trial_id(run_id, planned.task["id"], target.target_id, planned.rep)
+
+
+def config_hash(cfg: Mapping[str, Any]) -> str:
+    """The hash of the config as written (`${VAR}` references, not values; suite tasks left out)."""
+    return sha256_json({**cfg, "tasks": [t for t in cfg["tasks"] if "suite" not in t]})
+
+
+def open_resumed_run(out_dir: Path, run_id: str, cfg: Mapping[str, Any], force: bool) -> RunWriter:
+    """The writer of the run `run_id` for `--resume`. Exits with a message when the run cannot be resumed: it does not
+    exist, its files are invalid, the config is not the one it ran with, or a live process still holds it."""
+    try:
+        writer = RunWriter.open_existing(out_dir, run_id)
+        writer.trials()  # reads trials.jsonl now, so a bad file stops the resume before anything runs
+    except ResumeError as e:
+        sys.exit(f"resume: {e}")
+    if writer.info.config_sha256 != config_hash(cfg):
+        sys.exit(f"resume: the config changed since run {run_id} started; resume it with the config it ran with")
+    if not force and heartbeat_is_live(writer.run_dir / HEARTBEAT_FILE):
+        sys.exit(f"resume: run {run_id} is still running (its heartbeat is fresh and its process alive); use --force")
+    return writer
+
+
+def discard_leftovers(heartbeat_path: Path) -> None:
+    """Remove the private temp dirs a killed run left (its baseline git dirs and its work dir, with the env files in
+    it). The paths come from its heartbeat file, which an agent may have written, so a dir is removed only when it
+    sits directly in the temp dir, is no link, has the engine's name and holds the token the heartbeat names."""
+    data = read_heartbeat(heartbeat_path) or {}
+    tmp = Path(tempfile.gettempdir())
+    for key, prefix in (("git", "harness-bench-git-"), ("work", "harness-bench-work-")):
+        value = data.get(f"{key}_root")
+        path = Path(value) if isinstance(value, str) else None
+        owned = path and path.name.startswith(prefix) and path.parent.resolve() == tmp.resolve()
+        if owned and path and not path.is_symlink() and holds_token(path, data.get(f"{key}_token")):
+            rmtree_inside(path, tmp)
+
+
+def restore_legacy_rows(writer: RunWriter, results_path: Path) -> None:
+    """Write the `results.jsonl` row of every trial of the run that has none: a run killed between the two files."""
+    done = done_keys(results_path)
+    for trial in writer.trials():
+        if (trial.task_id, trial.target.harness, trial.target.model, trial.rep) not in done:
+            with results_path.open("a") as f:
+                f.write(json.dumps(row_from_trial(trial)) + "\n")
 
 
 def _run_matrix(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path, git_root: Path) -> None:
     cfg = expand_suites(cfg, base)
     validate_config(cfg)
-    sandboxed = is_sandboxed(cfg)
+    resume_id = getattr(args, "resume", None)
+    if resume_id and args.dry_run:
+        sys.exit("resume: --resume and --dry-run cannot be combined")
+    sandbox = make_sandbox(cfg)
     if not args.dry_run:
         require_sandbox(cfg, args.allow_unsandboxed)
     out_dir = base / cfg.get("output_dir", "results")
@@ -950,155 +1149,205 @@ def _run_matrix(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path, gi
     logs_dir = out_dir / "logs"
     logs_dir.mkdir(exist_ok=True)
     results_path = out_dir / "results.jsonl"
-    finished = done_keys(results_path)
     reps = args.reps or cfg.get("reps", 1)
-    harnesses = cfg["harnesses"]
-    prices = cfg.get("prices", {})
+    writer = None
+    if resume_id:
+        writer = open_resumed_run(out_dir, resume_id, cfg, getattr(args, "force", False))
+        discard_leftovers(writer.run_dir / HEARTBEAT_FILE)
+        restore_legacy_rows(writer, results_path)
     work_root = None if args.dry_run else resolve_work_root(cfg, base)
     if work_root:
         print(f"work dir: {work_root}")
-    secrets_all = [os.environ.get(v, "") for v in spend_key_vars(cfg)]
-    plans = {task["id"]: grade_plan(task) for task in cfg["tasks"]}
-    redactor = load_redactor(cfg["judge"]) if uses_judge(cfg) else None
-    writer = None if args.dry_run else RunWriter(out_dir, make_run_info(cfg, args.only, sandboxed))
+    if not (args.dry_run or resume_id):
+        writer = RunWriter(out_dir, make_run_info(cfg, args.only, sandbox))
+    finished = done_keys(results_path)
+    finished_ids = writer.finished_trial_ids() if writer else set()
+    shared = None
+    if work_root and writer:  # a dry run has neither
+        # The temp dirs a killed run leaves are found again by resume through these paths and tokens.
+        paths = {"git_root": str(git_root), "git_token": (git_root / OWNER_MARK_FILE).read_text()}
+        if not cfg.get("work_dir"):
+            paths |= {"work_root": str(work_root), "work_token": (work_root / OWNER_MARK_FILE).read_text()}
+        shared = _Matrix(
+            cfg=cfg,
+            base=base,
+            work_root=work_root,
+            git_root=git_root,
+            logs_dir=logs_dir,
+            results_path=results_path,
+            writer=writer,
+            heartbeat=Heartbeat(writer.run_dir / HEARTBEAT_FILE, extra=paths),
+            sandbox=sandbox,
+            plans={task["id"]: grade_plan(task) for task in cfg["tasks"]},
+            redactor=load_redactor(cfg["judge"]) if uses_judge(cfg) else None,
+            secrets=[os.environ.get(v, "") for v in spend_key_vars(cfg)],
+            keep=args.keep,
+            resuming=bool(resume_id),
+        )
 
-    for pair in cfg["matrix"]:
-        hname, model = pair["harness"], pair["model"]
-        if args.only and hname not in args.only:
-            continue
-        h = harnesses[hname]
-        price = prices.get(pair.get("price", model))
-        for task in cfg["tasks"]:
-            for rep in range(1, reps + 1):
+    try:
+        with shared.heartbeat if shared else contextlib.nullcontext():
+            for planned in _planned_trials(cfg, args.only, reps):
+                task, hname, model, rep = planned.task, planned.hname, planned.model, planned.rep
                 key = (task["id"], hname, model, rep)
-                if key in finished and not args.dry_run:
+                tid = planned_trial_id(writer.info.run_id, planned) if writer else ""
+                if (key in finished or tid in finished_ids) and not args.dry_run:
                     print(f"skip  {key} (done)")
                     continue
-                runner = runner_for(h)
-                cmd = runner.command(model, task["prompt"])
-                if work_root is None or writer is None:  # dry run: no work dir and no writer
-                    print(shlex.join(cmd))
+                if shared is None:  # dry run: no work dir and no writer
+                    print(shlex.join(planned.runner.command(model, task["prompt"])))
                     continue
-                tag = f"{safe(task['id'])}__{safe(hname)}__{safe(model)}__r{rep}"
-                workdir = work_root / tag
-                run_tag = f"bench-{datetime.now().strftime('%Y%m%d%H%M%S')}-{tag}"
-                cmd_env = base_env(cfg)
-                agent_env = dict(cmd_env, BENCH_TAG=run_tag)  # Pi/OpenCode/Codex send it as x-litellm-tags
-                harness_env = {k: expand_env(v).replace("{run_tag}", run_tag) for k, v in h.get("env", {}).items()}
-                agent_env.update(harness_env)
-                secrets = secrets_all + [v for v in harness_env.values() if v != run_tag]
-                if workdir.exists():
-                    rmtree_inside(workdir, work_root)
-                prepare_workdir(task, base, workdir)
-                env_file = work_root / f".{tag}.env"
-
-                if task.get("setup"):
-                    run_step(
-                        cfg,
-                        task["setup"],
-                        cmd_env,
-                        task.get("setup_timeout", 900),
-                        logs_dir / f"{tag}.setup.log",
-                        workdir,
-                        env_file,
-                        secrets,
-                    )
-                runner.prepare(workdir)
-                git_dir = git_root / f"{tag}.git"
-                baseline = make_baseline(workdir, git_dir)
-                snap = work_root / f".{tag}.protected"
-                if snap.exists():
-                    rmtree_inside(snap, work_root)
-                snap.mkdir()
-                snapshot_protected(task, workdir, snap)
-
-                print(f"run   {tag}", flush=True)
-                t0 = time.time()
-                write_env_file(agent_env, env_file)
-                try:
-                    rc, timed_out, stdout, stderr = run_proc(
-                        wrap(cfg, cmd, workdir, env_file),
-                        workdir,
-                        agent_env,
-                        task.get("timeout", cfg.get("timeout", 1800)),
-                    )
-                finally:
-                    env_file.unlink(missing_ok=True)
-                wall = time.time() - t0
-                (logs_dir / f"{tag}.agent.jsonl").write_text(redact(stdout, secrets))
-                (logs_dir / f"{tag}.agent.stderr").write_text(redact(stderr, secrets))
-
-                usage = runner.parse_usage(stdout)
-                parse_ok = usage is not None
-                usage = usage or empty_usage()
-
-                # Captured before the protected paths are restored: an edit there must still count as a change.
-                changes = collect_changes(baseline)
-                save_diff(baseline, logs_dir / f"{tag}.diff", secrets=secrets)
-                rmtree_inside(git_dir, git_root)
-                restore_protected(task, workdir, snap)
-                rmtree_inside(snap, work_root)
-
-                run_for = step_runner(cfg, logs_dir, tag, workdir, env_file, secrets, cmd_env)
-
-                judge = make_judge(cfg, secrets, redactor)
-                passed, grader_results = grade_trial(
-                    plans[task["id"]],
-                    task,
-                    base,
-                    workdir,
-                    changes,
-                    run_for,
-                    judge,
-                    grader_logger(logs_dir, tag, secrets),
-                )
-                test_to = any(r.timed_out for r in grader_results)
-
-                row = {
-                    "ts": datetime.now(UTC).isoformat(timespec="seconds"),
-                    "task": task["id"],
-                    "harness": hname,
-                    "model": model,
-                    "rep": rep,
-                    "passed": passed,
-                    "agent_rc": rc,
-                    "agent_timed_out": timed_out,
-                    "wall_s": round(wall, 1),
-                    "parse_ok": parse_ok,
-                    "run_tag": run_tag,
-                    "t_start": t0,
-                    "t_end": t0 + wall,
-                    "sandboxed": sandboxed,
-                    **usage,
-                    "cost_computed": computed_cost(usage, price) if parse_ok else None,
-                }
-                # Built before the legacy row is written, so a bad row cannot leave the two files out of step.
-                trial = trial_from_row_lenient(
-                    row,
-                    run_id=writer.info.run_id,  # dry runs never reach this point, so the writer exists
-                    suite_version=writer.info.suite_version,
-                    harness_version=runner.version(),
-                    test_timed_out=test_to,
-                    graders=grader_results if task.get("graders") else None,
-                    warn=print,
-                )
-                with results_path.open("a") as f:
-                    f.write(json.dumps(row) + "\n")
-                writer.append(trial)
-                tokens = sum(usage[k] for k in ("input", "output", "reasoning", "cache_read", "cache_write"))
-                print(
-                    f"done  {tag} passed={row['passed']} tokens={tokens}"
-                    f" cost={row['cost_computed'] if row['cost_computed'] is not None else usage['cost_reported']}",
-                    flush=True,
-                )
-                if not args.keep:
-                    rmtree_inside(workdir, work_root)
-    if work_root and not args.keep and not cfg.get("work_dir"):
-        shutil.rmtree(work_root, ignore_errors=True)
+                _run_trial(shared, planned, tid)
+    finally:  # also when a trial raises: the private work dir is never left behind
+        if work_root and not args.keep and not cfg.get("work_dir"):
+            shutil.rmtree(work_root, ignore_errors=True)
     if writer:
         writer.close(datetime.now(UTC))
     if not args.dry_run and not getattr(args, "no_report", False):
         cmd_report(args, cfg, base)
+
+
+def _run_trial(m: _Matrix, planned: _Planned, tid: str) -> None:
+    """One trial: workdir, setup, baseline, agent, audit diff, protected paths, graders; then its two result rows
+    (`trials.jsonl` first, flushed to disk, so a crash between the two can only lose the legacy row). The trial's
+    sandbox session is always destroyed."""
+    task, h, hname, model, rep = planned.task, planned.harness, planned.hname, planned.model, planned.rep
+    runner, price = planned.runner, planned.price
+    cmd = runner.command(model, task["prompt"])
+    m.heartbeat.beat(tid, "setup")
+    if m.resuming:
+        m.sandbox.reclaim(tid)  # a container the killed run left running for this very trial
+    tag = f"{safe(task['id'])}__{safe(hname)}__{safe(model)}__r{rep}"
+    workdir = m.work_root / tag
+    run_tag = f"bench-{datetime.now().strftime('%Y%m%d%H%M%S')}-{tag}"
+    cmd_env = base_env(m.cfg)
+    agent_env = dict(cmd_env, BENCH_TAG=run_tag)  # Pi/OpenCode/Codex send it as x-litellm-tags
+    harness_env = {k: expand_env(v).replace("{run_tag}", run_tag) for k, v in h.get("env", {}).items()}
+    agent_env.update(harness_env)
+    secrets = list(m.secrets) + [v for v in harness_env.values() if v != run_tag]
+    if workdir.exists():
+        rmtree_inside(workdir, m.work_root)
+    prepare_workdir(task, m.base, workdir)
+    env_file = m.work_root / f".{tag}.env"
+    env_file.unlink(missing_ok=True)  # the env file of a killed run holds secrets
+    session = m.sandbox.create(workdir, tid)
+    lost: list[str] = []  # why a step's container could not be shown to be gone: the trial then fails closed
+    try:
+        if task.get("setup"):
+            run_step(
+                session,
+                task["setup"],
+                cmd_env,
+                task.get("setup_timeout", 900),
+                m.logs_dir / f"{tag}.setup.log",
+                workdir,
+                env_file,
+                secrets,
+                lost,
+            )
+        runner.prepare(workdir)
+        git_dir = m.git_root / f"{tag}.git"
+        baseline = make_baseline(workdir, git_dir)
+        snap = m.work_root / f".{tag}.protected"
+        if snap.exists():
+            rmtree_inside(snap, m.work_root)
+        snap.mkdir()
+        snapshot_protected(task, workdir, snap)
+
+        print(f"run   {tag}", flush=True)
+        m.heartbeat.beat(tid, "agent")
+        t0 = time.time()
+        write_env_file(agent_env, env_file)
+        try:
+            rc, timed_out, stdout, stderr = run_proc(
+                wrap(session, cmd, env_file),
+                workdir,
+                agent_env,
+                task.get("timeout", m.cfg.get("timeout", 1800)),
+            )
+        finally:
+            env_file.unlink(missing_ok=True)
+            end_step_or_record(session, lost)  # the agent's container must be gone before anything reads the workdir
+        wall = time.time() - t0
+        (m.logs_dir / f"{tag}.agent.jsonl").write_text(redact(stdout, secrets))
+        (m.logs_dir / f"{tag}.agent.stderr").write_text(redact(stderr, secrets))
+
+        usage = runner.parse_usage(stdout)
+        parse_ok = usage is not None
+        usage = usage or empty_usage()
+
+        # Captured before the protected paths are restored: an edit there must still count as a change.
+        changes = UNKNOWN_CHANGES if lost else collect_changes(baseline)
+        save_diff(baseline, m.logs_dir / f"{tag}.diff", secrets=secrets)
+        rmtree_inside(git_dir, m.git_root)
+        restore_protected(task, workdir, snap)
+        rmtree_inside(snap, m.work_root)
+
+        run_for = step_runner(session, m.logs_dir, tag, workdir, env_file, secrets, cmd_env, lost)
+
+        m.heartbeat.beat(tid, "grade")
+        judge = make_judge(m.cfg, secrets, m.redactor)
+        passed = False
+        grader_results: list[GraderResult] = []  # a container that may still write to the workdir is never graded
+        if not lost:
+            passed, grader_results = grade_trial(
+                m.plans[task["id"]],
+                task,
+                m.base,
+                workdir,
+                changes,
+                run_for,
+                judge,
+                grader_logger(m.logs_dir, tag, secrets),
+            )
+        passed = passed and not lost  # also when it was a grader's own container
+    finally:
+        destroy_or_warn(session, tag)
+    m.heartbeat.beat(tid, "record")
+    test_to = any(r.timed_out for r in grader_results)
+
+    row = {
+        "ts": datetime.now(UTC).isoformat(timespec="seconds"),
+        "task": task["id"],
+        "harness": hname,
+        "model": model,
+        "rep": rep,
+        "passed": passed,
+        "agent_rc": rc,
+        "agent_timed_out": timed_out,
+        "wall_s": round(wall, 1),
+        "parse_ok": parse_ok,
+        "run_tag": run_tag,
+        "t_start": t0,
+        "t_end": t0 + wall,
+        "sandboxed": m.sandbox.isolated,
+        **usage,
+        "cost_computed": computed_cost(usage, price) if parse_ok else None,
+    }
+    # Built before the legacy row is written, so a bad row cannot leave the two files out of step.
+    trial = replace(
+        trial_from_row_lenient(
+            row,
+            run_id=m.writer.info.run_id,
+            suite_version=m.writer.info.suite_version,
+            harness_version=runner.version(),
+            test_timed_out=test_to,
+            graders=grader_results if task.get("graders") else None,
+            warn=print,
+        ),
+        image_digest=m.sandbox.image_digest(),
+    )
+    m.writer.append(trial)
+    with m.results_path.open("a") as f:
+        f.write(json.dumps(row) + "\n")
+    tokens = sum(usage[k] for k in ("input", "output", "reasoning", "cache_read", "cache_write"))
+    print(
+        f"done  {tag} passed={row['passed']} tokens={tokens}"
+        f" cost={row['cost_computed'] if row['cost_computed'] is not None else usage['cost_reported']}",
+        flush=True,
+    )
+    if not m.keep:
+        rmtree_inside(workdir, m.work_root)
 
 
 # ---------------------------------------------------------------- LiteLLM

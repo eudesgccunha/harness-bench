@@ -84,6 +84,9 @@ docker build -f sandbox/Dockerfile -t harness-bench-agents \
   --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
 python3 tests/docker_e2e.py
 
+# 1b. Check the setup (spends nothing): config, variables, CLIs inside the image, image digest, network, URLs
+python3 -m hbench doctor --config config.litellm.json            # add --network to GET the LiteLLM health and the spend key
+
 # 2. Check the generated commands (spends nothing)
 python3 harness_bench_litellm.py run --config config.litellm.json --dry-run
 
@@ -91,8 +94,12 @@ python3 harness_bench_litellm.py run --config config.litellm.json --dry-run
 python3 harness_bench_litellm.py run --config config.litellm.json --reps 1 --only pi
 python3 harness_bench_litellm.py run --config config.litellm.json --reps 1 --only claude-code opencode
 
-# 4. Full round (resumes where it stopped)
+# 4. Full round (a second run of the same config skips the finished tasks)
 python3 harness_bench_litellm.py run --config config.litellm.json
+
+#    If the run was killed, continue that very run: finished trials are skipped by trial_id
+#    (the run id is the name of its directory under results-litellm/)
+python3 harness_bench_litellm.py run --config config.litellm.json --resume RUN_ID
 
 # 5. If LiteLLM wrote its logs late
 python3 harness_bench_litellm.py reconcile --config config.litellm.json

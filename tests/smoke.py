@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -459,6 +460,36 @@ def main() -> None:
         )
         p = run(tmp, "harness_bench.py", "run", "--allow-unsandboxed", config=remote, expect_ok=False)
         check(p.returncode != 0 and "judge.base_url" in p.stderr, "judge: plain http to a remote host is refused")
+
+        # --- a process the agent leaves running in the background is killed with its process group, before grading
+        bg_file = tmp / "background.txt"
+        os.environ["FAKE_BG_FILE"] = str(bg_file)
+        steady = (
+            f"{PY} -c \"import os, time; p = os.environ['FAKE_BG_FILE']; a = os.path.getsize(p); time.sleep(0.5); "
+            'b = os.path.getsize(p); raise SystemExit(0 if a == b else 1)"'
+        )
+        bg_env = dict(harness_env, FAKE_BG_FILE="${FAKE_BG_FILE}")
+        cfg9 = dict(
+            cfg,
+            output_dir="results-bg",
+            env_passthrough=["FAKE_BG_FILE"],
+            tasks=[dict(fizz, graders=[{"type": "hidden_tests"}, {"type": "command", "command": steady}])],
+            harnesses={"claude": fixtures.harness("claude", bg_env, "fork-bg")},
+            matrix=[{"harness": "claude", "model": "m"}],
+        )
+        (tmp / "config9.json").write_text(json.dumps(cfg9))
+        run(tmp, "harness_bench.py", "run", "--allow-unsandboxed", config="config9.json")
+        (bg_row,) = results(tmp / "results-bg/results.jsonl")
+        grew = bg_file.stat().st_size
+        time.sleep(0.5)
+        check(
+            grew > 0 and bg_file.stat().st_size == grew,
+            "process group: a background process the agent left behind is dead after the agent step",
+        )
+        check(
+            bg_row["passed"] and not bg_row["agent_timed_out"],
+            "process group: it was gone before grading, and it never held the agent step up",
+        )
 
         # --- config validation and URL policy
         for bad, why in (

@@ -55,3 +55,43 @@ def safe_copy_into(src: Path, dest_root: Path, ignore: Ignore | None = None) -> 
             if name not in skipped:
                 _clear(target / name)
                 shutil.copy2(Path(dirpath) / name, target / name)
+
+
+def safe_copy_to(src: Path, dest_root: Path, rel: Path) -> None:
+    """Copy the file or tree `src` to `dest_root / rel`, never through a link the agent planted on the way (see
+    `safe_copy_into`). A tree is merged with what is there."""
+    if src.is_dir():
+        safe_copy_into(src, _real_directory(dest_root, rel))
+        return
+    parent = _real_directory(dest_root, rel.parent)
+    _clear(parent / rel.name)
+    shutil.copy2(src, parent / rel.name)
+
+
+def _regular_or_directory(path: Path) -> int:
+    """The `st_mode` of `path` if it is a regular file or a directory (a link is never followed), else `ValueError`."""
+    mode = os.lstat(path).st_mode
+    if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+        raise ValueError(f"{path} is not a regular file or directory (a link or special file is refused)")
+    return mode
+
+
+def copy_out_tree(root: Path, rel: Path, dest: Path) -> None:
+    """Copy `root / rel`, written by the untrusted agent, to the host path `dest`. A symlink anywhere on the way or
+    inside it, or any special file, raises `ValueError` before that entry is copied: the copy never reads a host
+    file through a link the agent planted. A missing `rel` raises `FileNotFoundError`."""
+    current = root
+    for part in rel.parts:
+        current = current / part
+        _regular_or_directory(current)
+    if not stat.S_ISDIR(_regular_or_directory(current)):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(current, dest)
+        return
+    for dirpath, dirnames, filenames in os.walk(current):
+        for name in (*dirnames, *filenames):
+            _regular_or_directory(Path(dirpath) / name)
+        target = dest / Path(dirpath).relative_to(current)
+        target.mkdir(parents=True, exist_ok=True)
+        for name in filenames:
+            shutil.copy2(Path(dirpath) / name, target / name)

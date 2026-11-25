@@ -125,3 +125,23 @@ graders never open a socket, they receive a `judge` through `GradeContext`.
 
 `report.py` adds `## Judges` from the trials in `trials.jsonl` and the calibration file named by `judge.calibration`.
 Plan: [`superpowers/plans/2026-11-24-phase-5-artifact-graders.md`](superpowers/plans/2026-11-24-phase-5-artifact-graders.md).
+
+## Phase 6: sandboxes, resume and doctor
+
+Decisions: [ADR 0010](adr/0010-pluggable-sandbox-and-resume.md). A sandbox builds argv and manages its own cleanup;
+the engine still starts every process, so the env allowlist, the timeout, the process-group kill and the redaction
+apply to every sandbox the same way.
+
+| Module | Role |
+|---|---|
+| `hbench/sandboxes/base.py` | The `Sandbox` and `SandboxSession` protocols, `SandboxError`, and `HostSession` (`copy_in`/`copy_out` through `safe_copy`, which never follows a link the agent planted). |
+| `hbench/sandboxes/{prefix,docker,local_tmp}.py` | The three built-in types. `prefix` builds the argv `wrap()` always built; `docker` builds `docker run` with the pinned image, `--network none` by default, `--cap-drop ALL`, the host user and the limits, and `end_step` runs `docker rm -f` for the containers of the command that just ended (killing the client leaves the container running) and `destroy` for any left; `local-tmp` isolates nothing and sets best-effort rlimits through a small launcher. |
+| `hbench/sandboxes/limits.py` | `Limits` (`cpus`, `memory`, `pids`, `cpu_seconds`) and its validation. |
+| `hbench/sandboxes/__init__.py` | `sandbox_for(cfg, run, env)`: the built-in type of `sandbox.type`, else a plugin of `harness_bench.sandboxes`. |
+| `hbench/results.py` | `RunWriter.open_existing`, `finished_trial_ids`, an `fsync` after each trial; `Heartbeat` (a daemon thread rewrites `heartbeat.json` every 30 s) and `heartbeat_is_live`. |
+| `hbench/doctor.py` | The checks behind `python3 -m hbench doctor`. |
+| `harness_bench.py` | `run_proc` kills the process group of every command; `_run_matrix` plans the trials, `_run_trial` runs one with its own session (destroyed in a `finally`); `open_resumed_run`, `restore_legacy_rows` and `discard_leftovers` are the resume path. |
+
+Order of the two result files for a trial: `trials.jsonl` first (flushed to disk), then the legacy row of `results.jsonl`;
+resume rewrites the legacy row of a trial that has none (`row_from_trial`). Contract 1.3.0 adds `RunInfo.sandbox`.
+Plan: [`superpowers/plans/2026-11-24-phase-6-sandbox-resume.md`](superpowers/plans/2026-11-24-phase-6-sandbox-resume.md).

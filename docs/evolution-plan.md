@@ -54,7 +54,7 @@ reading the code. The decisions are in [`adr/`](adr/), the terms in
 | `pip` and a requirements file for dev tools | Dev tools need a reproducible, hash-pinned install | uv manages dev tooling only; `uv.lock` is the source, `Makefile` wraps commands. [ADR 0004](adr/0004-uv-dev-tooling.md) |
 | Python ≥ 3.11 | Both scripts exit below 3.12 | Python 3.12 |
 | Fake harness to be written (Phase 0) | `tests/fake_agent.py` already mimics every CLI | Reuse it |
-| Resume a run (Phase 6) | `done_keys` already skips finished `(task, harness, model, rep)` rows | Phase 6 keeps that key and moves it to `trial_id` |
+| Resume a run (Phase 6) | `done_keys` already skips finished `(task, harness, model, rep)` rows | Phase 6 keeps that key for a plain `run` and adds `run --resume RUN_ID`, which matches by `trial_id` ([ADR 0010](adr/0010-pluggable-sandbox-and-resume.md)) |
 | Target, trial, suite, grader | Code says pair, run, tasks, test | Glossary in [`CONTEXT.md`](../CONTEXT.md) |
 | Separate `roadmap.md` items | M1–M16 overlap the phases | Each M-item now names its phase in [`roadmap.md`](roadmap.md) |
 
@@ -344,15 +344,24 @@ Acceptance: an example suite that generates a synthetic HTML report runs with ru
 
 ### Phase 6 — Pluggable sandbox and long tasks
 
-- [ ] `Sandbox` protocol: `create`, `exec`, `copy_in`, `copy_out`, `destroy`.
-- [ ] Implementations: `local-tmp` (dev, needs an explicit flag) and `docker` (default).
-      Other sandboxes come in as third-party plugins.
-- [ ] Per-trial limits: timeout, CPU, memory, network (gateway allowlist).
-- [ ] Heartbeat and checkpoint for long trials; resume an interrupted run, skipping
-      finished trials (idempotent by `trial_id`; today by `done_keys`).
-- [ ] Image pinned by digest and recorded in the result.
+Decisions: [ADR 0010](adr/0010-pluggable-sandbox-and-resume.md). Plan:
+[`superpowers/plans/2026-11-24-phase-6-sandbox-resume.md`](superpowers/plans/2026-11-24-phase-6-sandbox-resume.md).
 
-Acceptance: kill the process mid-run and resume without repeating finished trials.
+- [x] `Sandbox` protocol: `create`, `argv` (the engine's `run_proc` is the `exec`), `copy_in`,
+      `copy_out`, `destroy`.
+- [x] Implementations: `local-tmp` (dev, needs an explicit flag), `docker` (image pinned by
+      digest) and `prefix` (the older `sandbox.prefix`). Other sandboxes come in as third-party
+      plugins (`harness_bench.sandboxes`).
+- [x] Per-trial limits: timeout, CPU, memory, processes, network (`none` by default; a gateway
+      allowlist through an internal Docker network).
+- [x] Heartbeat and checkpoint for long trials; resume an interrupted run, skipping
+      finished trials (idempotent by `trial_id`; a plain `run` still uses `done_keys`).
+- [x] Image pinned by digest and recorded in the result (contract 1.3.0).
+- [x] `doctor`, process-group cleanup after every command (closes the unsandboxed race noted
+      in the Phase 5 review).
+
+Acceptance: kill the process mid-run and resume without repeating finished trials
+(`tests/test_resume.py`, `KillAndResumeTests`).
 
 ### Phase 7 — Sinks and telemetry (optional)
 

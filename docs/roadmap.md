@@ -14,8 +14,8 @@ Each item is scheduled in a phase of the [evolution plan](evolution-plan.md):
 | M12 task packs | 9 (the Exercism and Terminal-Bench importers need network access and a license review per pack; the suite `provenance` field is their hook) |
 | M3 `null` harness | 2 (done: negative control) |
 | M6 failure breakdown, M14 transcript hygiene | 1 |
-| M7 provenance | 1 (versions in the contract), 6 (image digest) |
-| M8 `doctor`, M15 egress restriction | 6 |
+| M7 provenance | 1 (versions in the contract), 6 (image digest, done) |
+| M8 `doctor`, M15 egress restriction | 6 (done) |
 | M9 partial credit | 3 (done, grader `score`) |
 | M13 trace export | 7 |
 | M16 skills axis | after 2 (needs M1, M3, M11) |
@@ -62,9 +62,15 @@ Classify each failed run as `wrong_answer` (test failed), `timeout`, `harness_er
 
 ## M7. Provenance and reproducibility (O)
 
+Phase 6 records the sandbox in `run.json` (`sandbox`) and the pinned image digest in each trial (`image_digest`); the CLI versions and the config hash were already there. What is left: the OS-level detail and the reasoning effort.
+
 Record in each `results.jsonl` line: each CLI's version, the config hash, the task hash, the Docker image digest, the OS and architecture, and the reasoning effort. This makes it safe to merge results from several machines.
 
 ## M8. `doctor` command (O)
+
+Done in Phase 6: `python3 -m hbench doctor --config C [--network]` checks the config, the variables, each CLI (in the image for `docker`), the image digest, the network and the URLs, and with `--network` the LiteLLM health and the spend key. What is left: one minimal call per matrix model.
+
+The original idea:
 
 A check that spends no tokens, or one minimal call:
 
@@ -99,7 +105,7 @@ A `scrub` command that removes emails, home paths, hostnames and key-shaped stri
 
 ## M15. Egress restriction
 
-A Docker network with an egress proxy that allows only the LiteLLM host (see "Why not OpenSandbox (yet)" in `HARNESS_BENCH.md`). It reduces the risk of a prompt injection leaking data.
+Done in Phase 6 without a proxy: the `docker` sandbox runs with `--network none` by default, or on an internal Docker network (`docker network create --internal`) to which only the gateway is attached; `doctor` warns when the network is not internal ([machine-setup.md](machine-setup.md)). A per-domain allowlist (OpenSandbox, see "Why not OpenSandbox (yet)" in `HARNESS_BENCH.md`) is still open. It reduces the risk of a prompt injection leaking data.
 
 ## M16. Skills axis
 

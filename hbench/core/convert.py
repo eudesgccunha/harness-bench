@@ -110,6 +110,43 @@ def trial_from_row(
     )
 
 
+def row_from_trial(trial: TrialResult) -> dict[str, Any]:
+    """The legacy `results.jsonl` row of a trial: what `run --resume` writes again when a run stopped after a trial
+    reached `trials.jsonl` but before its row reached `results.jsonl` (ADR 0010). `started_at` is the row's `ts`,
+    taken when the trial ended, so the agent window is rebuilt backwards from it from `latency_s` (`reconcile` pads
+    that window by an hour). A trial status of timeout is read as an agent timeout."""
+    usage, costs = trial.usage, trial.usage.costs
+    ended = trial.started_at.timestamp()
+    row: dict[str, Any] = {
+        "ts": trial.started_at.isoformat(timespec="seconds"),
+        "task": trial.task_id,
+        "harness": trial.target.harness,
+        "model": trial.target.model,
+        "rep": trial.rep,
+        "passed": trial.passed,
+        "agent_rc": trial.agent_exit_code,
+        "agent_timed_out": trial.status is TrialStatus.TIMEOUT,
+        "wall_s": trial.latency_s,
+        "parse_ok": usage.parsed,
+        "run_tag": trial.trace_id,
+        "t_start": ended - trial.latency_s,
+        "t_end": ended,
+        "sandboxed": trial.sandboxed,
+        "input": usage.input_tokens,
+        "output": usage.output_tokens,
+        "reasoning": usage.reasoning_tokens,
+        "cache_read": usage.cache_read_tokens,
+        "cache_write": usage.cache_write_tokens,
+        "turns": usage.turns,
+        "tool_calls": usage.tool_calls,
+        "cost_reported": costs.harness,
+        "cost_computed": costs.price_table,
+    }
+    if costs.gateway is not None:
+        row["cost_litellm"] = costs.gateway
+    return row
+
+
 def _label(row: Mapping[str, Any]) -> str:
     return str(row.get("run_tag") or f"{row.get('task')}/{row.get('harness')}/{row.get('model')} rep {row.get('rep')}")
 

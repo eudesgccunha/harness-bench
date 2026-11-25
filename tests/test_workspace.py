@@ -4,6 +4,7 @@ import dataclasses
 import os
 import shutil
 import subprocess
+import time
 import unittest
 from pathlib import Path
 from typing import Any
@@ -177,12 +178,14 @@ class RmtreeInsideTests(unittest.TestCase):
 
 
 class WrapTests(unittest.TestCase):
-    def test_without_prefix_returns_argv_unchanged(self) -> None:
-        self.assertEqual(hb.wrap({}, ["a", "b"], "/w", "/e"), ["a", "b"])
+    def test_without_a_sandbox_returns_argv_unchanged(self) -> None:
+        session = hb.make_sandbox({}).create(Path("/w"), "t")
+        self.assertEqual(hb.wrap(session, ["a", "b"], Path("/e")), ["a", "b"])
 
     def test_prefix_is_formatted_and_prepended(self) -> None:
         cfg = {"sandbox": {"prefix": ["box", "--env-file", "{env_file}", "-v", "{workdir}:/w"]}}
-        self.assertEqual(hb.wrap(cfg, ["a"], "/w", "/e"), ["box", "--env-file", "/e", "-v", "/w:/w", "a"])
+        session = hb.make_sandbox(cfg).create(Path("/w"), "t")
+        self.assertEqual(hb.wrap(session, ["a"], Path("/e")), ["box", "--env-file", "/e", "-v", "/w:/w", "a"])
 
 
 class WriteEnvFileTests(unittest.TestCase):
@@ -203,6 +206,59 @@ class RunProcTests(unittest.TestCase):
         code = "import sys, time; print('partial', flush=True); print('e', file=sys.stderr, flush=True); time.sleep(60)"
         rc, timed_out, out, err = hb.run_proc([fixtures.PY, "-c", code], None, os.environ.copy(), 5)
         self.assertEqual((rc, timed_out, out.strip(), err.strip()), (-1, True, "partial", "e"))
+
+
+BACKGROUND_LEADER = """
+import pathlib, subprocess, sys, time
+marker = pathlib.Path(sys.argv[1])
+child = "import sys, time\\nwhile True:\\n    open(sys.argv[1], 'a').write('x')\\n    time.sleep(0.05)\\n"
+subprocess.Popen([sys.executable, "-c", child, str(marker)])  # inherits stdout and stderr, stays in our group
+deadline = time.time() + 30
+while not marker.exists() and time.time() < deadline:
+    time.sleep(0.02)
+if sys.argv[2] == "sleep":
+    time.sleep(120)
+"""
+
+
+def stays_still(path: Path) -> bool:
+    """Whether the file stops growing: its writer appends every 50 ms, so 0.5 s without change means it is gone."""
+    before = path.stat().st_size
+    time.sleep(0.5)
+    return before > 0 and path.stat().st_size == before
+
+
+class ProcessGroupTests(unittest.TestCase):
+    def test_a_background_process_does_not_outlive_the_command_nor_hold_it_up(self) -> None:
+        marker = fixtures.tmpdir(self) / "bg.txt"
+        started = time.time()
+        rc, timed_out, _, _ = hb.run_proc(
+            [fixtures.PY, "-c", BACKGROUND_LEADER, str(marker), "exit"], None, os.environ.copy(), 25
+        )
+        self.assertEqual((rc, timed_out), (0, False))
+        self.assertLess(time.time() - started, 20)  # it did not wait for the child's end of the pipe
+        self.assertTrue(stays_still(marker))
+
+    def test_a_leader_reaped_by_someone_else_raises_that_error_not_a_lookup_error(self) -> None:
+        with mock.patch.object(os, "waitid", side_effect=ChildProcessError(10, "No child processes")):
+            with self.assertRaises(ChildProcessError):
+                hb.run_proc([fixtures.PY, "-c", "pass"], None, os.environ.copy(), 30)
+
+    def test_the_original_error_survives_when_the_group_is_gone_too(self) -> None:
+        with (
+            mock.patch.object(os, "waitid", side_effect=ChildProcessError(10, "No child processes")),
+            mock.patch.object(os, "killpg", side_effect=ProcessLookupError),
+        ):
+            with self.assertRaises(ChildProcessError):
+                hb.run_proc([fixtures.PY, "-c", "pass"], None, os.environ.copy(), 30)
+
+    def test_a_timeout_kills_the_whole_process_group(self) -> None:
+        marker = fixtures.tmpdir(self) / "bg.txt"
+        rc, timed_out, _, _ = hb.run_proc(
+            [fixtures.PY, "-c", BACKGROUND_LEADER, str(marker), "sleep"], None, os.environ.copy(), 5
+        )
+        self.assertEqual((rc, timed_out), (-1, True))
+        self.assertTrue(stays_still(marker))
 
 
 class BuildCmdTests(unittest.TestCase):
@@ -252,8 +308,11 @@ class ResolveWorkRootTests(unittest.TestCase):
 
     def test_default_is_a_fresh_temp_dir(self) -> None:
         root = hb.resolve_work_root({}, fixtures.tmpdir(self))
-        self.addCleanup(root.rmdir)
+        self.addCleanup(shutil.rmtree, root, True)
         self.assertTrue(root.name.startswith("harness-bench-work-"))
+        self.assertEqual(
+            hb.holds_token(root, (root / hb.OWNER_MARK_FILE).read_text()), True
+        )  # it can be recognized again
 
 
 class PrepareWorkdirTests(unittest.TestCase):
@@ -377,7 +436,8 @@ class RunStepTests(unittest.TestCase):
     def test_stdout_and_stderr_come_back_apart_and_redacted_and_the_log_has_both(self) -> None:
         work, log = fixtures.tmpdir(self), fixtures.tmpdir(self) / "step.log"
         script = "echo out-supersecret1; echo err-supersecret1 >&2; exit 3"
-        step = hb.run_step({}, script, dict(os.environ), 30, log, work, work.parent / "env", ["supersecret1"])
+        session = hb.make_sandbox({}).create(work, "t")
+        step = hb.run_step(session, script, dict(os.environ), 30, log, work, work.parent / "env", ["supersecret1"])
         self.assertEqual(step, (3, False, "out-***REDACTED***\n", "err-***REDACTED***\n"))
         self.assertEqual(log.read_text(), "out-***REDACTED***\n\n--- stderr ---\nerr-***REDACTED***\n")
 

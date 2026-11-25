@@ -31,7 +31,11 @@ current name in the existing config and results format until Phase 1 migrates it
 | Cost source | `cost_litellm`, `cost_computed`, `cost_reported` | Origin of a cost. Plan names: `gateway`, `price_table`, `harness`. Order of preference is the same. Unknown cost is `None`, never `0`. |
 | Gateway | LiteLLM | Proxy that bills the model calls and keeps spend logs. |
 | Bench tag | `run_tag`, `BENCH_TAG` | Per-trial tag sent as `x-litellm-tags`; `reconcile` matches spend logs by it. |
-| Sandbox | `sandbox.prefix` | Command prefix (for example `docker run ...`) that isolates the agent and the test command. |
+| Sandbox | `sandbox` section, `Sandbox` protocol | How the commands of a trial run: `docker` (image pinned by digest, no network by default, limits), `prefix` (a command template put in front, such as `docker run ...`) or `local-tmp` (no isolation). A sandbox only builds argv and cleans up; the engine runs every process. |
+| Image digest | `TrialResult.image_digest`, `sandbox.image` | The `sha256:` digest of the image a trial ran in; the `docker` sandbox refuses an image given as a tag. |
+| Heartbeat | `<run_id>/heartbeat.json` | File a running `run` rewrites (pid, host, trial, phase, time) so `--resume` can tell a live run from a killed one. |
+| Resume | `run --resume RUN_ID` | Continue an interrupted run in its own directory, skipping the trials already in its `trials.jsonl` (by `trial_id`). |
+| Doctor | `python3 -m hbench doctor` | Checks that a benchmark can run (config, variables, CLIs, image, network, URLs) without spending tokens. |
 | Cost per solved task | `cost_per_solved` | Main ranking metric: total cost of a target divided by its solved trials. |
 | pass@k | `pass_at_k` (report) | Chance that at least one of k runs of a task passes (capability). Unbiased estimator averaged over tasks; k is the smallest run count of any task for the target. |
 | pass^k | `pass_hat_k` (report) | Chance that all k runs of a task pass (consistency). |

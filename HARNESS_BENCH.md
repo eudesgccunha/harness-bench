@@ -114,7 +114,7 @@ Outputs in `results/`:
 - `summary.md` and `summary.csv`: table sorted by cost per solved task, the statistics sections described in [Reading the report](#reading-the-report) and the per-task pass matrix;
 - `logs/`: each agent's JSON output, stderr, setup, tests, and the `.diff` of everything the agent changed. Known secrets show as `***REDACTED***`.
 
-`run` only starts with `sandbox.prefix` set (see [Security](#security)). Inside a disposable VM, add `--allow-unsandboxed`.
+`run` only starts with a sandbox configured (`sandbox.type` `docker`, or a `sandbox.prefix`; see [Security](#security)). Inside a disposable VM, add `--allow-unsandboxed`. To continue a run that was killed, use `run --resume RUN_ID` (see [Sandbox types, limits, resume and doctor](#sandbox-types-limits-resume-and-doctor)).
 
 ## Reading the report
 
@@ -287,7 +287,7 @@ What the script does on every run:
 9. **Copies never follow a link the agent planted**: the hidden tests (before grading) and the `solution` of `suite validate --run` are copied with `hbench/safe_copy.py`, which replaces any symlink (or hard-linked file) on the destination path with a regular file instead of writing through it. Otherwise an agent that plants `test_hidden.py -> ~/.bashrc` would make the grader overwrite a host file.
 10. **Git transports**: `git clone` of a task repo runs with `GIT_ALLOW_PROTOCOL`: `https:ssh:file` for the tasks of your config, `https` only for suite tasks, so a suite can never clone a private local repo or use your SSH keys. The clone from the local cache into the workdir allows `file` alone.
 
-What the script does **not** solve on its own: without a sandbox, the agent runs as your user and can read any of your files (including `~/.ssh`) and tamper with results. That is why `run` requires `sandbox.prefix` or `--allow-unsandboxed`.
+What the script does **not** solve on its own: without a sandbox, the agent runs as your user and can read any of your files (including `~/.ssh`) and tamper with results. That is why `run` requires a sandbox (`docker` or `sandbox.prefix`) or `--allow-unsandboxed`.
 
 ### Docker sandbox
 
@@ -321,7 +321,30 @@ The `prefix` in the example configs mounts only the workdir, at the same path, a
 - The CLIs authenticate through environment variables (LiteLLM). Your `~/.claude`, `~/.ssh` and similar do not enter the container. Each CLI starts with a clean configuration, which also makes the comparison fairer.
 - `.dockerignore` keeps everything not needed out of the build context (configs, results, tasks).
 - **Network**: besides the `reconcile` `GET`, the engine makes one `POST` per judged artifact to `judge.base_url`, and only when a task uses `llm_rubric` (see [Artifact graders and the LLM judge](#artifact-graders-and-the-llm-judge)). The container has open internet egress, because it must reach LiteLLM. To restrict egress to LiteLLM only, use a Docker network with an egress proxy, or OpenSandbox (below).
-- Validate with `python3 tests/docker_e2e.py`. The test runs fake agents inside the container and checks HOME, UID, secrets and the test results.
+- Validate with `python3 tests/docker_e2e.py`. The test runs fake agents inside the container, once with the `docker` sandbox type and once with a `sandbox.prefix`, and checks HOME, UID, secrets, the test results, the missing network, the removed containers and the recorded image digest.
+
+### Sandbox types, limits, resume and doctor
+
+`sandbox.type` picks how the commands of a trial run ([ADR 0010](docs/adr/0010-pluggable-sandbox-and-resume.md)). Without a `type`, a `prefix` means `prefix` and nothing means `local-tmp`. A sandbox only builds the command; the engine still starts every process, so the env allowlist, the timeout, the log redaction and the process-group kill are the same for all of them.
+
+| Type | What it does | Needs `--allow-unsandboxed` |
+|---|---|---|
+| `docker` | `docker run` of an image **pinned by digest** (`name@sha256:<64 hex>`; a tag is a config error). The workdir is mounted at `/work`. `--network none` by default (or the name of a Docker network), `--cap-drop ALL`, `--security-opt no-new-privileges`, the host user, and `limits`: `cpus`, `memory` (`512m`, `2g`; swap off) and `pids`. `mounts` (`["/host:/container[:ro]"]`) adds helpers such as a CA file; never at or under `/work`. Mount read-only: a writable mount of `docker.sock` or a home directory hands it to the agent and breaks the isolation. Each command is a container named `hb-<trial_id>-<n>`; killing the `docker run` client does not stop its container, so the engine runs `docker rm -f` on it as soon as the command ends or times out, before it reads the workdir or starts the next command. If the container cannot be shown to be gone (`rm` fails or times out, or it is still listed after a second `rm -f`), the trial fails closed: it is not graded and counts as not passed. | no |
+| `prefix` | The older `sandbox.prefix` template (`{workdir}`, `{env_file}`), unchanged. | no |
+| `local-tmp` | No isolation: commands run as your user. `limits` `memory` (`RLIMIT_AS`), `pids` (`RLIMIT_NPROC`, counted over all your processes) and `cpu_seconds` (`RLIMIT_CPU`) are best effort; `cpus` is ignored. | yes |
+
+```json
+"sandbox": {"type": "docker", "image": "harness-bench-agents@sha256:<64 hex>", "network": "hb-egress",
+             "limits": {"cpus": 2, "memory": "4g", "pids": 512}}
+```
+
+The digest of a local image is `docker image inspect harness-bench-agents --format '{{.Id}}'`. The run records the sandbox in `run.json` (`sandbox`) and the digest in every trial (`image_digest`). To let the agents reach only LiteLLM, create an internal network (`docker network create --internal hb-egress`) and attach only the gateway to it ([docs/machine-setup.md](docs/machine-setup.md)). Another package can add a type through the entry-point group `harness_bench.sandboxes` (a factory `(sandbox section) -> Sandbox`).
+
+**Process groups.** Every command runs as the leader of its own session and its whole process group is killed when it ends or times out, so a process the agent forked into the background (`sleep 600 &`) is gone before the graders run. This is best effort outside a container: with `prefix` and `local-tmp`, a process that leaves the group with `setsid` (or a double fork) survives into grading. With `docker` the container's removal stops everything in it.
+
+**Resume.** `run --resume RUN_ID` reopens `<output_dir>/RUN_ID/` (the directory name), keeps the run id and skips every trial already in its `trials.jsonl`; the others run. A trial is written to `trials.jsonl` (and flushed to disk) before its row in `results.jsonl`, so a crash between the two loses only the row, which resume rewrites. It refuses a run whose config changed, a run id that is not a run directory, and a run whose heartbeat (`heartbeat.json`, rewritten every 30 s) is fresh while its process is alive (`--force` overrides). It deletes only the temp dirs (`harness-bench-work-*`, `harness-bench-git-*`) that the killed run's own heartbeat names and whose random token file it still holds. A plain `run` without `--resume` still skips the `(task, harness, model, rep)` rows of `results.jsonl` and writes a new run directory.
+
+**Doctor.** `python3 -m hbench doctor --config config.json [--network]` spends nothing and starts no agent. It checks the config, that every `${VAR}` is set (by name, never by value), each harness CLI (`docker run <image> <cli> --version` for `docker`, with the limits and no network of an agent; `PATH` otherwise), the image and its digest, that the network is `none` or internal, and the LiteLLM and judge URLs. `--network` adds one `GET /health/liveliness` and one page of `/spend/logs/v2` to the configured LiteLLM, to see that the spend key can read. It exits 1 when any check fails; a warning does not fail it.
 
 ### Why not OpenSandbox (yet)
 
@@ -435,13 +458,16 @@ Usage:
 """
 
 import argparse
+import contextlib
 import functools
 import json
 import os
 import platform
 import re
+import secrets
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -450,8 +476,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from email.message import Message
 from pathlib import Path
@@ -463,17 +489,19 @@ if sys.version_info < (3, 12):
 from hbench import cli, report  # noqa: E402
 from hbench import runners as _runners  # noqa: E402
 from hbench.calibration import Calibration, read_calibration  # noqa: E402
-from hbench.core.convert import trial_from_row_lenient, trials_from_rows  # noqa: E402
-from hbench.core.ids import new_run_id, sha256_json  # noqa: E402
+from hbench.core.convert import row_from_trial, trial_from_row_lenient, trials_from_rows  # noqa: E402
+from hbench.core.ids import new_run_id, sha256_json, trial_id  # noqa: E402
 from hbench.core.models import GraderResult, RunInfo, Target  # noqa: E402
 from hbench.graders import GRADERS as GRADERS, Change, GradeContext, GradePlan, compose, grade_plan  # noqa: E402
-from hbench.results import RunWriter, apply_gateway_costs, read_trials  # noqa: E402
+from hbench.results import HEARTBEAT_FILE, Heartbeat, ResumeError, RunWriter, apply_gateway_costs  # noqa: E402
+from hbench.results import heartbeat_is_live, read_heartbeat, read_trials  # noqa: E402
 from hbench.runners import PARSERS as PARSERS, empty_usage as empty_usage, json_lines as json_lines  # noqa: E402
 from hbench.runners import num as num, runner_for  # noqa: E402
 from hbench.graders.base import LogStep, RunStep, discard_log  # noqa: E402
 from hbench.judge import GatewayJudge, Judge, JudgeError  # noqa: E402
 from hbench.plugins import PluginError, redactor_for  # noqa: E402
-from hbench.runners.base import ParseUsage, build_argv  # noqa: E402
+from hbench.runners.base import HarnessRunner, ParseUsage, build_argv  # noqa: E402
+from hbench.sandboxes import Sandbox, SandboxError, SandboxSession, sandbox_for  # noqa: E402
 from hbench.safe_copy import safe_copy_into  # noqa: E402
 from hbench.suites import SUITE_ONLY_KEYS, SUITE_PATH_KEYS, Suite, SuiteError, load_suite, suite_tasks  # noqa: E402
 
@@ -738,6 +766,7 @@ def validate_config(cfg: Mapping[str, Any]) -> None:
         except ValueError as e:
             sys.exit(f"harness {name}: {e}")
     validate_judge(cfg)
+    make_sandbox(cfg)  # exits with a message for a bad `sandbox` section (a tag instead of a digest, bad limits)
     leaked = spend_key_vars(cfg) & (
         set(cfg.get("env_passthrough", []))
         | {v for h in cfg["harnesses"].values() for val in h.get("env", {}).values() for v in env_var_names(val)}
@@ -746,8 +775,17 @@ def validate_config(cfg: Mapping[str, Any]) -> None:
         sys.exit(f"LiteLLM spend key {sorted(leaked)} must not be passed to agents")
 
 
+def make_sandbox(cfg: Mapping[str, Any]) -> Sandbox:
+    """The sandbox of the config (ADR 0010); exits with a message when its section is invalid. Its helper commands
+    (`docker rm`) go through `run_proc` with the env allowlist, like every other command."""
+    try:
+        return sandbox_for(cfg, run_proc, base_env(cfg))
+    except ValueError as e:  # SandboxError and PluginError
+        sys.exit(f"sandbox: {e}")
+
+
 def is_sandboxed(cfg: Mapping[str, Any]) -> bool:
-    return bool((cfg.get("sandbox") or {}).get("prefix"))
+    return make_sandbox(cfg).isolated
 
 
 def require_sandbox(cfg: Mapping[str, Any], allow_unsandboxed: bool) -> None:
@@ -756,8 +794,8 @@ def require_sandbox(cfg: Mapping[str, Any], allow_unsandboxed: bool) -> None:
     if not is_sandboxed(cfg) and not allow_unsandboxed:
         sys.exit(
             "No sandbox configured. Agents run without approval prompts and the test\n"
-            "command executes agent-written code as your user. Set sandbox.prefix in the\n"
-            "config (see HARNESS_BENCH.md) or pass --allow-unsandboxed inside a disposable VM."
+            "command executes agent-written code as your user. Set sandbox (type docker, or a\n"
+            "prefix) in the config (see HARNESS_BENCH.md) or pass --allow-unsandboxed inside a disposable VM."
         )
 
 
@@ -768,13 +806,10 @@ def rmtree_inside(path: Path | str, root: Path | str) -> None:
     shutil.rmtree(path, ignore_errors=True)
 
 
-def wrap(cfg: Mapping[str, Any], argv: list[str], workdir: Path | str, env_file: Path | str) -> list[str]:
-    """Prefix a command with the configured sandbox (e.g. docker run ...)."""
-    prefix = (cfg.get("sandbox") or {}).get("prefix")
-    if not prefix:
-        return argv
-    fields = {"workdir": str(workdir), "env_file": str(env_file)}
-    return [p.format(**fields) for p in prefix] + argv
+def wrap(session: SandboxSession, argv: list[str], env_file: Path) -> list[str]:
+    """The command that runs `argv` in the trial's sandbox. Every command that executes agent or task code goes
+    through here."""
+    return session.argv(argv, env_file)
 
 
 # Host-specific values that would break a container (host PATH, home, user, temp dir).
@@ -794,17 +829,50 @@ def write_env_file(env: Mapping[str, str], path: Path) -> None:
 # ---------------------------------------------------------------- run
 
 
+def _kill_group(pgid: int) -> None:
+    """SIGKILL every process of the group. Its leader has not been reaped, so the group exists even if every
+    process in it has ended (a zombie leader is still a member)."""
+    os.killpg(pgid, signal.SIGKILL)
+
+
+def _wait_unreaped(pid: int, timeout: float) -> bool:
+    """Wait until the child `pid` has exited, without reaping it (`WNOWAIT`), so that its process group id stays
+    reserved until the caller has killed the group. False when `timeout` seconds pass first."""
+    deadline = time.monotonic() + timeout
+    while os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG) is None:
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
 def run_proc(argv: list[str], cwd: Path | None, env: Mapping[str, str], timeout: float) -> tuple[int, bool, str, str]:
-    """Run argv without a shell; return (rc, timed_out, stdout, stderr)."""
-    try:
-        p = subprocess.run(
-            argv, cwd=cwd, env=env, timeout=timeout, stdin=subprocess.DEVNULL, capture_output=True, text=True
+    """Run argv without a shell; return (rc, timed_out, stdout, stderr).
+
+    The command is the leader of its own session, and its whole process group is killed when it ends or times out, so
+    nothing the agent forked into the background survives into grading (ADR 0010). Output goes to private temp files,
+    not pipes: a background child that still holds stdout cannot keep this call waiting. A process that leaves the
+    group with `setsid` is out of reach; only a container (`end_step`) stops that."""
+    with (
+        tempfile.TemporaryFile("w+", errors="replace") as out_file,
+        tempfile.TemporaryFile("w+", errors="replace") as err_file,
+    ):
+        proc = subprocess.Popen(
+            argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=out_file, stderr=err_file, start_new_session=True
         )
-        return p.returncode, False, p.stdout, p.stderr
-    except subprocess.TimeoutExpired as e:
-        out = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
-        err = e.stderr.decode() if isinstance(e.stderr, bytes) else (e.stderr or "")
-        return -1, True, out, err
+        try:
+            timed_out = not _wait_unreaped(proc.pid, timeout)
+        finally:
+            # The leader is not reaped yet, so its pid cannot name another process group: kill, then reap. The group
+            # can be gone only if `waitid` failed because someone else reaped the leader; that error must not be
+            # replaced by a lookup error.
+            with contextlib.suppress(ProcessLookupError):
+                _kill_group(proc.pid)
+            status = proc.wait()
+        rc = -1 if timed_out else status
+        out_file.seek(0)
+        err_file.seek(0)
+        return rc, timed_out, out_file.read(), err_file.read()
 
 
 def git_bin() -> str:
@@ -1130,11 +1198,34 @@ def resolve_work_root(cfg: Mapping[str, Any], base: Path) -> Path:
             sys.exit(f"work_dir {root} is inside the benchmark repo; use a path outside it")
         root.mkdir(parents=True, exist_ok=True)
         return root
-    return Path(tempfile.mkdtemp(prefix="harness-bench-work-"))
+    root = Path(tempfile.mkdtemp(prefix="harness-bench-work-"))
+    plant_token(root)
+    return root
+
+
+OWNER_MARK_FILE = ".hb-owner"
+
+
+def plant_token(directory: Path) -> str:
+    """Put a random token in a private temp dir the engine made, and return it. A killed run's heartbeat names the
+    token, and resume deletes only a dir that still holds it: a heartbeat file cannot make it delete another dir."""
+    token = secrets.token_hex(16)
+    fd = os.open(directory / OWNER_MARK_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(token)
+    return token
+
+
+def holds_token(directory: Path, token: object) -> bool:
+    """Whether `directory` holds exactly the (non-empty) `token`."""
+    try:
+        return isinstance(token, str) and bool(token) and (directory / OWNER_MARK_FILE).read_text() == token
+    except OSError:
+        return False
 
 
 def run_step(
-    cfg: Mapping[str, Any],
+    session: SandboxSession,
     command: str,
     env: Mapping[str, str],
     timeout: float,
@@ -1142,27 +1233,53 @@ def run_step(
     workdir: Path,
     env_file: Path,
     secrets: Iterable[str],
+    lost: list[str] | None = None,
 ) -> tuple[int, bool, str, str]:
     """Run a setup or grader command in the sandbox wrapper and write its redacted log (stdout, then stderr).
-    Returns `(rc, timed_out, stdout, stderr)`, both redacted and kept apart: a score is only read from stdout."""
+    Returns `(rc, timed_out, stdout, stderr)`, both redacted and kept apart: a score is only read from stdout.
+    When the sandbox cannot end the step (its container is not shown to be gone), the reason goes to `lost`; without
+    a `lost` list it raises `SandboxError`."""
     write_env_file(env, env_file)
     try:
-        rc, to, out, err = run_proc(wrap(cfg, ["sh", "-c", command], workdir, env_file), workdir, env, timeout)
+        rc, to, out, err = run_proc(wrap(session, ["sh", "-c", command], env_file), workdir, env, timeout)
     finally:
         env_file.unlink(missing_ok=True)
+        end_step_or_record(session, lost)
     out, err = redact(out, secrets), redact(err, secrets)
     log_path.write_text(out + "\n--- stderr ---\n" + err)
     return rc, to, out, err
 
 
+def end_step_or_record(session: SandboxSession, lost: list[str] | None) -> None:
+    """End the step of the session. A failure (a container that cannot be shown to be gone) is recorded in `lost`
+    and printed, so the engine can fail the trial closed; without a `lost` list it is raised."""
+    try:
+        session.end_step()
+    except SandboxError as e:
+        if lost is None:
+            raise
+        print(f"warning: {e}")
+        lost.append(str(e))
+
+
+def destroy_or_warn(session: SandboxSession, what: str) -> None:
+    """Destroy the session at the end of a trial. The verdict is already decided, so a container that cannot be
+    removed is a warning."""
+    try:
+        session.destroy()
+    except SandboxError as e:
+        print(f"warning: could not remove the sandbox of {what}: {e}")
+
+
 def step_runner(
-    cfg: Mapping[str, Any],
+    session: SandboxSession,
     logs_dir: Path,
     tag: str,
     workdir: Path,
     env_file: Path,
     secrets: Iterable[str],
     env: Mapping[str, str],
+    lost: list[str] | None = None,
 ) -> Callable[[str], RunStep]:
     """`run_for(prefix)` for `grade_trial`: a `RunStep` that goes through `run_step` (sandbox wrapper, env allowlist,
     redacted log named `<tag>.<prefix><log name>.log` in `logs_dir`)."""
@@ -1171,7 +1288,7 @@ def step_runner(
     def run_for(prefix: str) -> RunStep:
         def run(command: str, timeout: int, log_name: str) -> tuple[int, bool, str, str]:
             log = logs_dir / f"{tag}.{prefix}{safe(log_name)}.log"
-            return run_step(cfg, command, env, timeout, log, workdir, env_file, secret_list)
+            return run_step(session, command, env, timeout, log, workdir, env_file, secret_list, lost)
 
         return run
 
@@ -1294,24 +1411,28 @@ def run_task_attempt(
     prepare_workdir(task, base, workdir)
     env = base_env(cfg)
     secrets = [os.environ.get(v, "") for v in spend_key_vars(cfg)]
-    run_for = step_runner(cfg, logs_dir, tag, workdir, work_root / f".{tag}.env", secrets, env)
-    if task.get("setup"):
-        run_for("")(task["setup"], task.get("setup_timeout", 900), "setup")
-    git_dir = git_root / f"{tag}.git"
-    baseline = make_baseline(workdir, git_dir)
-    snap = Path(tempfile.mkdtemp(prefix=f".{tag}.protected-", dir=work_root))
-    snapshot_protected(task, workdir, snap)
-    if solution is not None:
-        safe_copy_into(solution, workdir, ignore=PYCACHE)  # never through a link the repo left in the workdir
-    changes = collect_changes(baseline)
-    rmtree_inside(git_dir, git_root)
-    restore_protected(task, workdir, snap)
-    rmtree_inside(snap, work_root)
-    with_task = {**cfg, "tasks": [task]}
-    judge = make_judge(with_task, secrets, load_redactor(cfg["judge"]) if uses_judge(with_task) else None)
-    passed, _ = grade_trial(
-        grade_plan(task), task, base, workdir, changes, run_for, judge, grader_logger(logs_dir, tag, secrets)
-    )
+    session = make_sandbox(cfg).create(workdir, safe(tag))
+    try:
+        run_for = step_runner(session, logs_dir, tag, workdir, work_root / f".{tag}.env", secrets, env)
+        if task.get("setup"):
+            run_for("")(task["setup"], task.get("setup_timeout", 900), "setup")
+        git_dir = git_root / f"{tag}.git"
+        baseline = make_baseline(workdir, git_dir)
+        snap = Path(tempfile.mkdtemp(prefix=f".{tag}.protected-", dir=work_root))
+        snapshot_protected(task, workdir, snap)
+        if solution is not None:
+            safe_copy_into(solution, workdir, ignore=PYCACHE)  # never through a link the repo left in the workdir
+        changes = collect_changes(baseline)
+        rmtree_inside(git_dir, git_root)
+        restore_protected(task, workdir, snap)
+        rmtree_inside(snap, work_root)
+        with_task = {**cfg, "tasks": [task]}
+        judge = make_judge(with_task, secrets, load_redactor(cfg["judge"]) if uses_judge(with_task) else None)
+        passed, _ = grade_trial(
+            grade_plan(task), task, base, workdir, changes, run_for, judge, grader_logger(logs_dir, tag, secrets)
+        )
+    finally:
+        session.destroy()
     rmtree_inside(workdir, work_root)
     return passed
 
@@ -1329,7 +1450,7 @@ def validate_task_behavior(cfg: Mapping[str, Any], task: Mapping[str, Any], base
     return TaskCheck(task_id=task["id"], untouched_passed=untouched, solution_passed=solved)
 
 
-def make_run_info(cfg: Mapping[str, Any], only: Sequence[str] | None, sandboxed: bool) -> RunInfo:
+def make_run_info(cfg: Mapping[str, Any], only: Sequence[str] | None, sandbox: Sandbox) -> RunInfo:
     """Metadata of this `run`. The config hash covers `${VAR}` references, never expanded values, and the
     config as written: the tasks that came from suites are not part of it."""
     targets = tuple(
@@ -1347,11 +1468,12 @@ def make_run_info(cfg: Mapping[str, Any], only: Sequence[str] | None, sandboxed:
         started_at=datetime.now(UTC),
         finished_at=None,
         harness_bench_version=VERSION,
-        config_sha256=sha256_json({**cfg, "tasks": [t for t in cfg["tasks"] if "suite" not in t]}),
+        config_sha256=config_hash(cfg),
         suite_version=suite_version_of(cfg["tasks"]),
         python=platform.python_version(),
         platform=platform.platform(),
-        sandboxed=sandboxed,
+        sandboxed=sandbox.isolated,
+        sandbox=sandbox.describe(),
         targets=targets,
     )
 
@@ -1360,13 +1482,113 @@ def cmd_run(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path) -> Non
     """Run the matrix. The baseline git dirs of the trials live in a private temp dir that is always removed: not in
     `work_dir`, whose names an unsandboxed agent could guess."""
     with tempfile.TemporaryDirectory(prefix="harness-bench-git-") as git_root:
+        plant_token(Path(git_root))
         _run_matrix(args, cfg, base, Path(git_root))
+
+
+@dataclass(frozen=True)
+class _Matrix:
+    """What every trial of one `run` shares."""
+
+    cfg: Mapping[str, Any]
+    base: Path
+    work_root: Path
+    git_root: Path
+    logs_dir: Path
+    results_path: Path
+    writer: RunWriter
+    heartbeat: Heartbeat
+    sandbox: Sandbox
+    plans: Mapping[str, GradePlan]
+    redactor: Callable[[str], str] | None
+    secrets: Sequence[str]
+    keep: bool
+    resuming: bool
+
+
+@dataclass(frozen=True)
+class _Planned:
+    """One trial of the matrix, before it runs."""
+
+    task: Mapping[str, Any]
+    harness: Mapping[str, Any]
+    hname: str
+    model: str
+    rep: int
+    runner: HarnessRunner
+    price: Mapping[str, Any] | None
+
+
+def _planned_trials(cfg: Mapping[str, Any], only: Sequence[str] | None, reps: int) -> Iterator[_Planned]:
+    """Every trial of the matrix in run order: pairs, then tasks, then repetitions."""
+    prices = cfg.get("prices", {})
+    for pair in cfg["matrix"]:
+        hname, model = pair["harness"], pair["model"]
+        if only and hname not in only:
+            continue
+        for task in cfg["tasks"]:
+            for rep in range(1, reps + 1):
+                harness = cfg["harnesses"][hname]
+                price = prices.get(pair.get("price", model))
+                yield _Planned(task, harness, hname, model, rep, runner_for(harness), price)
+
+
+def planned_trial_id(run_id: str, planned: _Planned) -> str:
+    """The `trial_id` the trial will have in `trials.jsonl`: known before it runs, so resume can match it."""
+    target = Target(harness=planned.hname, harness_version=planned.runner.version(), model=planned.model, params={})
+    return trial_id(run_id, planned.task["id"], target.target_id, planned.rep)
+
+
+def config_hash(cfg: Mapping[str, Any]) -> str:
+    """The hash of the config as written (`${VAR}` references, not values; suite tasks left out)."""
+    return sha256_json({**cfg, "tasks": [t for t in cfg["tasks"] if "suite" not in t]})
+
+
+def open_resumed_run(out_dir: Path, run_id: str, cfg: Mapping[str, Any], force: bool) -> RunWriter:
+    """The writer of the run `run_id` for `--resume`. Exits with a message when the run cannot be resumed: it does not
+    exist, its files are invalid, the config is not the one it ran with, or a live process still holds it."""
+    try:
+        writer = RunWriter.open_existing(out_dir, run_id)
+        writer.trials()  # reads trials.jsonl now, so a bad file stops the resume before anything runs
+    except ResumeError as e:
+        sys.exit(f"resume: {e}")
+    if writer.info.config_sha256 != config_hash(cfg):
+        sys.exit(f"resume: the config changed since run {run_id} started; resume it with the config it ran with")
+    if not force and heartbeat_is_live(writer.run_dir / HEARTBEAT_FILE):
+        sys.exit(f"resume: run {run_id} is still running (its heartbeat is fresh and its process alive); use --force")
+    return writer
+
+
+def discard_leftovers(heartbeat_path: Path) -> None:
+    """Remove the private temp dirs a killed run left (its baseline git dirs and its work dir, with the env files in
+    it). The paths come from its heartbeat file, which an agent may have written, so a dir is removed only when it
+    sits directly in the temp dir, is no link, has the engine's name and holds the token the heartbeat names."""
+    data = read_heartbeat(heartbeat_path) or {}
+    tmp = Path(tempfile.gettempdir())
+    for key, prefix in (("git", "harness-bench-git-"), ("work", "harness-bench-work-")):
+        value = data.get(f"{key}_root")
+        path = Path(value) if isinstance(value, str) else None
+        owned = path and path.name.startswith(prefix) and path.parent.resolve() == tmp.resolve()
+        if owned and path and not path.is_symlink() and holds_token(path, data.get(f"{key}_token")):
+            rmtree_inside(path, tmp)
+
+
+def restore_legacy_rows(writer: RunWriter, results_path: Path) -> None:
+    """Write the `results.jsonl` row of every trial of the run that has none: a run killed between the two files."""
+    done = done_keys(results_path)
+    for trial in writer.trials():
+        if (trial.task_id, trial.target.harness, trial.target.model, trial.rep) not in done:
+            with results_path.open("a") as f:
+                f.write(json.dumps(row_from_trial(trial)) + "\n")
 
 
 def _run_matrix(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path, git_root: Path) -> None:
     cfg = expand_suites(cfg, base)
     validate_config(cfg)
-    sandboxed = is_sandboxed(cfg)
+    resume_id = getattr(args, "resume", None)
+    if resume_id and args.dry_run:
+        sys.exit("resume: --resume and --dry-run cannot be combined")
+    sandbox = make_sandbox(cfg)
     if not args.dry_run:
         require_sandbox(cfg, args.allow_unsandboxed)
     out_dir = base / cfg.get("output_dir", "results")
@@ -1374,155 +1596,205 @@ def _run_matrix(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path, gi
     logs_dir = out_dir / "logs"
     logs_dir.mkdir(exist_ok=True)
     results_path = out_dir / "results.jsonl"
-    finished = done_keys(results_path)
     reps = args.reps or cfg.get("reps", 1)
-    harnesses = cfg["harnesses"]
-    prices = cfg.get("prices", {})
+    writer = None
+    if resume_id:
+        writer = open_resumed_run(out_dir, resume_id, cfg, getattr(args, "force", False))
+        discard_leftovers(writer.run_dir / HEARTBEAT_FILE)
+        restore_legacy_rows(writer, results_path)
     work_root = None if args.dry_run else resolve_work_root(cfg, base)
     if work_root:
         print(f"work dir: {work_root}")
-    secrets_all = [os.environ.get(v, "") for v in spend_key_vars(cfg)]
-    plans = {task["id"]: grade_plan(task) for task in cfg["tasks"]}
-    redactor = load_redactor(cfg["judge"]) if uses_judge(cfg) else None
-    writer = None if args.dry_run else RunWriter(out_dir, make_run_info(cfg, args.only, sandboxed))
+    if not (args.dry_run or resume_id):
+        writer = RunWriter(out_dir, make_run_info(cfg, args.only, sandbox))
+    finished = done_keys(results_path)
+    finished_ids = writer.finished_trial_ids() if writer else set()
+    shared = None
+    if work_root and writer:  # a dry run has neither
+        # The temp dirs a killed run leaves are found again by resume through these paths and tokens.
+        paths = {"git_root": str(git_root), "git_token": (git_root / OWNER_MARK_FILE).read_text()}
+        if not cfg.get("work_dir"):
+            paths |= {"work_root": str(work_root), "work_token": (work_root / OWNER_MARK_FILE).read_text()}
+        shared = _Matrix(
+            cfg=cfg,
+            base=base,
+            work_root=work_root,
+            git_root=git_root,
+            logs_dir=logs_dir,
+            results_path=results_path,
+            writer=writer,
+            heartbeat=Heartbeat(writer.run_dir / HEARTBEAT_FILE, extra=paths),
+            sandbox=sandbox,
+            plans={task["id"]: grade_plan(task) for task in cfg["tasks"]},
+            redactor=load_redactor(cfg["judge"]) if uses_judge(cfg) else None,
+            secrets=[os.environ.get(v, "") for v in spend_key_vars(cfg)],
+            keep=args.keep,
+            resuming=bool(resume_id),
+        )
 
-    for pair in cfg["matrix"]:
-        hname, model = pair["harness"], pair["model"]
-        if args.only and hname not in args.only:
-            continue
-        h = harnesses[hname]
-        price = prices.get(pair.get("price", model))
-        for task in cfg["tasks"]:
-            for rep in range(1, reps + 1):
+    try:
+        with shared.heartbeat if shared else contextlib.nullcontext():
+            for planned in _planned_trials(cfg, args.only, reps):
+                task, hname, model, rep = planned.task, planned.hname, planned.model, planned.rep
                 key = (task["id"], hname, model, rep)
-                if key in finished and not args.dry_run:
+                tid = planned_trial_id(writer.info.run_id, planned) if writer else ""
+                if (key in finished or tid in finished_ids) and not args.dry_run:
                     print(f"skip  {key} (done)")
                     continue
-                runner = runner_for(h)
-                cmd = runner.command(model, task["prompt"])
-                if work_root is None or writer is None:  # dry run: no work dir and no writer
-                    print(shlex.join(cmd))
+                if shared is None:  # dry run: no work dir and no writer
+                    print(shlex.join(planned.runner.command(model, task["prompt"])))
                     continue
-                tag = f"{safe(task['id'])}__{safe(hname)}__{safe(model)}__r{rep}"
-                workdir = work_root / tag
-                run_tag = f"bench-{datetime.now().strftime('%Y%m%d%H%M%S')}-{tag}"
-                cmd_env = base_env(cfg)
-                agent_env = dict(cmd_env, BENCH_TAG=run_tag)  # Pi/OpenCode/Codex send it as x-litellm-tags
-                harness_env = {k: expand_env(v).replace("{run_tag}", run_tag) for k, v in h.get("env", {}).items()}
-                agent_env.update(harness_env)
-                secrets = secrets_all + [v for v in harness_env.values() if v != run_tag]
-                if workdir.exists():
-                    rmtree_inside(workdir, work_root)
-                prepare_workdir(task, base, workdir)
-                env_file = work_root / f".{tag}.env"
-
-                if task.get("setup"):
-                    run_step(
-                        cfg,
-                        task["setup"],
-                        cmd_env,
-                        task.get("setup_timeout", 900),
-                        logs_dir / f"{tag}.setup.log",
-                        workdir,
-                        env_file,
-                        secrets,
-                    )
-                runner.prepare(workdir)
-                git_dir = git_root / f"{tag}.git"
-                baseline = make_baseline(workdir, git_dir)
-                snap = work_root / f".{tag}.protected"
-                if snap.exists():
-                    rmtree_inside(snap, work_root)
-                snap.mkdir()
-                snapshot_protected(task, workdir, snap)
-
-                print(f"run   {tag}", flush=True)
-                t0 = time.time()
-                write_env_file(agent_env, env_file)
-                try:
-                    rc, timed_out, stdout, stderr = run_proc(
-                        wrap(cfg, cmd, workdir, env_file),
-                        workdir,
-                        agent_env,
-                        task.get("timeout", cfg.get("timeout", 1800)),
-                    )
-                finally:
-                    env_file.unlink(missing_ok=True)
-                wall = time.time() - t0
-                (logs_dir / f"{tag}.agent.jsonl").write_text(redact(stdout, secrets))
-                (logs_dir / f"{tag}.agent.stderr").write_text(redact(stderr, secrets))
-
-                usage = runner.parse_usage(stdout)
-                parse_ok = usage is not None
-                usage = usage or empty_usage()
-
-                # Captured before the protected paths are restored: an edit there must still count as a change.
-                changes = collect_changes(baseline)
-                save_diff(baseline, logs_dir / f"{tag}.diff", secrets=secrets)
-                rmtree_inside(git_dir, git_root)
-                restore_protected(task, workdir, snap)
-                rmtree_inside(snap, work_root)
-
-                run_for = step_runner(cfg, logs_dir, tag, workdir, env_file, secrets, cmd_env)
-
-                judge = make_judge(cfg, secrets, redactor)
-                passed, grader_results = grade_trial(
-                    plans[task["id"]],
-                    task,
-                    base,
-                    workdir,
-                    changes,
-                    run_for,
-                    judge,
-                    grader_logger(logs_dir, tag, secrets),
-                )
-                test_to = any(r.timed_out for r in grader_results)
-
-                row = {
-                    "ts": datetime.now(UTC).isoformat(timespec="seconds"),
-                    "task": task["id"],
-                    "harness": hname,
-                    "model": model,
-                    "rep": rep,
-                    "passed": passed,
-                    "agent_rc": rc,
-                    "agent_timed_out": timed_out,
-                    "wall_s": round(wall, 1),
-                    "parse_ok": parse_ok,
-                    "run_tag": run_tag,
-                    "t_start": t0,
-                    "t_end": t0 + wall,
-                    "sandboxed": sandboxed,
-                    **usage,
-                    "cost_computed": computed_cost(usage, price) if parse_ok else None,
-                }
-                # Built before the legacy row is written, so a bad row cannot leave the two files out of step.
-                trial = trial_from_row_lenient(
-                    row,
-                    run_id=writer.info.run_id,  # dry runs never reach this point, so the writer exists
-                    suite_version=writer.info.suite_version,
-                    harness_version=runner.version(),
-                    test_timed_out=test_to,
-                    graders=grader_results if task.get("graders") else None,
-                    warn=print,
-                )
-                with results_path.open("a") as f:
-                    f.write(json.dumps(row) + "\n")
-                writer.append(trial)
-                tokens = sum(usage[k] for k in ("input", "output", "reasoning", "cache_read", "cache_write"))
-                print(
-                    f"done  {tag} passed={row['passed']} tokens={tokens}"
-                    f" cost={row['cost_computed'] if row['cost_computed'] is not None else usage['cost_reported']}",
-                    flush=True,
-                )
-                if not args.keep:
-                    rmtree_inside(workdir, work_root)
-    if work_root and not args.keep and not cfg.get("work_dir"):
-        shutil.rmtree(work_root, ignore_errors=True)
+                _run_trial(shared, planned, tid)
+    finally:  # also when a trial raises: the private work dir is never left behind
+        if work_root and not args.keep and not cfg.get("work_dir"):
+            shutil.rmtree(work_root, ignore_errors=True)
     if writer:
         writer.close(datetime.now(UTC))
     if not args.dry_run and not getattr(args, "no_report", False):
         cmd_report(args, cfg, base)
+
+
+def _run_trial(m: _Matrix, planned: _Planned, tid: str) -> None:
+    """One trial: workdir, setup, baseline, agent, audit diff, protected paths, graders; then its two result rows
+    (`trials.jsonl` first, flushed to disk, so a crash between the two can only lose the legacy row). The trial's
+    sandbox session is always destroyed."""
+    task, h, hname, model, rep = planned.task, planned.harness, planned.hname, planned.model, planned.rep
+    runner, price = planned.runner, planned.price
+    cmd = runner.command(model, task["prompt"])
+    m.heartbeat.beat(tid, "setup")
+    if m.resuming:
+        m.sandbox.reclaim(tid)  # a container the killed run left running for this very trial
+    tag = f"{safe(task['id'])}__{safe(hname)}__{safe(model)}__r{rep}"
+    workdir = m.work_root / tag
+    run_tag = f"bench-{datetime.now().strftime('%Y%m%d%H%M%S')}-{tag}"
+    cmd_env = base_env(m.cfg)
+    agent_env = dict(cmd_env, BENCH_TAG=run_tag)  # Pi/OpenCode/Codex send it as x-litellm-tags
+    harness_env = {k: expand_env(v).replace("{run_tag}", run_tag) for k, v in h.get("env", {}).items()}
+    agent_env.update(harness_env)
+    secrets = list(m.secrets) + [v for v in harness_env.values() if v != run_tag]
+    if workdir.exists():
+        rmtree_inside(workdir, m.work_root)
+    prepare_workdir(task, m.base, workdir)
+    env_file = m.work_root / f".{tag}.env"
+    env_file.unlink(missing_ok=True)  # the env file of a killed run holds secrets
+    session = m.sandbox.create(workdir, tid)
+    lost: list[str] = []  # why a step's container could not be shown to be gone: the trial then fails closed
+    try:
+        if task.get("setup"):
+            run_step(
+                session,
+                task["setup"],
+                cmd_env,
+                task.get("setup_timeout", 900),
+                m.logs_dir / f"{tag}.setup.log",
+                workdir,
+                env_file,
+                secrets,
+                lost,
+            )
+        runner.prepare(workdir)
+        git_dir = m.git_root / f"{tag}.git"
+        baseline = make_baseline(workdir, git_dir)
+        snap = m.work_root / f".{tag}.protected"
+        if snap.exists():
+            rmtree_inside(snap, m.work_root)
+        snap.mkdir()
+        snapshot_protected(task, workdir, snap)
+
+        print(f"run   {tag}", flush=True)
+        m.heartbeat.beat(tid, "agent")
+        t0 = time.time()
+        write_env_file(agent_env, env_file)
+        try:
+            rc, timed_out, stdout, stderr = run_proc(
+                wrap(session, cmd, env_file),
+                workdir,
+                agent_env,
+                task.get("timeout", m.cfg.get("timeout", 1800)),
+            )
+        finally:
+            env_file.unlink(missing_ok=True)
+            end_step_or_record(session, lost)  # the agent's container must be gone before anything reads the workdir
+        wall = time.time() - t0
+        (m.logs_dir / f"{tag}.agent.jsonl").write_text(redact(stdout, secrets))
+        (m.logs_dir / f"{tag}.agent.stderr").write_text(redact(stderr, secrets))
+
+        usage = runner.parse_usage(stdout)
+        parse_ok = usage is not None
+        usage = usage or empty_usage()
+
+        # Captured before the protected paths are restored: an edit there must still count as a change.
+        changes = UNKNOWN_CHANGES if lost else collect_changes(baseline)
+        save_diff(baseline, m.logs_dir / f"{tag}.diff", secrets=secrets)
+        rmtree_inside(git_dir, m.git_root)
+        restore_protected(task, workdir, snap)
+        rmtree_inside(snap, m.work_root)
+
+        run_for = step_runner(session, m.logs_dir, tag, workdir, env_file, secrets, cmd_env, lost)
+
+        m.heartbeat.beat(tid, "grade")
+        judge = make_judge(m.cfg, secrets, m.redactor)
+        passed = False
+        grader_results: list[GraderResult] = []  # a container that may still write to the workdir is never graded
+        if not lost:
+            passed, grader_results = grade_trial(
+                m.plans[task["id"]],
+                task,
+                m.base,
+                workdir,
+                changes,
+                run_for,
+                judge,
+                grader_logger(m.logs_dir, tag, secrets),
+            )
+        passed = passed and not lost  # also when it was a grader's own container
+    finally:
+        destroy_or_warn(session, tag)
+    m.heartbeat.beat(tid, "record")
+    test_to = any(r.timed_out for r in grader_results)
+
+    row = {
+        "ts": datetime.now(UTC).isoformat(timespec="seconds"),
+        "task": task["id"],
+        "harness": hname,
+        "model": model,
+        "rep": rep,
+        "passed": passed,
+        "agent_rc": rc,
+        "agent_timed_out": timed_out,
+        "wall_s": round(wall, 1),
+        "parse_ok": parse_ok,
+        "run_tag": run_tag,
+        "t_start": t0,
+        "t_end": t0 + wall,
+        "sandboxed": m.sandbox.isolated,
+        **usage,
+        "cost_computed": computed_cost(usage, price) if parse_ok else None,
+    }
+    # Built before the legacy row is written, so a bad row cannot leave the two files out of step.
+    trial = replace(
+        trial_from_row_lenient(
+            row,
+            run_id=m.writer.info.run_id,
+            suite_version=m.writer.info.suite_version,
+            harness_version=runner.version(),
+            test_timed_out=test_to,
+            graders=grader_results if task.get("graders") else None,
+            warn=print,
+        ),
+        image_digest=m.sandbox.image_digest(),
+    )
+    m.writer.append(trial)
+    with m.results_path.open("a") as f:
+        f.write(json.dumps(row) + "\n")
+    tokens = sum(usage[k] for k in ("input", "output", "reasoning", "cache_read", "cache_write"))
+    print(
+        f"done  {tag} passed={row['passed']} tokens={tokens}"
+        f" cost={row['cost_computed'] if row['cost_computed'] is not None else usage['cost_reported']}",
+        flush=True,
+    )
+    if not m.keep:
+        rmtree_inside(workdir, m.work_root)
 
 
 # ---------------------------------------------------------------- LiteLLM
@@ -1869,7 +2141,7 @@ if __name__ == "__main__":
 
 ## `hbench/` package
 
-New code lives in the `hbench/` package ([ADR 0005](docs/adr/0005-data-contract-and-package.md)); the two scripts above call into it.
+New code lives in the `hbench/` package ([ADR 0005](docs/adr/0005-data-contract-and-package.md)); the two scripts above call into it. `hbench/sandboxes/` holds the sandboxes and `hbench/doctor.py` the `doctor` checks.
 
 `hbench/__init__.py`:
 
@@ -1930,7 +2202,7 @@ from enum import Enum, StrEnum
 from types import MappingProxyType, UnionType
 from typing import Any, ClassVar, Self, get_args, get_origin, get_type_hints
 
-SCHEMA_VERSION = "1.2.0"
+SCHEMA_VERSION = "1.3.0"
 _VERSION_RE = re.compile(r"^(\d+)\.\d+\.\d+$")
 _MAJOR = SCHEMA_VERSION.split(".")[0]
 
@@ -2287,6 +2559,7 @@ class RunInfo(_Model):
     platform: str
     sandboxed: bool
     targets: tuple[Target, ...]
+    sandbox: str = "unknown"  # what ran the commands: `docker:<image>`, `prefix`, `local-tmp`, a plugin's name
 
     DECODERS: ClassVar[Mapping[str, Callable[[Any], Any]]] = {
         "started_at": _parse_datetime,
@@ -2436,6 +2709,7 @@ RUN_SCHEMA: dict[str, Any] = {
             "python": _STRING,
             "platform": _STRING,
             "sandboxed": _BOOLEAN,
+            "sandbox": _STRING,
             "targets": {"type": "array", "items": {"$ref": "#/$defs/target"}},
         },
         [
@@ -2737,6 +3011,43 @@ def trial_from_row(
         trace_id=row.get("run_tag"),
         artifact_uri=_artifact_uri(row.get("run_tag")),
     )
+
+
+def row_from_trial(trial: TrialResult) -> dict[str, Any]:
+    """The legacy `results.jsonl` row of a trial: what `run --resume` writes again when a run stopped after a trial
+    reached `trials.jsonl` but before its row reached `results.jsonl` (ADR 0010). `started_at` is the row's `ts`,
+    taken when the trial ended, so the agent window is rebuilt backwards from it from `latency_s` (`reconcile` pads
+    that window by an hour). A trial status of timeout is read as an agent timeout."""
+    usage, costs = trial.usage, trial.usage.costs
+    ended = trial.started_at.timestamp()
+    row: dict[str, Any] = {
+        "ts": trial.started_at.isoformat(timespec="seconds"),
+        "task": trial.task_id,
+        "harness": trial.target.harness,
+        "model": trial.target.model,
+        "rep": trial.rep,
+        "passed": trial.passed,
+        "agent_rc": trial.agent_exit_code,
+        "agent_timed_out": trial.status is TrialStatus.TIMEOUT,
+        "wall_s": trial.latency_s,
+        "parse_ok": usage.parsed,
+        "run_tag": trial.trace_id,
+        "t_start": ended - trial.latency_s,
+        "t_end": ended,
+        "sandboxed": trial.sandboxed,
+        "input": usage.input_tokens,
+        "output": usage.output_tokens,
+        "reasoning": usage.reasoning_tokens,
+        "cache_read": usage.cache_read_tokens,
+        "cache_write": usage.cache_write_tokens,
+        "turns": usage.turns,
+        "tool_calls": usage.tool_calls,
+        "cost_reported": costs.harness,
+        "cost_computed": costs.price_table,
+    }
+    if costs.gateway is not None:
+        row["cost_litellm"] = costs.gateway
+    return row
 
 
 def _label(row: Mapping[str, Any]) -> str:
@@ -4552,8 +4863,9 @@ __all__ = ["GRADERS", "GRADER_GROUP", "GradePlan", "grade_plan", "grader_for"]
 """Plugins through entry points (ADR 0007, decision 7).
 
 Third-party packages register a factory `(config) -> HarnessRunner | Grader | redactor` in the groups
-`harness_bench.runners`, `harness_bench.graders` and `harness_bench.redactors` (a redactor is a callable
-`(text: str) -> str` that runs on an artifact before it is sent to the judge). Built-in names always win: callers
+`harness_bench.runners`, `harness_bench.graders`, `harness_bench.redactors` and `harness_bench.sandboxes` (a
+redactor is a callable `(text: str) -> str` that runs on an artifact before it is sent to the judge; a sandbox
+factory takes the `sandbox` section and returns a `Sandbox`, ADR 0010). Built-in names always win: callers
 only come here for a name that is not built in, so a plain run never imports third-party code. Every failure is a
 `PluginError` with a message that names the plugin, never a traceback from the engine.
 """
@@ -4565,6 +4877,7 @@ from typing import Any, TypeGuard
 RUNNER_GROUP = "harness_bench.runners"
 GRADER_GROUP = "harness_bench.graders"
 REDACTOR_GROUP = "harness_bench.redactors"
+SANDBOX_GROUP = "harness_bench.sandboxes"
 
 
 class PluginError(ValueError):
@@ -4650,10 +4963,808 @@ def redactor_for(name: str, config: Mapping[str, Any]) -> Callable[[str], str]:
     return create_plugin(REDACTOR_GROUP, name, (), config, _is_redactor, "callable")
 ```
 
+`hbench/sandboxes/__init__.py`:
+
+```python
+"""Sandboxes: the protocol, the built-in types and the registry (ADR 0010).
+
+`sandbox_for(cfg, run, env)` is the only way the engine gets a sandbox: the built-in type of `sandbox.type` (default:
+`prefix` when `sandbox.prefix` is set, else `local-tmp`), else the plugin of that name in the entry-point group
+`harness_bench.sandboxes`.
+"""
+
+from collections.abc import Mapping
+from typing import Any, TypeGuard
+
+from hbench.plugins import SANDBOX_GROUP, create_plugin
+from hbench.sandboxes.base import ProcRunner, Sandbox, SandboxError, SandboxSession
+from hbench.sandboxes.docker import DockerSandbox
+from hbench.sandboxes.local_tmp import LocalTmpSandbox
+from hbench.sandboxes.prefix import PrefixSandbox
+
+__all__ = [
+    "BUILTIN_TYPES",
+    "ProcRunner",
+    "Sandbox",
+    "SandboxError",
+    "SandboxSession",
+    "sandbox_for",
+]
+
+BUILTIN_TYPES = ("prefix", "docker", "local-tmp")
+_ALLOWED_KEYS: Mapping[str, frozenset[str]] = {
+    "prefix": frozenset({"type", "prefix"}),
+    "docker": frozenset({"type", "image", "network", "limits", "mounts"}),
+    "local-tmp": frozenset({"type", "limits"}),
+}
+
+
+def _is_sandbox(obj: object) -> TypeGuard[Sandbox]:
+    return isinstance(obj, Sandbox)
+
+
+def _check_keys(kind: str, section: Mapping[str, Any]) -> None:
+    unknown = sorted(set(section) - _ALLOWED_KEYS[kind] - {"_comment"})
+    if unknown:
+        raise SandboxError(f"unknown sandbox keys: {unknown} (a {kind} sandbox takes {sorted(_ALLOWED_KEYS[kind])})")
+
+
+def sandbox_for(cfg: Mapping[str, Any], run: ProcRunner, env: Mapping[str, str]) -> Sandbox:
+    """The sandbox the config asks for. `run` and `env` are how a sandbox runs its own helper commands (the engine's
+    `run_proc` and its env allowlist). Raises `SandboxError` or `PluginError` (both `ValueError`) for a bad section."""
+    section = cfg.get("sandbox") or {}
+    if not isinstance(section, Mapping):
+        raise SandboxError("sandbox must be an object")
+    kind = section.get("type") or ("prefix" if section.get("prefix") else "local-tmp")
+    if not isinstance(kind, str):
+        raise SandboxError("sandbox.type must be a string")
+    if kind in _ALLOWED_KEYS:
+        _check_keys(kind, section)
+    if kind == "prefix":
+        return PrefixSandbox(section)
+    if kind == "docker":
+        return DockerSandbox(section, run, env)
+    if kind == "local-tmp":
+        return LocalTmpSandbox(section)
+    return create_plugin(SANDBOX_GROUP, kind, BUILTIN_TYPES, section, _is_sandbox, "Sandbox")
+```
+
+`hbench/sandboxes/base.py`:
+
+```python
+"""The sandbox protocol and what the built-in sandboxes share (ADR 0010).
+
+A sandbox only builds argv and manages its own lifecycle. The engine keeps running every process (ADR 0007), so
+the env allowlist, the timeout, the process-group kill and the log redaction apply to every sandbox alike.
+"""
+
+from collections.abc import Callable, Mapping
+from pathlib import Path, PurePath
+from typing import Protocol, runtime_checkable
+
+from hbench.safe_copy import copy_out_tree, safe_copy_to
+
+# The engine's `run_proc`: `(argv, cwd, env, timeout) -> (returncode, timed_out, stdout, stderr)`.
+ProcRunner = Callable[[list[str], Path | None, Mapping[str, str], float], tuple[int, bool, str, str]]
+
+
+class SandboxError(ValueError):
+    """The sandbox configuration is invalid, or a copy through the sandbox was refused."""
+
+
+@runtime_checkable
+class SandboxSession(Protocol):
+    """The sandbox of one trial: it wraps each command of the trial and removes whatever it leaves behind."""
+
+    def argv(self, argv: list[str], env_file: Path) -> list[str]:
+        """The command that runs `argv` inside the sandbox. `env_file` holds the environment (Docker format)."""
+
+    def copy_in(self, src: Path, rel: str) -> None:
+        """Put the trusted file or tree `src` at `rel` in the workdir, never through a link the agent planted."""
+
+    def copy_out(self, rel: str, dest: Path) -> None:
+        """Copy `rel` of the workdir (untrusted) to the host path `dest`; a link in it is refused."""
+
+    def end_step(self) -> None:
+        """Stop whatever the command just run left behind (its container, which the engine's kill of the client
+        process does not reach). The engine calls it after every command, also after a timeout or an error, before
+        it reads the workdir or starts the next command."""
+
+    def destroy(self) -> None:
+        """Remove anything the trial left (containers); the engine always calls it, in a `finally`."""
+
+
+@runtime_checkable
+class Sandbox(Protocol):
+    """A way to run the commands of a trial in isolation (or, for `local-tmp`, without it)."""
+
+    isolated: bool  # False: agent code runs as the user, so the run needs `--allow-unsandboxed`
+
+    def create(self, workdir: Path, trial_id: str) -> SandboxSession:
+        """The session of one trial. `workdir` is the trial's directory, `trial_id` names its containers."""
+
+    def reclaim(self, trial_id: str) -> None:
+        """Remove what an interrupted run left for this trial (a container still running); resume calls it."""
+
+    def image_digest(self) -> str | None:
+        """The digest of the image the commands run in, or None when there is none."""
+
+    def describe(self) -> str:
+        """Short name for `run.json`: the type and, where it is not a secret, what it runs."""
+
+
+def relative_path(rel: str) -> Path:
+    """`rel` as a path inside the workdir: not empty, not absolute, no `..`."""
+    path = PurePath(rel)
+    if not rel or path.is_absolute() or ".." in path.parts:
+        raise SandboxError(f"path {rel!r} must be relative to the workdir, without '..'")
+    return Path(rel)
+
+
+class HostSession:
+    """Copies for the sandboxes whose workdir is the host directory itself (a bind mount counts): the host copies
+    through `safe_copy`, so it never writes through a link the agent left."""
+
+    def __init__(self, workdir: Path) -> None:
+        self.workdir = workdir
+
+    def copy_in(self, src: Path, rel: str) -> None:
+        safe_copy_to(src, self.workdir, relative_path(rel))
+
+    def copy_out(self, rel: str, dest: Path) -> None:
+        copy_out_tree(self.workdir, relative_path(rel), dest)
+
+    def end_step(self) -> None:
+        """Nothing outlives the process group the engine kills."""
+
+    def destroy(self) -> None:
+        """Nothing is left behind by default."""
+```
+
+`hbench/sandboxes/prefix.py`:
+
+```python
+"""The `prefix` sandbox: `sandbox.prefix` is a command template put in front of every command (ADR 0010).
+
+This is the form the benchmark has always had, so the argv it builds is byte-identical to the earlier `wrap()`:
+`{workdir}` and `{env_file}` are filled in and the prefix goes before the command.
+"""
+
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
+from hbench.sandboxes.base import HostSession, SandboxError, SandboxSession
+
+
+class PrefixSession(HostSession):
+    def __init__(self, workdir: Path, prefix: list[str]) -> None:
+        super().__init__(workdir)
+        self._prefix = prefix
+
+    def argv(self, argv: list[str], env_file: Path) -> list[str]:
+        fields = {"workdir": str(self.workdir), "env_file": str(env_file)}
+        return [part.format(**fields) for part in self._prefix] + argv
+
+
+class PrefixSandbox:
+    isolated = True
+
+    def __init__(self, section: Mapping[str, Any]) -> None:
+        prefix = section.get("prefix")
+        if not (isinstance(prefix, list) and prefix and all(isinstance(part, str) for part in prefix)):
+            raise SandboxError("sandbox.prefix must be a non-empty list of strings")
+        self._prefix: list[str] = prefix
+
+    def create(self, workdir: Path, trial_id: str) -> SandboxSession:
+        return PrefixSession(workdir, self._prefix)
+
+    def reclaim(self, trial_id: str) -> None:
+        """A prefix cannot name what it started, so there is nothing to remove."""
+
+    def image_digest(self) -> str | None:
+        return None
+
+    def describe(self) -> str:
+        return "prefix"
+```
+
+`hbench/sandboxes/local_tmp.py`:
+
+```python
+"""The `local-tmp` sandbox: commands run on the host as the user, in the trial's temp workdir. It isolates
+nothing, so a run with it needs `--allow-unsandboxed` (only inside a disposable VM).
+
+`limits` are best effort resource limits (`RLIMIT_AS`, `RLIMIT_NPROC`, `RLIMIT_CPU`), set by a small launcher that
+runs before the command: no `preexec_fn`, which is unsafe while the heartbeat thread runs. Note that `RLIMIT_NPROC`
+counts every process of the user, so a low `pids` also stops the benchmark's own `fork`s. `cpus` has no meaning
+without a container and is ignored. A process can still reach everything the user can.
+"""
+
+import json
+import sys
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
+from hbench.sandboxes.base import HostSession, SandboxSession
+from hbench.sandboxes.limits import Limits, parse_limits
+
+LIMIT_KEYS = frozenset({"cpus", "memory", "pids", "cpu_seconds"})
+# `argv[1]` is the JSON object of rlimit names and values, `argv[2:]` the command.
+LAUNCHER = (
+    "import json, os, resource, sys\n"
+    "for name, value in json.loads(sys.argv[1]).items():\n"
+    "    resource.setrlimit(getattr(resource, name), (value, value))\n"
+    "os.execvp(sys.argv[2], sys.argv[2:])\n"
+)
+
+
+def rlimits(limits: Limits) -> dict[str, int]:
+    """The `resource` limits a `Limits` maps to; only the ones that are set."""
+    wanted = {"RLIMIT_AS": limits.memory_bytes, "RLIMIT_NPROC": limits.pids, "RLIMIT_CPU": limits.cpu_seconds}
+    return {name: value for name, value in wanted.items() if value is not None}
+
+
+class LocalSession(HostSession):
+    def __init__(self, workdir: Path, limits: dict[str, int]) -> None:
+        super().__init__(workdir)
+        self._limits = limits
+
+    def argv(self, argv: list[str], env_file: Path) -> list[str]:
+        if not self._limits:
+            return argv
+        return [sys.executable, "-I", "-c", LAUNCHER, json.dumps(self._limits), *argv]
+
+
+class LocalTmpSandbox:
+    isolated = False
+
+    def __init__(self, section: Mapping[str, Any]) -> None:
+        self._limits = rlimits(parse_limits(section.get("limits"), LIMIT_KEYS))
+
+    def create(self, workdir: Path, trial_id: str) -> SandboxSession:
+        return LocalSession(workdir, self._limits)
+
+    def reclaim(self, trial_id: str) -> None:
+        """Nothing outlives the process group the engine kills."""
+
+    def image_digest(self) -> str | None:
+        return None
+
+    def describe(self) -> str:
+        return "local-tmp"
+```
+
+`hbench/sandboxes/limits.py`:
+
+```python
+"""The per-trial limits of a sandbox (`sandbox.limits`, ADR 0010): CPUs, memory, processes and, for `local-tmp`, CPU
+seconds. A bad value is a config error before any run."""
+
+import math
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any
+
+from hbench.sandboxes.base import SandboxError
+
+_MEMORY = re.compile(r"[1-9][0-9]*[kmg]")
+_UNITS = {"k": 1024, "m": 1024**2, "g": 1024**3}
+
+
+@dataclass(frozen=True)
+class Limits:
+    """Each limit is None when the config does not set it."""
+
+    cpus: float | None = None
+    memory: str | None = None  # `<digits>k|m|g`, as `docker run --memory` takes it
+    pids: int | None = None
+    cpu_seconds: int | None = None  # CPU time of one process (`local-tmp` only)
+
+    @property
+    def memory_bytes(self) -> int | None:
+        return None if self.memory is None else int(self.memory[:-1]) * _UNITS[self.memory[-1]]
+
+
+def _whole(name: str, value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise SandboxError(f"sandbox.limits.{name} must be a whole number >= 1")
+    return value
+
+
+def parse_limits(raw: Any, allowed: frozenset[str]) -> Limits:
+    """The limits of a sandbox section (`raw` is its `limits` value, or None). Only the keys in `allowed` may be set."""
+    if raw is None:
+        return Limits()
+    if not isinstance(raw, Mapping):
+        raise SandboxError("sandbox.limits must be an object")
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise SandboxError(f"sandbox.limits has unknown or unsupported keys {unknown} (allowed: {sorted(allowed)})")
+    fields: dict[str, Any] = {}
+    if "cpus" in raw:
+        cpus = raw["cpus"]
+        if isinstance(cpus, bool) or not isinstance(cpus, int | float) or not math.isfinite(cpus) or cpus <= 0:
+            raise SandboxError("sandbox.limits.cpus must be a number > 0")
+        fields["cpus"] = float(cpus)
+    if "memory" in raw:
+        if not isinstance(raw["memory"], str) or not _MEMORY.fullmatch(raw["memory"]):
+            raise SandboxError("sandbox.limits.memory must look like 512m or 2g (a whole number and k, m or g)")
+        fields["memory"] = raw["memory"]
+    for name in ("pids", "cpu_seconds"):
+        if name in raw:
+            fields[name] = _whole(name, raw[name])
+    return Limits(**fields)
+```
+
+`hbench/sandboxes/docker.py`:
+
+```python
+"""The `docker` sandbox (ADR 0010): every command runs in a fresh `docker run` of an image pinned by digest.
+
+The container gets the trial's workdir at `/work`, no network unless the config names one, no capabilities, no
+new privileges, the host user and the configured CPU, memory and process limits. The engine still starts the `docker`
+process, so its timeout and process-group kill apply; killing that client does not stop its container, so
+`end_step` removes the container of every command as soon as the command ends or times out.
+
+`mounts` are trusted config: a writable mount of anything sensitive (`/var/run/docker.sock`, a home directory) hands
+it to the agent and breaks the isolation. Mount helpers read-only (`:ro`).
+"""
+
+import os
+import posixpath
+import re
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
+from hbench.sandboxes.base import HostSession, ProcRunner, SandboxError, SandboxSession
+from hbench.sandboxes.limits import Limits, parse_limits
+
+IMAGE = re.compile(r"(?P<name>[A-Za-z0-9][A-Za-z0-9._/:-]*)@sha256:(?P<digest>[0-9a-f]{64})")
+NETWORK = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+MOUNT = re.compile(r"/[^:\s]+:/[^:\s]+(:ro)?")
+TRIAL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+LIMIT_KEYS = frozenset({"cpus", "memory", "pids"})
+CONTAINER_WORKDIR = "/work"
+HELPER_TIMEOUT = 60  # seconds for `docker rm` and `docker ps`
+
+
+def _image(section: Mapping[str, Any]) -> tuple[str, str]:
+    """The pinned image and its digest."""
+    image = section.get("image")
+    if not isinstance(image, str):
+        raise SandboxError("sandbox.image must be a string: name@sha256:<64 hex>")
+    match = IMAGE.fullmatch(image)
+    if match is None:
+        raise SandboxError(
+            f"sandbox.image {image!r} must be pinned by digest: name@sha256:<64 lowercase hex> "
+            "(a tag can change under the benchmark; `docker image inspect NAME --format '{{.Id}}'` gives the digest)"
+        )
+    return image, f"sha256:{match.group('digest')}"
+
+
+def _network(section: Mapping[str, Any]) -> str:
+    network = section.get("network", "none")
+    if not isinstance(network, str) or NETWORK.fullmatch(network) is None or network == "host":
+        raise SandboxError(
+            "sandbox.network must be 'none' or the name of a Docker network (not 'host': it shares the host network)"
+        )
+    return network
+
+
+def _mounts(section: Mapping[str, Any]) -> list[str]:
+    """The extra mounts, with each container path normalized (`/x/../work` is `/work`)."""
+    raw = section.get("mounts", [])
+    problem = SandboxError(
+        "sandbox.mounts must be a list of 'HOST:CONTAINER' or 'HOST:CONTAINER:ro' absolute paths, none of them "
+        f"{CONTAINER_WORKDIR} or under it (that is the workdir)"
+    )
+    if not (isinstance(raw, list) and all(isinstance(m, str) and MOUNT.fullmatch(m) for m in raw)):
+        raise problem
+    mounts = []
+    for mount in raw:
+        host, target, *mode = mount.split(":")
+        target = "/" + posixpath.normpath(target).lstrip("/")  # `//work` is `/work` to Docker
+        if target == CONTAINER_WORKDIR or target.startswith(CONTAINER_WORKDIR + "/"):
+            raise problem
+        mounts.append(":".join([host, target, *mode]))
+    return mounts
+
+
+class DockerSession(HostSession):
+    def __init__(self, sandbox: "DockerSandbox", workdir: Path, trial_id: str) -> None:
+        super().__init__(workdir)
+        self._sandbox = sandbox
+        self._trial_id = trial_id
+        self._names: list[str] = []  # the containers of the step in progress
+        self._started = 0  # commands run so far: names stay unique after `end_step`
+
+    def argv(self, argv: list[str], env_file: Path) -> list[str]:
+        name = f"hb-{self._trial_id}-{self._started}"
+        self._started += 1
+        self._names.append(name)
+        s = self._sandbox
+        limits = s.limits
+        flags = [
+            *(["--cpus", f"{limits.cpus:g}"] if limits.cpus is not None else []),
+            *(["--memory", limits.memory, "--memory-swap", limits.memory] if limits.memory is not None else []),
+            *(["--pids-limit", str(limits.pids)] if limits.pids is not None else []),
+        ]
+        return [
+            "docker",
+            "run",
+            "--rm",
+            "--name",
+            name,
+            "--env-file",
+            str(env_file),
+            "-v",
+            f"{self.workdir}:{CONTAINER_WORKDIR}",
+            *[part for mount in s.mounts for part in ("-v", mount)],
+            "-w",
+            CONTAINER_WORKDIR,
+            "--network",
+            s.network,
+            *flags,
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--user",
+            f"{os.getuid()}:{os.getgid()}",
+            s.image,
+            *argv,
+        ]
+
+    def end_step(self) -> None:
+        """Remove the containers of the command that just ended: killing the `docker run` client leaves its container
+        running, and it would keep writing to the workdir while the engine reads it."""
+        names, self._names = self._names, []
+        try:
+            self._sandbox.remove(names)
+        except SandboxError:
+            self._names = names + self._names  # `destroy` tries again
+            raise
+
+    def destroy(self) -> None:
+        self.end_step()  # whatever a command that never reached its end left
+
+
+class DockerSandbox:
+    isolated = True
+
+    def __init__(self, section: Mapping[str, Any], run: ProcRunner, env: Mapping[str, str]) -> None:
+        self.image, self._digest = _image(section)
+        self.network = _network(section)
+        self.limits: Limits = parse_limits(section.get("limits"), LIMIT_KEYS)
+        self.mounts = _mounts(section)
+        self._run = run
+        self._env = env
+
+    def create(self, workdir: Path, trial_id: str) -> SandboxSession:
+        if TRIAL_ID.fullmatch(trial_id) is None:
+            raise SandboxError(f"trial id {trial_id!r} cannot name a container: use letters, digits, _ . -")
+        return DockerSession(self, workdir, trial_id)
+
+    def _call(self, command: list[str]) -> tuple[int, str, str]:
+        """`(returncode, stdout, stderr)` of a helper command. Docker missing or the helper timing out is a
+        `SandboxError`: the caller cannot know what is still running."""
+        try:
+            rc, timed_out, out, err = self._run(command, None, self._env, HELPER_TIMEOUT)
+        except OSError as e:
+            raise SandboxError(f"{' '.join(command)}: {e.strerror}") from e
+        if timed_out:
+            raise SandboxError(f"{' '.join(command)} timed out after {HELPER_TIMEOUT} s")
+        return rc, out, err
+
+    def _force_remove(self, name: str) -> None:
+        command = ["docker", "rm", "-f", name]
+        rc, _, err = self._call(command)
+        if rc and "No such container" not in err:  # one that is already gone (`--rm` removed it) is what we want
+            raise SandboxError(f"{' '.join(command)} failed: {err.strip()}")
+
+    def _exists(self, name: str) -> bool:
+        command = ["docker", "ps", "-aq", "--filter", f"name=^{name}$"]
+        rc, out, err = self._call(command)
+        if rc:
+            raise SandboxError(f"{' '.join(command)} failed: {err.strip()}")
+        return bool(out.split())
+
+    def remove(self, names: list[str]) -> None:
+        """Make sure no container of `names` exists: `docker rm -f` each, check that it is gone, and once more if it
+        is not (a container that was still starting when `rm` ran). Fails closed with `SandboxError`: a container
+        that cannot be shown to be gone may still be writing to the workdir."""
+        for name in names:
+            self._force_remove(name)
+            if self._exists(name):
+                self._force_remove(name)
+                if self._exists(name):
+                    raise SandboxError(f"container {name} could not be removed")
+
+    def reclaim(self, trial_id: str) -> None:
+        command = ["docker", "ps", "-a", "--filter", f"name=hb-{trial_id}-", "--format", "{{.Names}}"]
+        rc, out, err = self._call(command)
+        if rc:
+            raise SandboxError(f"{' '.join(command)} failed: {err.strip()}")
+        self.remove(out.split())
+
+    def image_digest(self) -> str | None:
+        return self._digest
+
+    def describe(self) -> str:
+        return f"docker:{self.image}"
+```
+
+`hbench/doctor.py`:
+
+```python
+"""`doctor`: check that a benchmark can run, before it spends anything (ADR 0010, decision 10).
+
+Every check is independent and reports `ok`, `warning` (ok, but worth a look) or a failure with a reason. The checks
+start no agent and spend no tokens: they read the config and the environment, look up each harness CLI, ask Docker
+about the image and the network, and, only with `--network`, make two `GET`s to the configured LiteLLM (a health
+check and one page of spend logs, to see the spend key's permission). Details name variables, never their values.
+"""
+
+import json
+import os
+import secrets
+import shutil
+import tempfile
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import ModuleType
+from typing import Any
+
+from hbench.sandboxes import Sandbox
+from hbench.sandboxes.docker import DockerSandbox
+from hbench.suites import SuiteError
+
+PROBE_TIMEOUT_S = 120
+
+
+@dataclass(frozen=True)
+class Check:
+    name: str
+    ok: bool
+    detail: str
+    warning: bool = False  # passed, but the detail is worth reading
+
+
+def run_checks(cfg: Mapping[str, Any], base: Path, network: bool, engine: ModuleType | None = None) -> list[Check]:
+    """Every check of `cfg` (as loaded from the config file in `base`). `engine` is the `harness_bench` module
+    (found like the CLI finds it when not given). An invalid config is one failed `config` check: nothing else can
+    be judged then."""
+    if engine is None:
+        from hbench.cli import _engine  # here, not at the top: the CLI imports this module
+
+        engine = _engine()
+    try:
+        expanded = engine.expand_suites(cfg, base)
+        engine.validate_config(expanded)
+    except SystemExit as e:  # the engine reports a config error by exiting with the message
+        return [Check("config", False, str(e.code))]
+    except (KeyError, SuiteError) as e:
+        return [Check("config", False, f"missing or invalid setting: {e}")]
+    sandbox: Sandbox = engine.make_sandbox(expanded)
+    env = engine.base_env(expanded)
+    checks = [Check("config", True, "valid"), _env_check(expanded, engine)]
+    checks += _sandbox_checks(sandbox, expanded, engine, env)
+    image_ready = all(c.ok for c in checks if c.name == "sandbox")
+    checks += _harness_checks(expanded, sandbox, image_ready, engine, env)
+    urls = _url_checks(expanded, engine)
+    checks += urls
+    if network and urls[0].ok and not urls[0].warning and expanded.get("litellm"):
+        checks += _network_checks(expanded["litellm"], engine)
+    return checks
+
+
+# ---------------------------------------------------------------- environment
+
+
+def _referenced_variables(cfg: Mapping[str, Any], engine: ModuleType) -> list[str]:
+    """Every variable a `${VAR}` of the config reads: harness env, `litellm` and `judge`."""
+    values = [v for harness in cfg["harnesses"].values() for v in harness.get("env", {}).values()]
+    for section in ("litellm", "judge"):
+        values += [v for v in (cfg.get(section) or {}).values() if isinstance(v, str)]
+    return sorted({name for value in values for name in engine.env_var_names(value)})
+
+
+def _env_check(cfg: Mapping[str, Any], engine: ModuleType) -> Check:
+    """A `${VAR}` that is not set is a failure (it would expand to nothing); an `env_passthrough` name that is not
+    set is only passed on when it is, so it is a warning."""
+    names = _referenced_variables(cfg, engine)
+    missing = [name for name in names if not os.environ.get(name)]
+    unset_passthrough = [name for name in cfg.get("env_passthrough", []) if name not in os.environ]
+    if missing:
+        passthrough = f"; env_passthrough not set: {', '.join(unset_passthrough)}" if unset_passthrough else ""
+        return Check("env", False, f"not set: {', '.join(missing)}{passthrough}")
+    if unset_passthrough:
+        return Check("env", True, f"env_passthrough not set (not passed on): {', '.join(unset_passthrough)}", True)
+    return Check("env", True, f"{len(names)} variables set")
+
+
+# ---------------------------------------------------------------- sandbox
+
+
+def _run(engine: ModuleType, argv: list[str], env: Mapping[str, str], cwd: Path | None = None) -> tuple[int, str, str]:
+    """`(returncode, stdout, stderr)` of a helper command through the engine's `run_proc`; 127 when it is missing."""
+    try:
+        rc, _, out, err = engine.run_proc(argv, cwd, env, PROBE_TIMEOUT_S)
+    except OSError as e:
+        return 127, "", f"{argv[0]}: {e.strerror}"
+    return rc, out, err
+
+
+def _first_line(text: str) -> str:
+    return next((line.strip() for line in text.splitlines() if line.strip()), "")
+
+
+def _sandbox_checks(
+    sandbox: Sandbox, cfg: Mapping[str, Any], engine: ModuleType, env: Mapping[str, str]
+) -> list[Check]:
+    if not isinstance(sandbox, DockerSandbox):
+        note = "" if sandbox.isolated else ": no isolation, a run needs --allow-unsandboxed"
+        return [Check("sandbox", True, sandbox.describe() + note)]
+    return [_image_check(sandbox, engine, env), _network_check(sandbox, engine, env)]
+
+
+def _image_check(sandbox: DockerSandbox, engine: ModuleType, env: Mapping[str, str]) -> Check:
+    rc, out, err = _run(engine, ["docker", "image", "inspect", sandbox.image], env)
+    if rc:
+        reason = _first_line(err) or f"exit {rc}"
+        return Check(
+            "sandbox", False, f"image {sandbox.image} is not available ({reason}): docker pull it or build it first"
+        )
+    try:
+        info = json.loads(out)[0]
+        digests = {info["Id"], *(ref.rpartition("@")[2] for ref in info.get("RepoDigests", []))}
+    except (ValueError, LookupError, TypeError, AttributeError):
+        return Check("sandbox", False, f"cannot read the reply of docker image inspect {sandbox.image}")
+    if sandbox.image_digest() not in digests:
+        return Check(
+            "sandbox", False, f"image {sandbox.image} exists but its digest is not the pinned one ({sorted(digests)})"
+        )
+    return Check("sandbox", True, f"{sandbox.describe()}, image present")
+
+
+def _network_check(sandbox: DockerSandbox, engine: ModuleType, env: Mapping[str, str]) -> Check:
+    if sandbox.network == "none":
+        return Check("network", True, "none: no network inside the container")
+    create = f"docker network create --internal {sandbox.network}"
+    rc, out, err = _run(engine, ["docker", "network", "inspect", sandbox.network], env)
+    if rc:
+        return Check("network", False, f"docker has no network {sandbox.network!r} ({_first_line(err)}): {create}")
+    try:
+        internal = json.loads(out)[0]["Internal"]
+    except (ValueError, LookupError, TypeError):
+        return Check("network", False, f"cannot read the reply of docker network inspect {sandbox.network}")
+    if internal is True:
+        return Check("network", True, f"{sandbox.network} is internal: containers reach only what is attached to it")
+    return Check(
+        "network",
+        True,
+        f"{sandbox.network} is not internal: agents can reach the internet. Create one with `{create}` and attach "
+        "only the gateway to it",
+        warning=True,
+    )
+
+
+# ---------------------------------------------------------------- harness CLIs
+
+
+def _harness_checks(
+    cfg: Mapping[str, Any], sandbox: Sandbox, image_ready: bool, engine: ModuleType, env: Mapping[str, str]
+) -> list[Check]:
+    """One check per harness of the matrix: its CLI is where the sandbox runs it."""
+    names = list(dict.fromkeys(pair["harness"] for pair in cfg["matrix"]))
+    checks = []
+    for name in names:
+        command = cfg["harnesses"][name].get("command")
+        cli = command[0] if isinstance(command, list) and command else None
+        if cli is None:
+            checks.append(Check(f"harness {name}", True, "no command to look up"))
+        elif isinstance(sandbox, DockerSandbox):
+            checks.append(_probe_in_container(name, cli, sandbox, image_ready, engine, env))
+        else:
+            checks.append(_look_up_on_path(name, cli, sandbox))
+    return checks
+
+
+def _look_up_on_path(name: str, cli: str, sandbox: Sandbox) -> Check:
+    found = shutil.which(cli)
+    if found:
+        return Check(f"harness {name}", True, found)
+    if sandbox.isolated:  # a prefix or a plugin may run it somewhere the host cannot see
+        return Check(
+            f"harness {name}",
+            True,
+            f"{cli} is not on the host PATH (fine if the sandbox runs it elsewhere)",
+            warning=True,
+        )
+    return Check(f"harness {name}", False, f"{cli} is not on PATH")
+
+
+def _probe_in_container(
+    name: str, cli: str, sandbox: DockerSandbox, image_ready: bool, engine: ModuleType, env: Mapping[str, str]
+) -> Check:
+    """`<cli> --version` in the sandbox, with the limits and the no-network default of an agent."""
+    check = f"harness {name}"
+    if not image_ready:
+        return Check(check, False, "not checked: the image is not available")
+    with tempfile.TemporaryDirectory(prefix="harness-bench-doctor-") as tmp:
+        workdir, env_file = Path(tmp), Path(tmp) / "env"
+        engine.write_env_file({}, env_file)
+        session = sandbox.create(workdir, f"doctor-{secrets.token_hex(4)}")  # a name of its own per invocation
+        try:
+            rc, out, err = _run(engine, session.argv([cli, "--version"], env_file), env, workdir)
+        finally:
+            session.destroy()
+    if rc:
+        return Check(check, False, f"{cli} --version failed in the image: {_first_line(err) or f'exit {rc}'}")
+    return Check(check, True, _first_line(out) or f"{cli} answers")
+
+
+# ---------------------------------------------------------------- URLs and the gateway
+
+
+def _url_checks(cfg: Mapping[str, Any], engine: ModuleType) -> list[Check]:
+    """The LiteLLM and judge URLs follow the https rule (http only for localhost)."""
+    urls = {
+        f"{section}.base_url": str(cfg[section]["base_url"])
+        for section in ("litellm", "judge")
+        if (cfg.get(section) or {}).get("base_url")
+    }
+    if not urls:
+        return [Check("urls", True, "no litellm or judge section")]
+    problems, unset = [], []
+    for setting, raw in urls.items():
+        missing = sorted(n for n in engine.env_var_names(raw) if not os.environ.get(n))
+        if missing:
+            unset += missing
+            continue
+        try:
+            engine.check_litellm_url(engine.expand_env(raw), setting)
+        except SystemExit as e:
+            problems.append(str(e.code))
+    if problems:
+        return [Check("urls", False, "; ".join(problems))]
+    if unset:
+        return [Check("urls", True, f"skipped: {', '.join(unset)} not set", warning=True)]
+    return [Check("urls", True, ", ".join(urls))]
+
+
+def _network_checks(litellm: Mapping[str, Any], engine: ModuleType) -> list[Check]:
+    """One `GET` of the health endpoint and one of a single page of spend logs, both to the configured gateway."""
+    url, key = engine.expand_env(litellm["base_url"]), engine.expand_env(litellm.get("api_key", ""))
+    now = datetime.now(UTC)
+    fmt = "%Y-%m-%d %H:%M:%S"
+    spend = {"start_date": (now - timedelta(hours=1)).strftime(fmt), "end_date": now.strftime(fmt)}
+    requests: tuple[tuple[str, str, dict[str, Any]], ...] = (
+        ("litellm health", "/health/liveliness", {}),
+        ("litellm spend key", "/spend/logs/v2", {**spend, "page": 1, "page_size": 1}),
+    )
+    checks = []
+    for name, path, params in requests:
+        try:
+            engine.litellm_get(url, key, path, params)
+        except (OSError, ValueError) as e:  # URLError, HTTPError and timeouts are OSErrors; a bad reply a ValueError
+            checks.append(Check(name, False, f"GET {path}: {type(e).__name__}: {e}"))
+        else:
+            checks.append(Check(name, True, f"GET {path} answered"))
+    return checks
+```
+
 `hbench/results.py`:
 
 ```python
-"""Writing the contract output of a run: `<output_dir>/<run_id>/run.json` and `trials.jsonl`.
+"""Writing the contract output of a run: `<output_dir>/<run_id>/run.json` and `trials.jsonl`, and what `run --resume`
+needs: reopening a run directory and the heartbeat that says whether a run is still alive (ADR 0010).
 
 Files hold references only (log path prefixes), never prompts, agent output or diffs.
 """
@@ -4661,11 +5772,17 @@ Files hold references only (log path prefixes), never prompts, agent output or d
 import dataclasses
 import json
 import os
+import re
 import shutil
+import socket
+import sys
 import tempfile
+import threading
 from collections.abc import Callable, Mapping
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
+from types import TracebackType
+from typing import Any, Self
 
 from hbench.core.models import ContractError, Costs, RunInfo, TrialResult
 
@@ -4689,21 +5806,67 @@ def _atomic_write(path: Path, text: str) -> None:
         raise
 
 
-class RunWriter:
-    """Owns one run directory. `run.json` exists from construction; `close` adds the finish time."""
+RUN_ID = re.compile(r"[0-9a-f]{32}")  # `new_run_id()`: a UUID4 in hex
 
-    def __init__(self, out_dir: Path, info: RunInfo) -> None:
+
+class ResumeError(ValueError):
+    """A run cannot be reopened: it does not exist, or its files are not valid contract data."""
+
+
+class RunWriter:
+    """Owns one run directory. `run.json` exists from construction; `close` adds the finish time.
+
+    `RunWriter.open_existing` reopens the directory of an interrupted run (`run --resume`)."""
+
+    def __init__(self, out_dir: Path, info: RunInfo, *, existing: bool = False) -> None:
         self.info = info
         self.run_dir = out_dir / info.run_id
-        self.run_dir.mkdir(parents=True)
         self.trials_path = self.run_dir / "trials.jsonl"
-        self.trials_path.touch()
-        self._write_info()
+        if not existing:
+            self.run_dir.mkdir(parents=True)
+            self.trials_path.touch()
+            self._write_info()
+
+    @classmethod
+    def open_existing(cls, out_dir: Path, run_id: str) -> Self:
+        """The writer of the run `run_id` in `out_dir`, appending to its `trials.jsonl`. A last line cut short by a
+        crash is dropped, so the next trial starts on a line of its own. Raises `ResumeError` for an id that is
+        not a run id, a run that does not exist, or files that are not valid."""
+        if RUN_ID.fullmatch(run_id) is None:
+            raise ResumeError(f"{run_id!r} is not a run id (32 lowercase hex characters, the name of a run directory)")
+        info_path = out_dir / run_id / "run.json"
+        try:
+            info = RunInfo.from_dict(json.loads(info_path.read_text()))
+        except FileNotFoundError as e:
+            raise ResumeError(f"no run {run_id} in {out_dir}: {info_path} does not exist") from e
+        except ValueError as e:  # ContractError and json.JSONDecodeError are both ValueErrors
+            raise ResumeError(f"{info_path} is not valid run data: {e}") from e
+        writer = cls(out_dir, info, existing=True)
+        writer._drop_partial_last_line()
+        return writer
+
+    def _drop_partial_last_line(self) -> None:
+        text = self.trials_path.read_text() if self.trials_path.exists() else ""
+        if text and not text.endswith("\n"):
+            _atomic_write(self.trials_path, text[: text.rfind("\n") + 1])
+
+    def trials(self) -> list[TrialResult]:
+        """The trials written so far. Raises `ResumeError` when `trials.jsonl` holds anything else."""
+        try:
+            lines = self.trials_path.read_text().splitlines() if self.trials_path.exists() else []
+            return [TrialResult.from_dict(json.loads(line)) for line in lines if line.strip()]
+        except ValueError as e:
+            raise ResumeError(f"{self.trials_path} is not valid trial data: {e}") from e
+
+    def finished_trial_ids(self) -> set[str]:
+        return {trial.trial_id for trial in self.trials()}
 
     def append(self, trial: TrialResult) -> None:
+        """Add a trial and make it durable before returning: `fsync`, so a crash right after cannot lose it."""
         with self.trials_path.open("a") as f:
             f.write(json.dumps(trial.to_dict()) + "\n")
             f.flush()
+            os.fsync(f.fileno())
 
     def close(self, finished_at: datetime) -> None:
         self.info = dataclasses.replace(self.info, finished_at=finished_at)
@@ -4776,6 +5939,117 @@ def apply_gateway_costs(out_dir: Path, costs_by_tag: Mapping[str, float]) -> int
             _atomic_write(path, "".join(json.dumps(t.to_dict()) + "\n" for t in trials))
             updated += matched
     return updated
+
+
+# ---------------------------------------------------------------- heartbeat
+
+HEARTBEAT_FILE = "heartbeat.json"
+HEARTBEAT_INTERVAL_S = 30.0
+HEARTBEAT_FRESH_S = 90.0
+
+
+class Heartbeat:
+    """`<run_dir>/heartbeat.json`: who is running the run and what it is doing, rewritten atomically at each phase
+    change and every `interval` seconds by a daemon thread, so `--resume` can tell a live run from a killed one.
+    Fields: `pid`, `hostname`, `trial_id`, `phase`, `updated_at` and the `extra` ones the caller adds. Use it as a
+    context manager: it starts on entry and the file is removed on exit (a run that is gone leaves none)."""
+
+    def __init__(
+        self, path: Path, extra: Mapping[str, str] | None = None, interval: float = HEARTBEAT_INTERVAL_S
+    ) -> None:
+        self.path = path
+        self.interval = interval
+        self._state: dict[str, Any] = {"trial_id": None, "phase": "start", **(extra or {})}
+        self._lock = threading.Lock()
+        self._warned = False
+        self._stopped = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name="heartbeat", daemon=True)
+
+    def beat(self, trial_id: str | None, phase: str) -> None:
+        """Record the phase now (and rewrite the file at once)."""
+        with self._lock:
+            self._state.update(trial_id=trial_id, phase=phase)
+            self._write()
+
+    def _write(self) -> None:
+        """Write the file; the caller holds the lock. A failure (disk full, a dir gone) is warned about once and never
+        raised: a run must not die because its heartbeat could not be written, and the next beat may succeed."""
+        state = {
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            **self._state,
+            "updated_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        }
+        try:
+            _atomic_write(self.path, json.dumps(state, indent=2) + "\n")
+        except OSError as e:
+            if not self._warned:
+                self._warned = True
+                print(f"warning: heartbeat {self.path} not written (will keep trying): {e}", file=sys.stderr)
+
+    def _loop(self) -> None:
+        while not self._stopped.wait(self.interval):
+            with self._lock:
+                self._write()
+
+    def start(self) -> None:
+        """Write the first beat and start the thread."""
+        with self._lock:
+            self._write()
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop the thread and remove the file: a run that is gone leaves none."""
+        self._stopped.set()
+        self._thread.join()
+        self.path.unlink(missing_ok=True)
+
+    def __enter__(self) -> Self:
+        self.start()
+        return self
+
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None
+    ) -> None:
+        self.stop()
+
+
+def read_heartbeat(path: Path) -> dict[str, Any] | None:
+    """The heartbeat file as a dict, or None when it is missing or not a JSON object."""
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # it exists, and belongs to another user
+        return True
+    return True
+
+
+def heartbeat_is_live(path: Path, now: datetime | None = None, max_age_s: float = HEARTBEAT_FRESH_S) -> bool:
+    """Whether the run behind this heartbeat file may still be running: it is fresh (younger than `max_age_s`) and
+    its pid is alive on this host. A fresh heartbeat of another host cannot be checked, so it counts as alive. A
+    missing, malformed or stale file means the run is gone."""
+    data = read_heartbeat(path)
+    if data is None:
+        return False
+    pid, host, updated = data.get("pid"), data.get("hostname"), data.get("updated_at")
+    if not (isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and isinstance(host, str)):
+        return False
+    try:
+        age = ((now or datetime.now(UTC)) - datetime.fromisoformat(str(updated))).total_seconds()
+    except (ValueError, TypeError):  # not a timestamp, or a naive one
+        return False
+    if age >= max_age_s:
+        return False
+    return _pid_alive(pid) if host == socket.gethostname() else True
 ```
 
 `hbench/stats.py`:
@@ -5784,6 +7058,7 @@ from typing import Any
 
 from hbench.calibration import calibrate, calibration_status, read_labels, write_calibration
 from hbench.core.schema import schema_document
+from hbench.doctor import run_checks
 from hbench.judge import JudgeError
 from hbench.profiles import apply_litellm_profile
 from hbench.suites import Suite, SuiteError, load_suite, suite_label, suite_tasks
@@ -5791,12 +7066,14 @@ from hbench.suites import Suite, SuiteError, load_suite, suite_label, suite_task
 _DESCRIPTION = (
     "harness-bench: compare coding-agent harness x model pairs. Main metric: cost per solved task.\n\n"
     "  python3 -m hbench run       --config config.json [--reps 3] [--only HARNESS] [--keep] [--dry-run]\n"
+    "  python3 -m hbench run       --config config.json --resume RUN_ID [--force]   # continue an interrupted run\n"
     "  python3 -m hbench reconcile --config config.json   # pull real spend from LiteLLM\n"
     "  python3 -m hbench report    --config config.json [--drop-saturated]\n"
     "  python3 -m hbench schema export [--out PATH]       # JSON Schema of trials.jsonl and run.json\n"
     "  python3 -m hbench suite list     [--config C | PATH...]\n"
     "  python3 -m hbench suite validate [--config C] [--run [--allow-unsandboxed]] [PATH...]\n"
-    "  python3 -m hbench judge calibrate --config C --labels LABELS.jsonl --out calibration.json\n\n"
+    "  python3 -m hbench judge calibrate --config C --labels LABELS.jsonl --out calibration.json\n"
+    "  python3 -m hbench doctor    --config C [--network]   # check env, CLIs, image and network; spends nothing\n\n"
     "Add --litellm to run, report or reconcile for the LiteLLM-only benchmark."
 )
 
@@ -5840,7 +7117,17 @@ def build_parser(epilog: str | None = None) -> argparse.ArgumentParser:
     run.add_argument("--keep", action="store_true", help="keep work directories")
     run.add_argument("--dry-run", action="store_true", help="print commands only")
     run.add_argument(
-        "--allow-unsandboxed", action="store_true", help="run without sandbox.prefix (only inside a disposable VM)"
+        "--allow-unsandboxed", action="store_true", help="run without a sandbox (only inside a disposable VM)"
+    )
+    run.add_argument(
+        "--resume",
+        metavar="RUN_ID",
+        help="continue the run RUN_ID (a directory of the output dir): trials already in its trials.jsonl are skipped",
+    )
+    run.add_argument(
+        "--force",
+        action="store_true",
+        help="with --resume: resume although the run's heartbeat says it may still be running",
     )
     run.add_argument(
         "--settle",
@@ -5872,9 +7159,16 @@ def build_parser(epilog: str | None = None) -> argparse.ArgumentParser:
         "--run", action="store_true", help="the graders must fail on the repo and pass with the solution"
     )
     validate.add_argument(
-        "--allow-unsandboxed", action="store_true", help="with --run: no sandbox.prefix (only inside a disposable VM)"
+        "--allow-unsandboxed", action="store_true", help="with --run: no sandbox (only inside a disposable VM)"
     )
     validate.add_argument("paths", nargs="*", metavar="PATH", help="suite directories")
+    doctor = sub.add_parser("doctor", help="check that the benchmark can run; starts no agent and spends nothing")
+    doctor.add_argument("--config", required=True)
+    doctor.add_argument(
+        "--network",
+        action="store_true",
+        help="also GET the LiteLLM health endpoint and one page of spend logs (the spend key's permission)",
+    )
     judge = sub.add_parser("judge", help="LLM judge tools")
     judge_sub = judge.add_subparsers(dest="judge_cmd", required=True)
     calibrate_cmd = judge_sub.add_parser(
@@ -6007,6 +7301,21 @@ def _judge_calibrate(args: argparse.Namespace) -> None:
     print(f"{'calibrated' if reason is None else f'experimental: {reason}'}; saved {args.out}")
 
 
+def _doctor(args: argparse.Namespace) -> None:
+    """`doctor`: print one line per check; exit 1 when any check failed."""
+    engine = _engine()
+    cfg_path = Path(args.config).resolve()
+    checks = run_checks(json.loads(cfg_path.read_text()), cfg_path.parent, args.network, engine)
+    for check in checks:
+        status = "warn " if check.warning else "ok   " if check.ok else "FAIL "
+        print(f"{status} {check.name}: {check.detail}")
+    failed = sum(not c.ok for c in checks)
+    warned = sum(c.warning for c in checks)
+    print(f"{len(checks)} checks, {failed} failed, {warned} warnings")
+    if failed:
+        sys.exit(1)
+
+
 def _run_litellm(engine: ModuleType, args: argparse.Namespace, cfg: dict[str, Any], base: Path) -> None:
     """`run` under the LiteLLM profile: report only after reconcile, when the gateway cost exists."""
     engine.cmd_run(args, cfg, base)
@@ -6031,6 +7340,9 @@ def main(argv: Sequence[str] | None = None, *, epilog: str | None = None) -> Non
         return
     if args.cmd == "judge":
         _judge_calibrate(args)
+        return
+    if args.cmd == "doctor":
+        _doctor(args)
         return
     engine = _engine()
     cfg_path = Path(args.config).resolve()
@@ -6254,7 +7566,7 @@ if __name__ == "__main__":
   "cost_source": "auto",
   "output_dir": "results",
   "sandbox": {
-    "_comment": "Image from sandbox/Dockerfile. Without Docker, leave prefix empty and use --allow-unsandboxed only inside a disposable VM.",
+    "_comment": "Image from sandbox/Dockerfile. Without Docker, leave prefix empty and use --allow-unsandboxed only inside a disposable VM. Alternative with limits, no network by default and a recorded image digest: replace this section with {\"type\": \"docker\", \"image\": \"harness-bench-agents@sha256:<digest of docker image inspect --format '{{.Id}}'>\", \"network\": \"none\", \"limits\": {\"cpus\": 2, \"memory\": \"4g\", \"pids\": 512}}; the agents then reach nothing unless you name an internal Docker network that holds only LiteLLM (docs/machine-setup.md).",
     "prefix": [
       "docker",
       "run",
@@ -6751,6 +8063,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -7200,6 +8513,36 @@ def main() -> None:
         p = run(tmp, "harness_bench.py", "run", "--allow-unsandboxed", config=remote, expect_ok=False)
         check(p.returncode != 0 and "judge.base_url" in p.stderr, "judge: plain http to a remote host is refused")
 
+        # --- a process the agent leaves running in the background is killed with its process group, before grading
+        bg_file = tmp / "background.txt"
+        os.environ["FAKE_BG_FILE"] = str(bg_file)
+        steady = (
+            f"{PY} -c \"import os, time; p = os.environ['FAKE_BG_FILE']; a = os.path.getsize(p); time.sleep(0.5); "
+            'b = os.path.getsize(p); raise SystemExit(0 if a == b else 1)"'
+        )
+        bg_env = dict(harness_env, FAKE_BG_FILE="${FAKE_BG_FILE}")
+        cfg9 = dict(
+            cfg,
+            output_dir="results-bg",
+            env_passthrough=["FAKE_BG_FILE"],
+            tasks=[dict(fizz, graders=[{"type": "hidden_tests"}, {"type": "command", "command": steady}])],
+            harnesses={"claude": fixtures.harness("claude", bg_env, "fork-bg")},
+            matrix=[{"harness": "claude", "model": "m"}],
+        )
+        (tmp / "config9.json").write_text(json.dumps(cfg9))
+        run(tmp, "harness_bench.py", "run", "--allow-unsandboxed", config="config9.json")
+        (bg_row,) = results(tmp / "results-bg/results.jsonl")
+        grew = bg_file.stat().st_size
+        time.sleep(0.5)
+        check(
+            grew > 0 and bg_file.stat().st_size == grew,
+            "process group: a background process the agent left behind is dead after the agent step",
+        )
+        check(
+            bg_row["passed"] and not bg_row["agent_timed_out"],
+            "process group: it was gone before grading, and it never held the agent step up",
+        )
+
         # --- config validation and URL policy
         for bad, why in (
             (dict(fizz, id="/etc"), "absolute task id"),
@@ -7239,7 +8582,7 @@ if __name__ == "__main__":
 ```python
 """Fake coding-agent CLI for tests. Prints the JSON shape of a real harness.
 
-Usage: fake_agent.py <claude|opencode|pi|codex|cursor> <fix|nofix|hack|probe-hidden|plant-link|artifacts|artifacts-secret|artifacts-link|hide-git|hide-git-clean|hide-ignore|hide-attr|hide-config>
+Usage: fake_agent.py <claude|opencode|pi|codex|cursor> <fix|nofix|hack|probe-hidden|plant-link|artifacts|artifacts-secret|artifacts-link|hide-git|hide-git-clean|hide-ignore|hide-attr|hide-config|fork-bg|slow-once|slow-writer>
 "fix" repairs fizzbuzz.py in the cwd. "hack" leaves the bug and tampers with the test
 infrastructure instead (rewrites run_tests.py, adds conftest.py, moves git refs).
 The "hide-*" modes fix the bug and then try to hide a forbidden change from the diff:
@@ -7255,6 +8598,11 @@ separated) or a .py file holding the marker that every example hidden test carri
 make the grader overwrite a host file.
 "artifacts" writes `report.html` and `summary.json` from `data.csv` (the examples-artifacts suite); "artifacts-secret"
 also puts $FAKE_API_KEY in the report, and "artifacts-link" plants `report.html` as a symlink to $FAKE_CANARY_FILE.
+"fork-bg" fixes the bug and leaves a background process behind that appends to $FAKE_BG_FILE every 50 ms (it keeps
+stdout open and stays in the agent's process group, like `sleep 600 &` in a shell): the engine must kill it.
+"slow-writer" appends to late.txt every 50 ms for a minute, in the foreground (an agent that outlasts its timeout).
+"slow-once" fixes the bug like "fix", but first sleeps (up to 90 s) while the file $FAKE_SLOW_FLAG exists; it gives up
+as soon as its parent is gone, so a killed engine leaves no agent behind.
 Security probes: exits 9 if the LiteLLM spend key or SECRET_CANARY reached the agent,
 prints FAKE_API_KEY to stderr (must be redacted in logs), and records git history depth. When BENCH_TAG is set (and kind is not cursor),
 the tag is appended to $FAKE_TAGS_FILE, which fake_litellm.py serves as spend logs.
@@ -7313,7 +8661,7 @@ def find_hidden_tests() -> list[str]:
 
 
 kind, mode = sys.argv[1], sys.argv[2]
-fix = mode in ("fix", "plant-link") or mode.startswith("hide-")
+fix = mode in ("fix", "plant-link", "fork-bg", "slow-once") or mode.startswith("hide-")
 for leaked in ("FAKE_KEY", "SECRET_CANARY"):
     if leaked in os.environ:
         sys.exit(9)
@@ -7405,6 +8753,50 @@ if mode == "artifacts-link":
     os.symlink(os.environ["FAKE_CANARY_FILE"], "report.html")
     with open("summary.json", "w") as f:
         json.dump({"total": 245, "rows": 3, "regions": ["north", "south", "east"]}, f)
+BACKGROUND_WRITER = "import sys, time\nwhile True:\n    open(sys.argv[1], 'a').write('x')\n    time.sleep(0.05)\n"
+
+
+def leave_background_process() -> None:
+    """Start a process that outlives this one unless the engine kills the process group, and wait until it writes."""
+    import subprocess
+    import time
+
+    path = os.environ["FAKE_BG_FILE"]
+    subprocess.Popen([sys.executable, "-c", BACKGROUND_WRITER, path])
+    deadline = time.time() + 30
+    while not (os.path.exists(path) and os.path.getsize(path)) and time.time() < deadline:
+        time.sleep(0.02)
+
+
+def wait_while_flag_exists() -> None:
+    """Sleep while $FAKE_SLOW_FLAG exists, but stop when the parent process dies."""
+    import time
+
+    parent, flag = os.getppid(), os.environ["FAKE_SLOW_FLAG"]
+    if os.environ.get("FAKE_SLOW_PID"):  # lets the test make sure no agent outlives it
+        with open(os.environ["FAKE_SLOW_PID"], "w") as f:
+            f.write(str(os.getpid()))
+    deadline = time.time() + 90
+    while os.path.exists(flag) and os.getppid() == parent and time.time() < deadline:
+        time.sleep(0.05)
+
+
+def write_for_a_minute() -> None:
+    import time
+
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        with open("late.txt", "a") as f:
+            f.write("x")
+        time.sleep(0.05)
+
+
+if mode == "slow-writer":
+    write_for_a_minute()
+if mode == "fork-bg":
+    leave_background_process()
+if mode == "slow-once":
+    wait_while_flag_exists()
 if mode == "plant-link":
     os.symlink(os.environ["FAKE_CANARY_FILE"], "test_hidden.py")
 if mode.startswith("hide-"):
@@ -8186,6 +9578,7 @@ import dataclasses
 import os
 import shutil
 import subprocess
+import time
 import unittest
 from pathlib import Path
 from typing import Any
@@ -8359,12 +9752,14 @@ class RmtreeInsideTests(unittest.TestCase):
 
 
 class WrapTests(unittest.TestCase):
-    def test_without_prefix_returns_argv_unchanged(self) -> None:
-        self.assertEqual(hb.wrap({}, ["a", "b"], "/w", "/e"), ["a", "b"])
+    def test_without_a_sandbox_returns_argv_unchanged(self) -> None:
+        session = hb.make_sandbox({}).create(Path("/w"), "t")
+        self.assertEqual(hb.wrap(session, ["a", "b"], Path("/e")), ["a", "b"])
 
     def test_prefix_is_formatted_and_prepended(self) -> None:
         cfg = {"sandbox": {"prefix": ["box", "--env-file", "{env_file}", "-v", "{workdir}:/w"]}}
-        self.assertEqual(hb.wrap(cfg, ["a"], "/w", "/e"), ["box", "--env-file", "/e", "-v", "/w:/w", "a"])
+        session = hb.make_sandbox(cfg).create(Path("/w"), "t")
+        self.assertEqual(hb.wrap(session, ["a"], Path("/e")), ["box", "--env-file", "/e", "-v", "/w:/w", "a"])
 
 
 class WriteEnvFileTests(unittest.TestCase):
@@ -8385,6 +9780,59 @@ class RunProcTests(unittest.TestCase):
         code = "import sys, time; print('partial', flush=True); print('e', file=sys.stderr, flush=True); time.sleep(60)"
         rc, timed_out, out, err = hb.run_proc([fixtures.PY, "-c", code], None, os.environ.copy(), 5)
         self.assertEqual((rc, timed_out, out.strip(), err.strip()), (-1, True, "partial", "e"))
+
+
+BACKGROUND_LEADER = """
+import pathlib, subprocess, sys, time
+marker = pathlib.Path(sys.argv[1])
+child = "import sys, time\\nwhile True:\\n    open(sys.argv[1], 'a').write('x')\\n    time.sleep(0.05)\\n"
+subprocess.Popen([sys.executable, "-c", child, str(marker)])  # inherits stdout and stderr, stays in our group
+deadline = time.time() + 30
+while not marker.exists() and time.time() < deadline:
+    time.sleep(0.02)
+if sys.argv[2] == "sleep":
+    time.sleep(120)
+"""
+
+
+def stays_still(path: Path) -> bool:
+    """Whether the file stops growing: its writer appends every 50 ms, so 0.5 s without change means it is gone."""
+    before = path.stat().st_size
+    time.sleep(0.5)
+    return before > 0 and path.stat().st_size == before
+
+
+class ProcessGroupTests(unittest.TestCase):
+    def test_a_background_process_does_not_outlive_the_command_nor_hold_it_up(self) -> None:
+        marker = fixtures.tmpdir(self) / "bg.txt"
+        started = time.time()
+        rc, timed_out, _, _ = hb.run_proc(
+            [fixtures.PY, "-c", BACKGROUND_LEADER, str(marker), "exit"], None, os.environ.copy(), 25
+        )
+        self.assertEqual((rc, timed_out), (0, False))
+        self.assertLess(time.time() - started, 20)  # it did not wait for the child's end of the pipe
+        self.assertTrue(stays_still(marker))
+
+    def test_a_leader_reaped_by_someone_else_raises_that_error_not_a_lookup_error(self) -> None:
+        with mock.patch.object(os, "waitid", side_effect=ChildProcessError(10, "No child processes")):
+            with self.assertRaises(ChildProcessError):
+                hb.run_proc([fixtures.PY, "-c", "pass"], None, os.environ.copy(), 30)
+
+    def test_the_original_error_survives_when_the_group_is_gone_too(self) -> None:
+        with (
+            mock.patch.object(os, "waitid", side_effect=ChildProcessError(10, "No child processes")),
+            mock.patch.object(os, "killpg", side_effect=ProcessLookupError),
+        ):
+            with self.assertRaises(ChildProcessError):
+                hb.run_proc([fixtures.PY, "-c", "pass"], None, os.environ.copy(), 30)
+
+    def test_a_timeout_kills_the_whole_process_group(self) -> None:
+        marker = fixtures.tmpdir(self) / "bg.txt"
+        rc, timed_out, _, _ = hb.run_proc(
+            [fixtures.PY, "-c", BACKGROUND_LEADER, str(marker), "sleep"], None, os.environ.copy(), 5
+        )
+        self.assertEqual((rc, timed_out), (-1, True))
+        self.assertTrue(stays_still(marker))
 
 
 class BuildCmdTests(unittest.TestCase):
@@ -8434,8 +9882,11 @@ class ResolveWorkRootTests(unittest.TestCase):
 
     def test_default_is_a_fresh_temp_dir(self) -> None:
         root = hb.resolve_work_root({}, fixtures.tmpdir(self))
-        self.addCleanup(root.rmdir)
+        self.addCleanup(shutil.rmtree, root, True)
         self.assertTrue(root.name.startswith("harness-bench-work-"))
+        self.assertEqual(
+            hb.holds_token(root, (root / hb.OWNER_MARK_FILE).read_text()), True
+        )  # it can be recognized again
 
 
 class PrepareWorkdirTests(unittest.TestCase):
@@ -8559,7 +10010,8 @@ class RunStepTests(unittest.TestCase):
     def test_stdout_and_stderr_come_back_apart_and_redacted_and_the_log_has_both(self) -> None:
         work, log = fixtures.tmpdir(self), fixtures.tmpdir(self) / "step.log"
         script = "echo out-supersecret1; echo err-supersecret1 >&2; exit 3"
-        step = hb.run_step({}, script, dict(os.environ), 30, log, work, work.parent / "env", ["supersecret1"])
+        session = hb.make_sandbox({}).create(work, "t")
+        step = hb.run_step(session, script, dict(os.environ), 30, log, work, work.parent / "env", ["supersecret1"])
         self.assertEqual(step, (3, False, "out-***REDACTED***\n", "err-***REDACTED***\n"))
         self.assertEqual(log.read_text(), "out-***REDACTED***\n\n--- stderr ---\nerr-***REDACTED***\n")
 
@@ -9058,6 +10510,8 @@ def args(**overrides: Any) -> argparse.Namespace:
         "allow_unsandboxed": True,
         "no_report": True,
         "cost_source": None,
+        "resume": None,
+        "force": False,
     }
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -10235,8 +11689,40 @@ class ToolCallsTests(unittest.TestCase):
         loaded = TrialResult.from_dict(d)
         self.assertEqual((loaded.usage.tool_calls, loaded.schema_version), (None, "1.0.0"))
 
-    def test_the_current_contract_version_is_1_2_0(self) -> None:
-        self.assertEqual((SCHEMA_VERSION, trial().schema_version), ("1.2.0", "1.2.0"))
+    def test_the_current_contract_version_is_1_3_0(self) -> None:
+        self.assertEqual((SCHEMA_VERSION, trial().schema_version), ("1.3.0", "1.3.0"))
+
+
+class SandboxFieldTests(unittest.TestCase):
+    def test_a_run_names_its_sandbox_and_it_round_trips(self) -> None:
+        info = run_info(sandbox="docker:img@sha256:" + "a" * 64)
+        self.assertEqual(RunInfo.from_dict(info.to_dict()), info)
+        self.assertEqual(info.to_dict()["sandbox"], "docker:img@sha256:" + "a" * 64)
+
+    def test_the_sandbox_is_unknown_when_nothing_says_otherwise(self) -> None:
+        self.assertEqual(run_info().sandbox, "unknown")
+
+    def test_a_run_of_contract_1_0_to_1_2_loads_with_an_unknown_sandbox(self) -> None:
+        for version in ("1.0.0", "1.1.0", "1.2.0"):
+            d = run_info().to_dict()
+            del d["sandbox"]
+            d["schema_version"] = version
+            with self.subTest(version=version):
+                loaded = RunInfo.from_dict(d)
+                self.assertEqual((loaded.sandbox, loaded.schema_version), ("unknown", version))
+
+    def test_the_sandbox_must_be_a_string(self) -> None:
+        bad_values: list[Any] = [3, None, True, ["docker"]]
+        for bad in bad_values:
+            with self.subTest(bad=bad), self.assertRaises(ContractError):
+                run_info(sandbox=bad)
+
+    def test_a_trial_records_the_image_digest_and_a_1_2_trial_loads_without_one_set(self) -> None:
+        digest = "sha256:" + "b" * 64
+        self.assertEqual(TrialResult.from_dict(trial(image_digest=digest).to_dict()).image_digest, digest)
+        d = trial().to_dict()
+        d["schema_version"] = "1.2.0"
+        self.assertIsNone(TrialResult.from_dict(d).image_digest)
 
 
 class JudgeFieldTests(unittest.TestCase):
@@ -10365,8 +11851,8 @@ class ValidateContractTests(unittest.TestCase):
     def test_schema_document_holds_both_schemas_with_ids(self) -> None:
         doc = schema_document()
         self.assertEqual((doc["trial"], doc["run"]), (TRIAL_SCHEMA, RUN_SCHEMA))
-        self.assertTrue(TRIAL_SCHEMA["$id"].endswith("/trial/1.2.0"))
-        self.assertTrue(RUN_SCHEMA["$id"].endswith("/run/1.2.0"))
+        self.assertTrue(TRIAL_SCHEMA["$id"].endswith("/trial/1.3.0"))
+        self.assertTrue(RUN_SCHEMA["$id"].endswith("/run/1.3.0"))
 
 
 class ValidatorKeywordTests(unittest.TestCase):
@@ -15030,6 +16516,2118 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
+`tests/test_sandboxes.py`:
+
+```python
+"""The sandbox protocol and its implementations (ADR 0010): registry, `prefix`, `local-tmp`, copies and lifecycle."""
+
+import json
+import os
+import signal
+import unittest
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any, TypeGuard
+from unittest import mock
+
+import fixtures
+import harness_bench as hb
+from hbench.plugins import PluginError
+from hbench.sandboxes import BUILTIN_TYPES, Sandbox, SandboxError, SandboxSession, sandbox_for
+from test_plugins import installed
+from test_run import RunTestCase, args, rows_of
+
+ENV: dict[str, str] = {"PATH": os.environ.get("PATH", "")}
+
+
+def never_run(argv: list[str], cwd: Path | None, env: Mapping[str, str], timeout: float) -> tuple[int, bool, str, str]:
+    raise AssertionError(f"no process expected, got {argv}")
+
+
+def build(cfg: Mapping[str, Any]) -> Sandbox:
+    return sandbox_for(cfg, never_run, ENV)
+
+
+def example_sandbox_section() -> dict[str, Any]:
+    section: dict[str, Any] = json.loads((fixtures.ROOT / "config.example.json").read_text())["sandbox"]
+    return section
+
+
+class RegistryTests(unittest.TestCase):
+    def test_without_a_sandbox_section_commands_run_on_the_host(self) -> None:
+        sandbox = build({})
+        self.assertEqual((sandbox.describe(), sandbox.isolated, sandbox.image_digest()), ("local-tmp", False, None))
+
+    def test_the_type_defaults_to_prefix_when_a_prefix_is_set(self) -> None:
+        sandbox = build({"sandbox": {"prefix": ["box"]}})
+        self.assertEqual((sandbox.describe(), sandbox.isolated), ("prefix", True))
+
+    def test_an_explicit_type_wins(self) -> None:
+        self.assertEqual(build({"sandbox": {"type": "local-tmp"}}).describe(), "local-tmp")
+
+    def test_builtin_types_are_listed(self) -> None:
+        self.assertEqual(BUILTIN_TYPES, ("prefix", "docker", "local-tmp"))
+
+    def test_the_section_must_be_an_object(self) -> None:
+        with self.assertRaisesRegex(SandboxError, "sandbox must be an object"):
+            build({"sandbox": ["docker"]})
+
+    def test_the_type_must_be_a_string(self) -> None:
+        with self.assertRaisesRegex(SandboxError, "sandbox.type must be a string"):
+            build({"sandbox": {"type": 3}})
+
+    def test_an_unknown_type_without_a_plugin_is_an_error_that_names_the_entry_point_group(self) -> None:
+        with self.assertRaisesRegex(PluginError, "harness_bench.sandboxes"):
+            build({"sandbox": {"type": "nope"}})
+
+    def test_unknown_keys_are_a_config_error_for_a_builtin_type(self) -> None:
+        with self.assertRaisesRegex(SandboxError, "unknown sandbox keys: \\['netwrk'\\]"):
+            build({"sandbox": {"type": "local-tmp", "netwrk": "none"}})
+
+    def test_a_comment_key_is_allowed(self) -> None:
+        self.assertEqual(build({"sandbox": {"_comment": "why", "prefix": ["box"]}}).describe(), "prefix")
+
+
+class PrefixTests(unittest.TestCase):
+    def test_argv_of_the_example_config_is_what_the_old_wrap_built(self) -> None:
+        section = example_sandbox_section()
+        session = build({"sandbox": section}).create(Path("/w"), "trial")
+        expected = [p.format(workdir="/w", env_file="/e") for p in section["prefix"]] + ["a", "b"]
+        self.assertEqual(session.argv(["a", "b"], Path("/e")), expected)
+        self.assertEqual(expected[:9], ["docker", "run", "--rm", "--env-file", "/e", "-v", "/w:/w", "-w", "/w"])
+        self.assertEqual(expected[-3:], ["harness-bench-agents", "a", "b"])
+
+    def test_prefix_is_formatted_and_prepended(self) -> None:
+        cfg = {"sandbox": {"prefix": ["box", "--env-file", "{env_file}", "-v", "{workdir}:/w"]}}
+        argv = build(cfg).create(Path("/w"), "t").argv(["a"], Path("/e"))
+        self.assertEqual(argv, ["box", "--env-file", "/e", "-v", "/w:/w", "a"])
+
+    def test_the_prefix_must_be_a_list_of_strings(self) -> None:
+        for bad in ("docker run", [], ["ok", 3], None):
+            with self.subTest(bad=bad), self.assertRaisesRegex(SandboxError, "sandbox.prefix"):
+                build({"sandbox": {"type": "prefix", "prefix": bad}})
+
+    def test_an_image_digest_is_unknown(self) -> None:
+        self.assertIsNone(build({"sandbox": {"prefix": ["box"]}}).image_digest())
+
+    def test_reclaim_and_destroy_do_nothing(self) -> None:
+        sandbox = build({"sandbox": {"prefix": ["box"]}})
+        sandbox.reclaim("t")
+        sandbox.create(Path("/w"), "t").destroy()
+
+
+class LocalTmpTests(unittest.TestCase):
+    def test_argv_is_unchanged(self) -> None:
+        session = build({}).create(Path("/w"), "t")
+        self.assertEqual(session.argv(["a", "b"], Path("/e")), ["a", "b"])
+
+    def test_the_run_is_refused_without_the_flag_and_accepted_with_it(self) -> None:
+        for cfg in ({}, {"sandbox": {"type": "local-tmp"}}):
+            with self.subTest(cfg=cfg):
+                with self.assertRaises(SystemExit) as cm:
+                    hb.require_sandbox(cfg, False)
+                self.assertIn("No sandbox configured", str(cm.exception.code))
+                hb.require_sandbox(cfg, True)
+
+    def test_a_configured_sandbox_needs_no_flag(self) -> None:
+        hb.require_sandbox({"sandbox": {"prefix": ["box"]}}, False)
+
+    def test_is_sandboxed_follows_the_type(self) -> None:
+        self.assertEqual(
+            (hb.is_sandboxed({}), hb.is_sandboxed({"sandbox": {"prefix": ["box"]}})),
+            (False, True),
+        )
+
+    def test_a_bad_section_exits_with_a_message(self) -> None:
+        with self.assertRaises(SystemExit) as cm:
+            hb.is_sandboxed({"sandbox": {"type": "prefix"}})
+        self.assertIn("sandbox.prefix", str(cm.exception.code))
+
+
+class CopyTests(unittest.TestCase):
+    def session(self, workdir: Path) -> SandboxSession:
+        return build({}).create(workdir, "t")
+
+    def test_copy_in_puts_a_file_and_a_tree_in_the_workdir(self) -> None:
+        work, src = fixtures.tmpdir(self), fixtures.tmpdir(self)
+        (src / "one.txt").write_text("1")
+        (src / "tree").mkdir()
+        (src / "tree" / "two.txt").write_text("2")
+        session = self.session(work)
+        session.copy_in(src / "one.txt", "a/b/one.txt")
+        session.copy_in(src / "tree", "c")
+        self.assertEqual(((work / "a/b/one.txt").read_text(), (work / "c/two.txt").read_text()), ("1", "2"))
+
+    def test_copy_in_never_writes_through_a_link_the_agent_planted(self) -> None:
+        work, src, host = fixtures.tmpdir(self), fixtures.tmpdir(self), fixtures.tmpdir(self)
+        (host / "secret.txt").write_text("host")
+        (work / "dir").symlink_to(host, target_is_directory=True)
+        (work / "file.txt").symlink_to(host / "secret.txt")
+        (src / "file.txt").write_text("new")
+        session = self.session(work)
+        session.copy_in(src / "file.txt", "dir/file.txt")
+        session.copy_in(src / "file.txt", "file.txt")
+        self.assertEqual(
+            ((host / "secret.txt").read_text(), list(host.iterdir()), (work / "file.txt").read_text()),
+            ("host", [host / "secret.txt"], "new"),
+        )
+
+    def test_a_path_that_leaves_the_workdir_is_refused(self) -> None:
+        work, src = fixtures.tmpdir(self), fixtures.tmpdir(self)
+        (src / "f").write_text("x")
+        session = self.session(work)
+        for rel in ("/abs", "../out", "a/../../out", ""):
+            with self.subTest(rel=rel):
+                with self.assertRaises(SandboxError):
+                    session.copy_in(src / "f", rel)
+                with self.assertRaises(SandboxError):
+                    session.copy_out(rel, src / "dest")
+
+    def test_copy_out_returns_a_file_and_a_tree(self) -> None:
+        work, dest = fixtures.tmpdir(self), fixtures.tmpdir(self)
+        (work / "out").mkdir()
+        (work / "out" / "r.txt").write_text("r")
+        (work / "out" / "sub").mkdir()
+        (work / "out" / "sub" / "s.txt").write_text("s")
+        session = self.session(work)
+        session.copy_out("out/r.txt", dest / "one" / "r.txt")
+        session.copy_out("out", dest / "tree")
+        self.assertEqual(
+            (
+                (dest / "one/r.txt").read_text(),
+                (dest / "tree/r.txt").read_text(),
+                (dest / "tree/sub/s.txt").read_text(),
+            ),
+            ("r", "r", "s"),
+        )
+
+    def test_copy_out_never_follows_a_link_the_agent_planted(self) -> None:
+        work, dest, host = fixtures.tmpdir(self), fixtures.tmpdir(self), fixtures.tmpdir(self)
+        (host / "secret.txt").write_text("host")
+        (work / "leak.txt").symlink_to(host / "secret.txt")
+        (work / "via").symlink_to(host, target_is_directory=True)
+        (work / "tree").mkdir()
+        (work / "tree" / "leak").symlink_to(host / "secret.txt")
+        (work / "tree" / "dirlink").symlink_to(host, target_is_directory=True)
+        os.mkfifo(work / "pipe")
+        session = self.session(work)
+        for rel in ("leak.txt", "via/secret.txt", "tree", "pipe", "missing"):
+            with self.subTest(rel=rel), self.assertRaises((ValueError, FileNotFoundError)):
+                session.copy_out(rel, dest / "x")
+        self.assertEqual([p for p in dest.rglob("*") if p.is_file() and p.read_text() == "host"], [])
+
+    def test_copy_out_of_a_tree_with_a_special_file_leaves_no_such_file(self) -> None:
+        work, dest = fixtures.tmpdir(self), fixtures.tmpdir(self)
+        (work / "tree").mkdir()
+        os.mkfifo(work / "tree" / "pipe")
+        with self.assertRaises(ValueError):
+            self.session(work).copy_out("tree", dest / "x")
+
+
+class RecordingSandbox:
+    """A plugin-style sandbox that runs commands unchanged and records its lifecycle."""
+
+    isolated = True
+
+    def __init__(self) -> None:
+        self.events: list[str] = []
+        self.steps = 0  # `end_step` calls so far
+        self.failing_steps: set[int] = set()  # the numbers of the calls that raise
+        self.failing_destroy = False
+
+    def create(self, workdir: Path, trial_id: str) -> SandboxSession:
+        self.events.append(f"create {trial_id}")
+        return RecordingSession(self)
+
+    def reclaim(self, trial_id: str) -> None:
+        self.events.append(f"reclaim {trial_id}")
+
+    def image_digest(self) -> str | None:
+        return "sha256:" + "a" * 64
+
+    def describe(self) -> str:
+        return "recording"
+
+
+class RecordingSession:
+    def __init__(self, owner: RecordingSandbox) -> None:
+        self.owner = owner
+        self.events = owner.events
+
+    def argv(self, argv: list[str], env_file: Path) -> list[str]:
+        self.events.append("argv " + " ".join(argv))
+        return argv
+
+    def copy_in(self, src: Path, rel: str) -> None:
+        self.events.append(f"copy_in {rel}")
+
+    def copy_out(self, rel: str, dest: Path) -> None:
+        self.events.append(f"copy_out {rel}")
+
+    def end_step(self) -> None:
+        self.events.append("end_step")
+        self.owner.steps += 1
+        if self.owner.steps in self.owner.failing_steps:
+            raise SandboxError("container of the step could not be removed")
+
+    def destroy(self) -> None:
+        self.events.append("destroy")
+        if self.owner.failing_destroy:
+            raise SandboxError("container could not be removed")
+
+
+def _is_sandbox(obj: object) -> TypeGuard[Sandbox]:
+    return isinstance(obj, Sandbox)
+
+
+PLUGIN_MODULE = """
+from pathlib import Path
+
+
+class Plugin:
+    isolated = True
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+    def create(self, workdir, trial_id):
+        raise NotImplementedError
+
+    def reclaim(self, trial_id):
+        pass
+
+    def image_digest(self):
+        return None
+
+    def describe(self):
+        return "plugin:" + self.cfg["label"]
+
+
+def factory(cfg):
+    return Plugin(cfg)
+
+
+def not_a_sandbox(cfg):
+    return object()
+"""
+
+
+class PluginTests(unittest.TestCase):
+    def test_a_plugin_sandbox_is_built_from_its_section(self) -> None:
+        points = "[harness_bench.sandboxes]\nvm = demo_plugin:factory\n"
+        with installed(self, points, PLUGIN_MODULE), fixtures.quiet() as buf:
+            sandbox = build({"sandbox": {"type": "vm", "label": "x"}})
+        self.assertEqual((sandbox.describe(), sandbox.isolated), ("plugin:x", True))
+        self.assertIn("plugin harness_bench.sandboxes:vm from demo_plugin 0.1", buf.getvalue())
+
+    def test_a_plugin_that_returns_something_else_is_an_error(self) -> None:
+        points = "[harness_bench.sandboxes]\nvm = demo_plugin:not_a_sandbox\n"
+        with (
+            installed(self, points, PLUGIN_MODULE),
+            fixtures.quiet(),
+            self.assertRaisesRegex(PluginError, "not a Sandbox"),
+        ):
+            build({"sandbox": {"type": "vm"}})
+
+    def test_a_plugin_cannot_take_a_builtin_name(self) -> None:
+        points = "[harness_bench.sandboxes]\nprefix = demo_plugin:factory\n"
+        with installed(self, points, PLUGIN_MODULE), self.assertRaisesRegex(PluginError, "built-in name"):
+            build({"sandbox": {"type": "vm"}})
+
+    def test_the_recording_sandbox_satisfies_the_protocol(self) -> None:
+        self.assertTrue(_is_sandbox(RecordingSandbox()))
+
+
+class LifecycleTests(RunTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.sandbox = RecordingSandbox()
+        self.cfg["matrix"] = [{"harness": "claude", "model": "fix"}]
+        patcher = mock.patch.object(hb, "make_sandbox", return_value=self.sandbox)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_every_trial_gets_a_session_that_is_destroyed_after_its_commands(self) -> None:
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        events = self.sandbox.events
+        self.assertEqual(
+            (len([e for e in events if e.startswith("create ")]), events.count("destroy"), events[-1]),
+            (1, 1, "destroy"),
+        )
+        self.assertTrue(any(e.startswith("argv ") and "fake_agent.py" in e for e in events))
+        self.assertTrue(any(e.startswith("argv sh -c") for e in events))  # the hidden tests ran through it too
+        (row,) = rows_of(self.base)
+        self.assertTrue(row["sandboxed"])
+
+    def test_the_run_and_the_trial_record_what_the_sandbox_describes(self) -> None:
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        (run_dir,) = [p.parent for p in (self.base / "results").glob("*/trials.jsonl")]
+        info = json.loads((run_dir / "run.json").read_text())
+        (trial,) = fixtures.read_rows(run_dir / "trials.jsonl")
+        self.assertEqual((info["sandbox"], trial["image_digest"]), ("recording", "sha256:" + "a" * 64))
+
+    def test_every_command_ends_its_step_before_the_engine_looks_at_the_workdir_or_runs_the_next_one(self) -> None:
+        events = self.sandbox.events
+        real_collect = hb.collect_changes
+
+        def collect(baseline: Any) -> Any:
+            events.append("collect_changes")
+            return real_collect(baseline)
+
+        with mock.patch.object(hb, "collect_changes", collect):
+            fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        commands = [i for i, e in enumerate(events) if e.startswith("argv ")]
+        self.assertEqual(len(commands), 2)  # the agent, then the hidden tests
+        for index in commands:
+            self.assertEqual(events[index + 1], "end_step")
+        self.assertEqual(events[commands[0] + 2], "collect_changes")
+
+    def test_the_step_ends_when_the_agent_times_out_or_the_command_raises(self) -> None:
+        self.cfg["tasks"][0]["timeout"] = 0.2
+        self.cfg["harnesses"]["claude"]["command"] = [fixtures.PY, "-c", "import time; time.sleep(30)"]
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        events = self.sandbox.events
+        first = next(i for i, e in enumerate(events) if e.startswith("argv "))
+        self.assertEqual(events[first + 1], "end_step")
+        self.cfg["output_dir"] = "results-again"
+        with mock.patch.object(hb, "run_proc", side_effect=RuntimeError("boom")), self.assertRaises(RuntimeError):
+            fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        self.assertEqual(events[-2:], ["end_step", "destroy"])
+
+    def ran_graders(self) -> bool:
+        return any(e.startswith("argv sh -c") for e in self.sandbox.events)
+
+    def test_an_agent_container_that_cannot_be_removed_fails_the_trial_closed_without_grading(self) -> None:
+        self.sandbox.failing_steps = {1}
+        out = fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        (row,) = rows_of(self.base)
+        self.assertEqual((row["passed"], self.ran_graders(), self.sandbox.events[-1]), (False, False, "destroy"))
+        self.assertIn("container of the step could not be removed", out)
+
+    def test_a_grader_container_that_cannot_be_removed_fails_the_trial_although_the_tests_passed(self) -> None:
+        self.sandbox.failing_steps = {2}
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        (row,) = rows_of(self.base)
+        self.assertEqual((row["passed"], self.ran_graders()), (False, True))
+
+    def test_a_session_that_cannot_be_destroyed_is_a_warning_after_the_verdict(self) -> None:
+        self.sandbox.failing_destroy = True
+        out = fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        (row,) = rows_of(self.base)
+        self.assertEqual(row["passed"], True)
+        self.assertIn("warning: could not remove the sandbox of", out)
+
+    def test_run_step_without_a_place_to_record_the_loss_raises(self) -> None:
+        self.sandbox.failing_steps = {1}
+        work = fixtures.tmpdir(self)
+        session = self.sandbox.create(work, "t")
+        with self.assertRaises(SandboxError):
+            hb.run_step(session, "true", dict(os.environ), 30, work / "log", work, work / "env", [])
+
+    def test_the_session_is_destroyed_when_the_agent_step_raises(self) -> None:
+        with mock.patch.object(hb, "run_proc", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        self.assertEqual(self.sandbox.events.count("destroy"), 1)
+
+
+class LimitsTests(unittest.TestCase):
+    def test_memory_converts_to_bytes_and_unset_limits_stay_none(self) -> None:
+        from hbench.sandboxes.limits import Limits, parse_limits
+
+        keys = frozenset({"memory", "pids"})
+        self.assertEqual(
+            (
+                parse_limits({"memory": "512k"}, keys).memory_bytes,
+                parse_limits({"memory": "3m"}, keys).memory_bytes,
+                parse_limits({"memory": "2g"}, keys).memory_bytes,
+                parse_limits(None, keys),
+            ),
+            (512 * 1024, 3 * 1024**2, 2 * 1024**3, Limits()),
+        )
+
+
+def local_argv(limits: Mapping[str, Any], argv: list[str]) -> list[str]:
+    return build({"sandbox": {"type": "local-tmp", "limits": limits}}).create(Path("/w"), "t").argv(argv, Path("/e"))
+
+
+def run_limited(limits: Mapping[str, Any], code: str, timeout: float = 60) -> tuple[int, bool, str, str]:
+    return hb.run_proc(local_argv(limits, [fixtures.PY, "-c", code]), None, dict(os.environ), timeout)
+
+
+class LocalLimitsTests(unittest.TestCase):
+    def test_a_limit_that_local_tmp_cannot_apply_leaves_the_argv_alone(self) -> None:
+        self.assertEqual(local_argv({"cpus": 2}, ["a", "b"]), ["a", "b"])
+        self.assertEqual(local_argv({}, ["a", "b"]), ["a", "b"])
+
+    def test_the_limits_become_rlimits_in_a_launcher_that_then_runs_the_command(self) -> None:
+        argv = local_argv({"memory": "2g", "pids": 64, "cpu_seconds": 30, "cpus": 1}, ["a", "b"])
+        self.assertEqual((argv[0], argv[1], argv[2]), (fixtures.PY, "-I", "-c"))
+        self.assertEqual(
+            (json.loads(argv[4]), argv[5:]),
+            ({"RLIMIT_AS": 2 * 1024**3, "RLIMIT_NPROC": 64, "RLIMIT_CPU": 30}, ["a", "b"]),
+        )
+
+    def test_unsupported_limit_keys_and_bad_values_are_config_errors(self) -> None:
+        for limits in ({"gpus": 1}, {"cpu_seconds": 0}, {"memory": "9"}):
+            with self.subTest(limits=limits), self.assertRaises(SandboxError):
+                build({"sandbox": {"type": "local-tmp", "limits": limits}})
+
+    def test_the_memory_limit_stops_a_process_that_allocates_more(self) -> None:
+        rc, _, out, err = run_limited({"memory": "512m"}, "b = bytearray(2 * 1024**3); print('allocated')")
+        self.assertEqual((rc == 0, "allocated" in out, "MemoryError" in err), (False, False, True))
+
+    def test_a_process_inside_the_limit_runs_normally(self) -> None:
+        self.assertEqual(run_limited({"memory": "2g", "cpu_seconds": 60}, "print('fine')")[:3:2], (0, "fine\n"))
+
+    def test_the_cpu_limit_kills_a_busy_loop(self) -> None:
+        rc, timed_out, _, _ = run_limited({"cpu_seconds": 1}, "while True: pass")
+        self.assertEqual((rc, timed_out), (-int(signal.SIGKILL), False))  # soft = hard: the kernel kills
+
+    @unittest.skipIf(os.geteuid() == 0, "root is not bound by RLIMIT_NPROC")
+    def test_the_process_limit_stops_a_fork(self) -> None:
+        code = "import os\ntry:\n    os.fork()\nexcept OSError as e:\n    print('refused', e.errno)\n"
+        rc, _, out, _ = run_limited({"pids": 1}, code)
+        self.assertEqual((rc, out.startswith("refused")), (0, True))
+
+
+class RunRecordsSandboxTests(RunTestCase):
+    def recorded(self) -> tuple[str, str | None]:
+        fixtures.call_quiet(hb.cmd_run, args(), self.cfg, self.base)
+        (run_dir,) = [p.parent for p in (self.base / "results").glob("*/trials.jsonl")]
+        info = json.loads((run_dir / "run.json").read_text())
+        trials = fixtures.read_rows(run_dir / "trials.jsonl")
+        return info["sandbox"], trials[0]["image_digest"]
+
+    def test_without_a_sandbox_the_run_is_local_tmp_and_there_is_no_digest(self) -> None:
+        self.assertEqual(self.recorded(), ("local-tmp", None))
+
+    def test_a_prefix_sandbox_is_named_prefix_and_has_no_digest(self) -> None:
+        self.cfg["sandbox"] = {"prefix": ["env", "X=1"]}
+        self.assertEqual(self.recorded(), ("prefix", None))
+```
+
+`tests/fake_docker.py`:
+
+```python
+"""A fake `docker` executable for tests: it records its argv and answers the few commands the engine uses.
+
+`install(dest)` writes a launcher named `docker` into `dest` (put `dest` first on PATH). The fake reads:
+  FAKE_DOCKER_LOG       file that gets one JSON argv per call (required)
+  FAKE_DOCKER_PS        text printed by `docker ps` (container names or ids, one per line)
+  FAKE_DOCKER_RM_RC     exit code of `docker rm` (default 0); FAKE_DOCKER_RM_ERR is printed to stderr
+  FAKE_DOCKER_MISSING   comma separated commands that `docker run ... <image> <cmd> --version` cannot find (127)
+  FAKE_DOCKER_VERSION   what `docker run ... <image> <cmd> --version` prints (default 1.2.3)
+  FAKE_DOCKER_INSPECT   JSON printed by `docker image inspect` and `docker network inspect`
+  FAKE_DOCKER_INSPECT_RC  exit code of both inspect commands (default 0)
+  FAKE_DOCKER_STATE     directory: with it, `docker run` starts the command in a session of its own (a container
+                        that outlives a killed client) and `docker rm -f NAME` kills it
+`docker run -v HOST:/work -w /work --env-file F ... IMAGE CMD...` runs CMD on the host with cwd HOST and the
+environment of F: enough to run the engine end to end through the real `docker run` argv of the sandbox.
+"""
+
+import json
+import os
+import signal
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+# `docker run` options that take a value; every other option is a flag.
+VALUE_OPTIONS = {
+    "--name",
+    "--env-file",
+    "-v",
+    "-w",
+    "--network",
+    "--cpus",
+    "--memory",
+    "--memory-swap",
+    "--pids-limit",
+    "--cap-drop",
+    "--security-opt",
+    "--user",
+}
+
+
+def install(dest: Path) -> Path:
+    """Write the `docker` launcher into `dest`; returns its path."""
+    launcher = dest / "docker"
+    launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{Path(__file__).resolve()}" "$@"\n')
+    launcher.chmod(launcher.stat().st_mode | stat.S_IXUSR)
+    return launcher
+
+
+def parse_run(args: list[str]) -> tuple[dict[str, str], list[str], list[str]]:
+    """The options with a value, the option list of `-v` mounts and the image-and-command of a `docker run`."""
+    options: dict[str, str] = {}
+    mounts: list[str] = []
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        if args[i] in VALUE_OPTIONS:
+            if args[i] == "-v":
+                mounts.append(args[i + 1])
+            options[args[i]] = args[i + 1]
+            i += 2
+        else:
+            options[args[i]] = ""
+            i += 1
+    return options, mounts, args[i:]
+
+
+def kill_container(pid: int) -> None:
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def read_env_file(path: str) -> dict[str, str]:
+    env = {"PATH": os.environ.get("PATH", "")}
+    for line in Path(path).read_text().splitlines():
+        key, _, value = line.partition("=")
+        env[key] = value
+    return env
+
+
+def run(args: list[str]) -> int:
+    options, mounts, rest = parse_run(args)
+    command = rest[1:]  # rest[0] is the image
+    if command and command[-1] == "--version":  # a probe such as `docker run ... IMAGE claude --version`
+        if command[0] in os.environ.get("FAKE_DOCKER_MISSING", "").split(","):
+            print(f"exec: {command[0]!r}: executable file not found in $PATH", file=sys.stderr)
+            return 127
+        print(os.environ.get("FAKE_DOCKER_VERSION", "1.2.3"))
+        return 0
+    workdir = next(m.split(":", 1)[0] for m in mounts if m.endswith(":/work"))
+    env = read_env_file(options["--env-file"]) if "--env-file" in options else {"PATH": os.environ.get("PATH", "")}
+    state = os.environ.get("FAKE_DOCKER_STATE")
+    detached = state is not None and "--name" in options
+    child = subprocess.Popen(command, cwd=workdir, env=env, stdin=subprocess.DEVNULL, start_new_session=detached)
+    if detached:
+        (Path(state or "") / options["--name"]).write_text(str(child.pid))
+    return child.wait()
+
+
+def main(argv: list[str]) -> int:
+    with open(os.environ["FAKE_DOCKER_LOG"], "a") as log:
+        log.write(json.dumps(argv) + "\n")
+    command = argv[0] if argv else ""
+    if command == "run":
+        return run(argv[1:])
+    if command == "ps":
+        print(os.environ.get("FAKE_DOCKER_PS", ""), end="")
+        return 0
+    if command == "rm":
+        state = os.environ.get("FAKE_DOCKER_STATE")
+        for name in argv[2:] if state else []:
+            pid_file = Path(state or "") / name
+            if pid_file.exists():
+                kill_container(int(pid_file.read_text()))
+        if os.environ.get("FAKE_DOCKER_RM_ERR"):
+            print(os.environ["FAKE_DOCKER_RM_ERR"], file=sys.stderr)
+        return int(os.environ.get("FAKE_DOCKER_RM_RC", "0"))
+    if command in ("image", "network"):
+        print(os.environ.get("FAKE_DOCKER_INSPECT", "[]"))
+        return int(os.environ.get("FAKE_DOCKER_INSPECT_RC", "0"))
+    print(f"fake docker: unsupported command {argv}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+```
+
+`tests/test_docker_sandbox.py`:
+
+```python
+"""The `docker` sandbox (ADR 0010): config checks, the exact `docker run` argv, cleanup, and a run through a fake
+`docker` executable. No Docker is needed."""
+
+import json
+import os
+import unittest
+from collections.abc import Callable, Mapping
+from pathlib import Path
+from typing import Any
+from unittest import mock
+
+import fake_docker
+import fixtures
+import harness_bench as hb
+from hbench.sandboxes import Sandbox, SandboxError, SandboxSession, sandbox_for
+from test_run import RunTestCase, args, rows_of
+
+DIGEST = "a" * 64
+IMAGE = f"harness-bench-agents@sha256:{DIGEST}"
+LIST_T1_0 = ["docker", "ps", "-aq", "--filter", "name=^hb-t1-0$"]  # the check that a removed container is gone
+LIST_T1_1 = ["docker", "ps", "-aq", "--filter", "name=^hb-t1-1$"]
+GONE = (1, False, "", "Error response from daemon: No such container: hb-t1-0")
+Call = tuple[list[str], Path | None, Mapping[str, str], float]
+
+
+class Recorder:
+    """A `run_proc` stand-in: records every call and answers with `result`."""
+
+    def __init__(
+        self,
+        result: tuple[int, bool, str, str] = (0, False, "", ""),
+        script: list[tuple[int, bool, str, str]] | None = None,
+    ) -> None:
+        self.calls: list[Call] = []
+        self.result = result
+        self.script = list(script or [])  # answers for the first calls; `result` answers the rest
+
+    def __call__(
+        self, argv: list[str], cwd: Path | None, env: Mapping[str, str], timeout: float
+    ) -> tuple[int, bool, str, str]:
+        self.calls.append((argv, cwd, env, timeout))
+        return self.script.pop(0) if self.script else self.result
+
+
+def docker_cfg(**section: Any) -> dict[str, Any]:
+    return {"sandbox": {"type": "docker", "image": IMAGE, **section}}
+
+
+def build(cfg: Mapping[str, Any], run: Callable[..., Any] | None = None) -> Sandbox:
+    return sandbox_for(cfg, run or Recorder(), {"PATH": "/bin"})
+
+
+def argv_of(sandbox: Sandbox, trial: str = "t1") -> list[str]:
+    return sandbox.create(Path("/w"), trial).argv(["agent", "--go"], Path("/e"))
+
+
+class ConfigTests(unittest.TestCase):
+    def test_a_digest_pinned_image_is_accepted(self) -> None:
+        sandbox = build(docker_cfg())
+        self.assertEqual(
+            (sandbox.describe(), sandbox.isolated, sandbox.image_digest()),
+            (f"docker:{IMAGE}", True, f"sha256:{DIGEST}"),
+        )
+
+    def test_a_tag_is_a_config_error(self) -> None:
+        for image in ("img:latest", "img", "registry.example.com/team/img:1.2"):
+            with self.subTest(image=image), self.assertRaisesRegex(SandboxError, "pinned by digest"):
+                build(docker_cfg(image=image))
+
+    def test_a_malformed_digest_is_a_config_error(self) -> None:
+        for image in (
+            "img@sha256:abc",
+            f"img@sha256:{'A' * 64}",
+            f"img@sha256:{'a' * 65}",
+            f"img@sha512:{'a' * 64}",
+            f"img@sha256:{'g' * 64}",
+            f"-img@sha256:{DIGEST}",
+            f"img @sha256:{DIGEST}",
+            f"@sha256:{DIGEST}",
+        ):
+            with self.subTest(image=image), self.assertRaisesRegex(SandboxError, "pinned by digest"):
+                build(docker_cfg(image=image))
+
+    def test_the_image_is_required_and_a_string(self) -> None:
+        for section in ({"type": "docker"}, {"type": "docker", "image": 3}):
+            with self.subTest(section=section), self.assertRaisesRegex(SandboxError, "sandbox.image"):
+                build({"sandbox": section})
+
+    def test_a_registry_with_a_port_is_a_valid_image_name(self) -> None:
+        image = f"localhost:5000/team/agents@sha256:{DIGEST}"
+        self.assertEqual(build(docker_cfg(image=image)).describe(), f"docker:{image}")
+
+    def test_the_network_is_checked(self) -> None:
+        for network in (3, "", "host", "container:x", "-x", "a b"):
+            with self.subTest(network=network), self.assertRaisesRegex(SandboxError, "sandbox.network"):
+                build(docker_cfg(network=network))
+
+    def test_bad_limits_are_a_config_error(self) -> None:
+        bad: list[tuple[Any, str]] = [
+            ({"cpus": 0}, "limits.cpus"),
+            ({"cpus": -1}, "limits.cpus"),
+            ({"cpus": True}, "limits.cpus"),
+            ({"cpus": "2"}, "limits.cpus"),
+            ({"cpus": float("inf")}, "limits.cpus"),
+            ({"cpus": float("nan")}, "limits.cpus"),
+            ({"memory": "2"}, "limits.memory"),
+            ({"memory": "2gb"}, "limits.memory"),
+            ({"memory": "0m"}, "limits.memory"),
+            ({"memory": "-1g"}, "limits.memory"),
+            ({"memory": 2048}, "limits.memory"),
+            ({"memory": "2 g"}, "limits.memory"),
+            ({"pids": 0}, "limits.pids"),
+            ({"pids": 1.5}, "limits.pids"),
+            ({"pids": True}, "limits.pids"),
+            ({"pids": "9"}, "limits.pids"),
+            ({"cpu_seconds": 5}, "limits"),
+            ({"gpus": 1}, "limits"),
+            ([1], "limits must be an object"),
+        ]
+        for limits, message in bad:
+            with self.subTest(limits=limits), self.assertRaisesRegex(SandboxError, message):
+                build(docker_cfg(limits=limits))
+
+    def test_mounts_are_checked(self) -> None:
+        for mounts in (
+            "/a:/b",
+            ["a:/b"],
+            ["/a:b"],
+            ["/a:/b:rw"],
+            ["/a:/b:ro:x"],
+            [3],
+            ["/a b:/c"],
+            ["/a:/work"],
+        ):  # the last: the workdir itself
+            with self.subTest(mounts=mounts), self.assertRaisesRegex(SandboxError, "sandbox.mounts"):
+                build(docker_cfg(mounts=mounts))
+
+    def test_nothing_may_be_mounted_at_or_under_the_workdir_however_the_path_is_written(self) -> None:
+        for target in ("/work/", "/work/sub", "/x/../work", "//work", "/work/./a", "/a/../work/b"):
+            with self.subTest(target=target), self.assertRaisesRegex(SandboxError, "sandbox.mounts"):
+                build(docker_cfg(mounts=[f"/h:{target}"]))
+
+    def test_a_mount_target_is_written_normalized(self) -> None:
+        argv = argv_of(build(docker_cfg(mounts=["/h/a:/x/../y/./z:ro", "/h/b://w"])))
+        self.assertEqual(argv[7:13], ["-v", "/w:/work", "-v", "/h/a:/y/z:ro", "-v", "/h/b:/w"])
+
+    def test_unknown_keys_and_a_prefix_are_refused(self) -> None:
+        for extra in ({"netwrk": "none"}, {"prefix": ["x"]}):
+            with self.subTest(extra=extra), self.assertRaisesRegex(SandboxError, "unknown sandbox keys"):
+                build(docker_cfg(**extra))
+
+    def test_a_trial_id_that_is_not_a_container_name_is_refused(self) -> None:
+        sandbox = build(docker_cfg())
+        for trial in ("", "-x", "a b", "../x", ".x"):
+            with self.subTest(trial=trial), self.assertRaisesRegex(SandboxError, "trial id"):
+                sandbox.create(Path("/w"), trial)
+
+
+class ArgvTests(unittest.TestCase):
+    def test_default_argv_has_no_network_no_capabilities_and_the_host_user(self) -> None:
+        self.assertEqual(
+            argv_of(build(docker_cfg())),
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--name",
+                "hb-t1-0",
+                "--env-file",
+                "/e",
+                "-v",
+                "/w:/work",
+                "-w",
+                "/work",
+                "--network",
+                "none",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges",
+                "--user",
+                f"{os.getuid()}:{os.getgid()}",
+                IMAGE,
+                "agent",
+                "--go",
+            ],
+        )
+
+    def test_full_limits_and_a_named_network(self) -> None:
+        limits = {"cpus": 1.5, "memory": "2g", "pids": 256}
+        argv = argv_of(build(docker_cfg(network="hb-egress", limits=limits)))
+        self.assertEqual(
+            argv[9:23],
+            [
+                "-w",
+                "/work",
+                "--network",
+                "hb-egress",
+                "--cpus",
+                "1.5",
+                "--memory",
+                "2g",
+                "--memory-swap",
+                "2g",
+                "--pids-limit",
+                "256",
+                "--cap-drop",
+                "ALL",
+            ],
+        )
+        self.assertEqual(argv[-3:], [IMAGE, "agent", "--go"])
+
+    def test_a_whole_number_of_cpus_has_no_decimal_point(self) -> None:
+        self.assertIn("2", argv_of(build(docker_cfg(limits={"cpus": 2.0}))))
+
+    def test_each_limit_alone_adds_only_its_own_flags(self) -> None:
+        for limits, flags in (
+            ({"memory": "512m"}, ["--memory", "512m", "--memory-swap", "512m"]),
+            ({"pids": 64}, ["--pids-limit", "64"]),
+            ({"cpus": 3}, ["--cpus", "3"]),
+        ):
+            with self.subTest(limits=limits):
+                argv = argv_of(build(docker_cfg(limits=limits)))
+                start = argv.index("none") + 1
+                self.assertEqual(argv[start : start + len(flags)], flags)
+
+    def test_mounts_follow_the_workdir_mount(self) -> None:
+        argv = argv_of(build(docker_cfg(mounts=["/h/tests:/h/tests:ro", "/h/shared:/h/shared"])))
+        self.assertEqual(argv[7:13], ["-v", "/w:/work", "-v", "/h/tests:/h/tests:ro", "-v", "/h/shared:/h/shared"])
+
+    def test_every_command_of_a_trial_gets_its_own_container_name(self) -> None:
+        session = build(docker_cfg()).create(Path("/w"), "t1")
+        names = [session.argv(["x"], Path("/e"))[4] for _ in range(3)]
+        self.assertEqual(names, ["hb-t1-0", "hb-t1-1", "hb-t1-2"])
+
+    def test_the_prefix_form_still_builds_what_it_always_built(self) -> None:
+        section = json.loads((fixtures.ROOT / "config.example.json").read_text())["sandbox"]
+        argv = sandbox_for({"sandbox": section}, Recorder(), {}).create(Path("/w"), "t").argv(["a"], Path("/e"))
+        self.assertEqual((argv[:3], argv[-2:]), (["docker", "run", "--rm"], ["harness-bench-agents", "a"]))
+
+
+class DestroyTests(unittest.TestCase):
+    def test_destroy_removes_every_container_of_the_session_with_rm_f(self) -> None:
+        run = Recorder()
+        session = build(docker_cfg(), run).create(Path("/w"), "t1")
+        session.argv(["a"], Path("/e"))
+        session.argv(["b"], Path("/e"))
+        session.destroy()
+        self.assertEqual((run.calls[0][1], dict(run.calls[0][2])), (None, {"PATH": "/bin"}))
+        self.assertEqual(
+            [c[0] for c in run.calls],
+            [
+                ["docker", "rm", "-f", "hb-t1-0"],
+                LIST_T1_0,
+                ["docker", "rm", "-f", "hb-t1-1"],
+                LIST_T1_1,
+            ],
+        )
+
+    def test_end_step_removes_only_the_containers_of_that_step(self) -> None:
+        run = Recorder()
+        session = build(docker_cfg(), run).create(Path("/w"), "t1")
+        session.argv(["a"], Path("/e"))
+        session.end_step()
+        session.end_step()  # nothing new: no second call
+        session.argv(["b"], Path("/e"))
+        session.end_step()
+        session.destroy()  # nothing pending
+        self.assertEqual(
+            [c[0] for c in run.calls],
+            [["docker", "rm", "-f", "hb-t1-0"], LIST_T1_0, ["docker", "rm", "-f", "hb-t1-1"], LIST_T1_1],
+        )
+
+    def test_destroy_without_a_command_runs_nothing(self) -> None:
+        run = Recorder()
+        build(docker_cfg(), run).create(Path("/w"), "t1").destroy()
+        self.assertEqual(run.calls, [])
+
+    def pending(self, run: Callable[..., Any]) -> SandboxSession:
+        session = build(docker_cfg(), run).create(Path("/w"), "t1")
+        session.argv(["a"], Path("/e"))
+        return session
+
+    def test_a_container_that_is_already_gone_is_fine(self) -> None:
+        run = Recorder(script=[GONE])
+        self.pending(run).end_step()
+        self.assertEqual([c[0] for c in run.calls], [["docker", "rm", "-f", "hb-t1-0"], LIST_T1_0])
+
+    def test_any_other_failure_of_rm_fails_closed(self) -> None:
+        run = Recorder(script=[(1, False, "", "Cannot connect to the Docker daemon")])
+        with self.assertRaisesRegex(SandboxError, "docker rm -f hb-t1-0 failed: Cannot connect"):
+            self.pending(run).end_step()
+        self.assertEqual(len(run.calls), 1)
+
+    def test_a_helper_that_times_out_or_is_missing_fails_closed(self) -> None:
+        with self.assertRaisesRegex(SandboxError, "timed out"):
+            self.pending(Recorder(script=[(-1, True, "", "")])).end_step()
+        missing = mock.Mock(side_effect=FileNotFoundError(2, "No such file or directory"))
+        with self.assertRaisesRegex(SandboxError, "docker rm -f hb-t1-0: No such file or directory"):
+            self.pending(missing).end_step()
+
+    def test_a_container_still_listed_after_rm_is_removed_again(self) -> None:
+        run = Recorder(script=[(0, False, "", ""), (0, False, "abc123\n", ""), (0, False, "", ""), (0, False, "", "")])
+        self.pending(run).end_step()
+        self.assertEqual(
+            [c[0] for c in run.calls],
+            [["docker", "rm", "-f", "hb-t1-0"], LIST_T1_0, ["docker", "rm", "-f", "hb-t1-0"], LIST_T1_0],
+        )
+
+    def test_a_container_that_survives_the_second_rm_fails_closed(self) -> None:
+        listed = (0, False, "abc123\n", "")
+        run = Recorder(script=[(0, False, "", ""), listed, (0, False, "", ""), listed])
+        with self.assertRaisesRegex(SandboxError, "hb-t1-0 could not be removed"):
+            self.pending(run).end_step()
+
+    def test_a_listing_that_fails_fails_closed(self) -> None:
+        run = Recorder(script=[(0, False, "", ""), (1, False, "", "daemon down")])
+        with self.assertRaisesRegex(SandboxError, "docker ps -aq --filter name=\\^hb-t1-0\\$ failed: daemon down"):
+            self.pending(run).end_step()
+
+    def test_destroy_fails_closed_too(self) -> None:
+        run = Recorder(script=[(1, False, "", "daemon down")])
+        with self.assertRaises(SandboxError):
+            self.pending(run).destroy()
+
+    def test_a_second_destroy_does_nothing(self) -> None:
+        run = Recorder()
+        session = build(docker_cfg(), run).create(Path("/w"), "t1")
+        session.argv(["a"], Path("/e"))
+        session.destroy()
+        session.destroy()
+        self.assertEqual(len(run.calls), 2)  # one `rm -f` and the check that the container is gone
+
+    def test_destroy_tries_again_for_a_container_end_step_could_not_remove(self) -> None:
+        run = Recorder(script=[(1, False, "", "daemon down")])
+        session = self.pending(run)
+        with self.assertRaises(SandboxError):
+            session.end_step()
+        session.destroy()  # the daemon is back: the same container, removed now
+        self.assertEqual(
+            [c[0] for c in run.calls],
+            [["docker", "rm", "-f", "hb-t1-0"], ["docker", "rm", "-f", "hb-t1-0"], LIST_T1_0],
+        )
+
+    def test_reclaim_removes_the_containers_a_killed_run_left_for_the_trial(self) -> None:
+        run = Recorder(script=[(0, False, "hb-t1-0\nhb-t1-3\n", "")])
+        build(docker_cfg(), run).reclaim("t1")
+        self.assertEqual(
+            [c[0] for c in run.calls],
+            [
+                ["docker", "ps", "-a", "--filter", "name=hb-t1-", "--format", "{{.Names}}"],
+                ["docker", "rm", "-f", "hb-t1-0"],
+                LIST_T1_0,
+                ["docker", "rm", "-f", "hb-t1-3"],
+                ["docker", "ps", "-aq", "--filter", "name=^hb-t1-3$"],
+            ],
+        )
+
+    def test_reclaim_with_nothing_left_runs_only_the_listing(self) -> None:
+        run = Recorder()
+        build(docker_cfg(), run).reclaim("t1")
+        self.assertEqual([c[0][1] for c in run.calls], ["ps"])
+
+    def test_reclaim_when_docker_cannot_list_fails_closed(self) -> None:
+        run = Recorder((1, False, "", "daemon down"))
+        with self.assertRaisesRegex(SandboxError, "daemon down"):
+            build(docker_cfg(), run).reclaim("t1")
+        self.assertEqual(len(run.calls), 1)
+
+
+class FakeDockerRunTests(RunTestCase):
+    """The engine end to end through the real argv of the sandbox, with a fake `docker` on PATH."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        bin_dir = fixtures.tmpdir(self)
+        fake_docker.install(bin_dir)
+        self.log = bin_dir / "docker.log"
+        patcher = mock.patch.dict(
+            os.environ,
+            {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "FAKE_DOCKER_LOG": str(self.log)},
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.cfg["sandbox"] = {
+            "type": "docker",
+            "image": IMAGE,
+            "limits": {"cpus": 2, "memory": "1g", "pids": 128},
+            "mounts": [f"{fixtures.ROOT / 'tests'}:{fixtures.ROOT / 'tests'}:ro", f"{self.base}:{self.base}"],
+        }
+        self.cfg["matrix"] = [{"harness": "claude", "model": "fix"}]
+        self.cfg["env_passthrough"] = ["FAKE_DOCKER_LOG"]  # the fake docker is a process of the run: env allowlist
+
+    def calls(self) -> list[list[str]]:
+        return [json.loads(line) for line in self.log.read_text().splitlines()]
+
+    def test_the_agent_and_the_graders_run_through_docker_run_and_the_containers_are_removed(self) -> None:
+        fixtures.call_quiet(hb.cmd_run, args(allow_unsandboxed=False), self.cfg, self.base)
+        runs = [c for c in self.calls() if c[0] == "run"]
+        self.assertEqual(len(runs), 2)  # the agent and the hidden tests
+        for call in runs:
+            self.assertEqual(call[call.index("--network") + 1], "none")
+            self.assertIn("--cap-drop", call)
+            self.assertEqual(call[call.index("--pids-limit") + 1], "128")
+            self.assertEqual(call[call.index(IMAGE) - 1], f"{os.getuid()}:{os.getgid()}")
+        names = [c[c.index("--name") + 1] for c in runs]
+        self.assertEqual(len(set(names)), 2)
+        self.assertEqual([c for c in self.calls() if c[0] == "rm"], [["rm", "-f", name] for name in names])
+        (row,) = rows_of(self.base)
+        self.assertEqual((row["passed"], row["sandboxed"]), (True, True))
+
+    def test_the_run_and_its_trial_record_the_sandbox_and_the_image_digest(self) -> None:
+        fixtures.call_quiet(hb.cmd_run, args(allow_unsandboxed=False), self.cfg, self.base)
+        (run_dir,) = [p.parent for p in (self.base / "results").glob("*/trials.jsonl")]
+        info = json.loads((run_dir / "run.json").read_text())
+        (trial,) = fixtures.read_rows(run_dir / "trials.jsonl")
+        self.assertEqual(
+            (
+                info["sandbox"],
+                info["sandboxed"],
+                info["schema_version"],
+                trial["image_digest"],
+                trial["schema_version"],
+            ),
+            (f"docker:{IMAGE}", True, "1.3.0", f"sha256:{DIGEST}", "1.3.0"),
+        )
+
+    def test_a_container_that_outlives_the_timeout_is_removed_before_the_next_step(self) -> None:
+        state = fixtures.tmpdir(self)
+        self.addCleanup(self.kill_survivors, state)
+        names = ["FAKE_DOCKER_STATE", "FAKE_DOCKER_LOG"]
+        self.cfg["env_passthrough"] = names
+        steady = (
+            f"{fixtures.PY} -c \"import os, time; a = os.path.getsize('late.txt'); time.sleep(0.5); "
+            "raise SystemExit(0 if os.path.getsize('late.txt') == a else 1)\""
+        )
+        self.cfg["harnesses"]["claude"]["command"] = [fixtures.PY, fixtures.AGENT, "claude", "slow-writer"]
+        self.cfg["tasks"][0] = {
+            **self.cfg["tasks"][0],
+            "timeout": 3,
+            "graders": [{"type": "command", "command": steady}],
+        }
+        with mock.patch.dict(os.environ, {"FAKE_DOCKER_STATE": str(state)}):
+            fixtures.call_quiet(hb.cmd_run, args(allow_unsandboxed=False), self.cfg, self.base)
+        (row,) = rows_of(self.base)
+        self.assertEqual((row["agent_timed_out"], row["passed"]), (True, True))  # the writer was gone for the grader
+
+    @staticmethod
+    def kill_survivors(state: Path) -> None:
+        for pid_file in state.iterdir():
+            fake_docker.kill_container(int(pid_file.read_text()))
+
+    def test_validate_config_rejects_a_tag_before_any_run(self) -> None:
+        self.cfg["sandbox"] = {"type": "docker", "image": "harness-bench-agents:latest"}
+        with self.assertRaises(SystemExit) as cm:
+            fixtures.call_quiet(hb.cmd_run, args(allow_unsandboxed=False), self.cfg, self.base)
+        self.assertIn("pinned by digest", str(cm.exception.code))
+        self.assertFalse(self.log.exists())
+```
+
+`tests/test_resume.py`:
+
+```python
+"""Resume by `trial_id`, the heartbeat and the legacy row of a trial (ADR 0010, decisions 8 and 9)."""
+
+import contextlib
+import io
+import json
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import tempfile
+import time
+import unittest
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+from unittest import mock
+
+import fixtures
+import harness_bench as hb
+from hbench import results
+from hbench.core.convert import row_from_trial, trial_from_row
+from hbench.core.ids import trial_id
+from hbench.core.models import RunInfo, TrialStatus
+from hbench.results import (
+    HEARTBEAT_FILE,
+    Heartbeat,
+    ResumeError,
+    RunWriter,
+    heartbeat_is_live,
+    read_heartbeat,
+)
+from test_core_models import run_info, trial
+from test_run import RunTestCase, args, rows_of
+from test_sandboxes import RecordingSandbox
+
+NOW = datetime(2026, 11, 24, 12, 0, 0, tzinfo=UTC)
+
+
+def dead_pid() -> int:
+    """The pid of a process that has ended and been reaped."""
+    child = subprocess.Popen([fixtures.PY, "-c", "pass"])
+    child.wait()
+    return child.pid
+
+
+def write_heartbeat(path: Path, **overrides: Any) -> None:
+    beat: dict[str, Any] = {
+        "pid": os.getpid(),
+        "hostname": socket.gethostname(),
+        "trial_id": "t",
+        "phase": "agent",
+        "updated_at": NOW.isoformat(),
+    }
+    beat.update(overrides)
+    path.write_text(json.dumps(beat))
+
+
+class RowFromTrialTests(unittest.TestCase):
+    def test_the_legacy_row_of_a_trial_carries_what_reconcile_and_report_read(self) -> None:
+        original = {
+            "ts": "2026-11-24T12:00:00+00:00",
+            "task": "fizzbuzz",
+            "harness": "claude",
+            "model": "m",
+            "rep": 2,
+            "passed": False,
+            "agent_rc": 3,
+            "agent_timed_out": True,
+            "wall_s": 4.5,
+            "parse_ok": True,
+            "run_tag": "bench-20261124120000-x",
+            "t_start": 0.0,
+            "t_end": 0.0,
+            "sandboxed": True,
+            "input": 10,
+            "output": 5,
+            "reasoning": 2,
+            "cache_read": 7,
+            "cache_write": 1,
+            "turns": 3,
+            "tool_calls": 4,
+            "cost_reported": 0.3,
+            "cost_computed": 0.2,
+        }
+        t = trial_from_row(original, run_id="r" * 32, suite_version="s", harness_version="1")
+        row = row_from_trial(t)
+        times = ("t_start", "t_end")
+        self.assertEqual(
+            {k: v for k, v in row.items() if k not in times}, {k: v for k, v in original.items() if k not in times}
+        )
+        self.assertEqual((row["t_end"], row["t_start"]), (NOW.timestamp(), NOW.timestamp() - 4.5))
+        self.assertNotIn("cost_litellm", row)
+
+    def test_a_gateway_cost_comes_back_as_cost_litellm_and_unknown_costs_stay_none(self) -> None:
+        t = trial()
+        row = row_from_trial(
+            trial(
+                usage=type(t.usage)(
+                    input_tokens=1, output_tokens=1, parsed=False, costs=type(t.usage.costs)(gateway=0.0)
+                )
+            )
+        )
+        self.assertEqual(
+            (row["cost_litellm"], row["cost_reported"], row["cost_computed"], row["parse_ok"]), (0.0, None, None, False)
+        )
+
+    def test_a_trial_that_timed_out_is_an_agent_timeout_and_one_that_passed_is_not(self) -> None:
+        self.assertEqual(
+            (
+                row_from_trial(trial(status=TrialStatus.TIMEOUT))["agent_timed_out"],
+                row_from_trial(trial(status=TrialStatus.PASSED))["agent_timed_out"],
+                row_from_trial(trial(status=TrialStatus.FAILED))["passed"],
+            ),
+            (True, False, False),
+        )
+
+
+class RunWriterResumeTests(unittest.TestCase):
+    def make(self, out: Path, *trials: Any, run_id: str = "a" * 32) -> RunWriter:
+        writer = RunWriter(out, run_info(run_id=run_id))
+        for t in trials:
+            writer.append(t)
+        return writer
+
+    def test_open_existing_keeps_the_run_and_appends_to_its_trials(self) -> None:
+        out = fixtures.tmpdir(self)
+        first = self.make(out, trial(trial_id="1" * 16))
+        reopened = RunWriter.open_existing(out, "a" * 32)
+        reopened.append(trial(trial_id="2" * 16, rep=2))
+        self.assertEqual(
+            (reopened.info, reopened.finished_trial_ids(), first.info == reopened.info),
+            (first.info, {"1" * 16, "2" * 16}, True),
+        )
+
+    def test_reopening_does_not_rewrite_run_json(self) -> None:
+        out = fixtures.tmpdir(self)
+        self.make(out)
+        info_path = out / ("a" * 32) / "run.json"
+        info_path.write_text(info_path.read_text() + "\n\n")  # a marker that a rewrite would remove
+        before = info_path.read_text()
+        RunWriter.open_existing(out, "a" * 32)
+        self.assertEqual(info_path.read_text(), before)
+
+    def test_every_append_is_flushed_to_disk(self) -> None:
+        out = fixtures.tmpdir(self)
+        writer = self.make(out)
+        with mock.patch("os.fsync") as fsync:
+            writer.append(trial())
+        fsync.assert_called_once()
+
+    def test_a_last_line_cut_short_by_a_crash_is_dropped(self) -> None:
+        out = fixtures.tmpdir(self)
+        writer = self.make(out, trial(trial_id="1" * 16))
+        with writer.trials_path.open("a") as f:
+            f.write('{"run_id": "cut off')
+        reopened = RunWriter.open_existing(out, "a" * 32)
+        reopened.append(trial(trial_id="2" * 16, rep=2))
+        self.assertEqual(reopened.finished_trial_ids(), {"1" * 16, "2" * 16})
+
+    def test_a_trials_file_that_was_never_created_reads_as_empty(self) -> None:
+        out = fixtures.tmpdir(self)
+        writer = self.make(out)
+        writer.trials_path.unlink()
+        self.assertEqual(RunWriter.open_existing(out, "a" * 32).finished_trial_ids(), set())
+
+    def test_a_run_id_that_is_not_a_run_id_is_refused_without_touching_the_path(self) -> None:
+        out = fixtures.tmpdir(self)
+        (out / "x").mkdir()
+        for bad in ("../x", "x", "", "A" * 32, "a" * 31, "/etc", "a" * 32 + "/../x"):
+            with self.subTest(run_id=bad), self.assertRaisesRegex(ResumeError, "not a run id"):
+                RunWriter.open_existing(out, bad)
+
+    def test_a_run_that_does_not_exist_is_a_clean_error(self) -> None:
+        with self.assertRaisesRegex(ResumeError, "no run " + "b" * 32):
+            RunWriter.open_existing(fixtures.tmpdir(self), "b" * 32)
+
+    def test_invalid_run_json_or_trials_are_a_clean_error(self) -> None:
+        out = fixtures.tmpdir(self)
+        writer = self.make(out)
+        (writer.run_dir / "trials.jsonl").write_text("not json\n")
+        with self.assertRaisesRegex(ResumeError, "trial data"):
+            RunWriter.open_existing(out, "a" * 32).finished_trial_ids()
+        (writer.run_dir / "run.json").write_text("{}")
+        with self.assertRaisesRegex(ResumeError, "not valid run data"):
+            RunWriter.open_existing(out, "a" * 32)
+
+
+class HeartbeatTests(unittest.TestCase):
+    def test_the_file_has_pid_host_trial_phase_and_time_and_is_removed_at_the_end(self) -> None:
+        path = fixtures.tmpdir(self) / HEARTBEAT_FILE
+        with Heartbeat(path, extra={"work_root": "/w"}) as heartbeat:
+            heartbeat.beat("trial-1", "agent")
+            data = read_heartbeat(path)
+            assert data is not None
+            self.assertEqual(
+                (data["pid"], data["trial_id"], data["phase"], data["work_root"]),
+                (os.getpid(), "trial-1", "agent", "/w"),
+            )
+            self.assertEqual(data["hostname"], socket.gethostname())
+            self.assertIsNotNone(datetime.fromisoformat(data["updated_at"]).utcoffset())
+        self.assertFalse(path.exists())
+
+    def test_start_and_stop_can_be_called_without_a_with_block(self) -> None:
+        path = fixtures.tmpdir(self) / HEARTBEAT_FILE
+        heartbeat = Heartbeat(path)
+        heartbeat.start()
+        self.assertTrue(path.exists())
+        heartbeat.stop()
+        self.assertFalse(path.exists())
+
+    def test_the_first_write_happens_on_entry_with_no_trial(self) -> None:
+        path = fixtures.tmpdir(self) / HEARTBEAT_FILE
+        with Heartbeat(path):
+            data = read_heartbeat(path)
+            assert data is not None
+            self.assertEqual((data["trial_id"], data["phase"]), (None, "start"))
+
+    def test_a_write_that_fails_warns_once_and_the_beat_goes_on(self) -> None:
+        path = fixtures.tmpdir(self) / HEARTBEAT_FILE
+        attempts: list[int] = []
+        real_write = results._atomic_write
+
+        def flaky(target: Path, text: str) -> None:
+            attempts.append(1)
+            if len(attempts) < 6:
+                raise OSError("disk full")
+            real_write(target, text)
+
+        stderr = io.StringIO()
+        with mock.patch.object(results, "_atomic_write", flaky), contextlib.redirect_stderr(stderr):
+            with Heartbeat(path, interval=0.02) as heartbeat:
+                heartbeat.beat("t", "agent")  # a phase change on the main thread fails too, and must not raise
+                deadline = time.time() + 30
+                while not path.exists() and time.time() < deadline:
+                    time.sleep(0.005)
+                self.assertTrue(heartbeat_is_live(path))
+        self.assertEqual(stderr.getvalue().count("warning: heartbeat"), 1)
+        self.assertIn("disk full", stderr.getvalue())
+
+    def test_a_thread_rewrites_the_file_while_the_run_is_busy(self) -> None:
+        path = fixtures.tmpdir(self) / HEARTBEAT_FILE
+        writes: list[int] = []
+        real_write = Heartbeat._write
+
+        def spy(self: Heartbeat) -> None:
+            writes.append(1)
+            real_write(self)
+
+        with mock.patch.object(Heartbeat, "_write", spy), Heartbeat(path, interval=0.02):
+            deadline = time.time() + 30
+            while len(writes) < 4 and time.time() < deadline:
+                time.sleep(0.005)
+            self.assertTrue(heartbeat_is_live(path))
+        self.assertGreaterEqual(len(writes), 4)
+        self.assertFalse(path.exists())
+
+    def test_the_file_is_removed_when_the_run_ends_with_an_error(self) -> None:
+        path = fixtures.tmpdir(self) / HEARTBEAT_FILE
+        with self.assertRaises(RuntimeError), Heartbeat(path):
+            raise RuntimeError("boom")
+        self.assertFalse(path.exists())
+
+
+class LivenessTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.path = fixtures.tmpdir(self) / HEARTBEAT_FILE
+
+    def live(self, **overrides: Any) -> bool:
+        write_heartbeat(self.path, **overrides)
+        return heartbeat_is_live(self.path, now=NOW + timedelta(seconds=30))
+
+    def test_a_fresh_beat_of_a_live_pid_is_live(self) -> None:
+        self.assertTrue(self.live())
+
+    def test_a_fresh_beat_of_a_dead_pid_is_not(self) -> None:
+        self.assertFalse(self.live(pid=dead_pid()))
+
+    def test_a_stale_beat_is_not_live_even_for_a_live_pid(self) -> None:
+        write_heartbeat(self.path)
+        self.assertFalse(heartbeat_is_live(self.path, now=NOW + timedelta(seconds=90)))
+        self.assertTrue(heartbeat_is_live(self.path, now=NOW + timedelta(seconds=89)))
+
+    def test_a_fresh_beat_of_another_host_counts_as_live_because_its_pid_cannot_be_checked(self) -> None:
+        self.assertTrue(self.live(hostname="another-host", pid=dead_pid()))
+
+    def test_a_pid_of_another_user_counts_as_alive(self) -> None:
+        with mock.patch("os.kill", side_effect=PermissionError):
+            self.assertTrue(self.live())
+
+    def test_a_missing_or_malformed_beat_is_not_live(self) -> None:
+        self.assertFalse(heartbeat_is_live(self.path, now=NOW))
+        self.path.write_text("not json")
+        self.assertFalse(heartbeat_is_live(self.path, now=NOW))
+        self.path.write_text("[1]")
+        self.assertFalse(heartbeat_is_live(self.path, now=NOW))
+        for overrides in (
+            {"pid": 0},
+            {"pid": -1},
+            {"pid": True},
+            {"pid": "1"},
+            {"hostname": 3},
+            {"updated_at": "yesterday"},
+            {"updated_at": None},
+            {"updated_at": "2026-11-24T12:00:00"},
+        ):
+            with self.subTest(overrides=overrides):
+                self.assertFalse(self.live(**overrides))
+
+
+class ResumeRunTests(RunTestCase):
+    def cmd_run(self, **overrides: Any) -> str:
+        return fixtures.call_quiet(hb.cmd_run, args(**overrides), self.cfg, self.base)
+
+    def run_dirs(self) -> list[Path]:
+        return sorted(p.parent for p in (self.base / "results").glob("*/trials.jsonl"))
+
+    def first_run(self, **overrides: Any) -> Path:
+        self.cmd_run(**overrides)
+        (run_dir,) = self.run_dirs()
+        return run_dir
+
+    def trials(self, run_dir: Path) -> list[dict[str, Any]]:
+        return fixtures.read_rows(run_dir / "trials.jsonl")
+
+    def test_resume_runs_only_the_trials_the_run_has_not_finished_in_the_same_run(self) -> None:
+        run_dir = self.first_run(only=["claude"])
+        out = self.cmd_run(resume=run_dir.name)
+        trials = self.trials(run_dir)
+        self.assertEqual(
+            (self.run_dirs(), [t["target"]["harness"] for t in trials], out.count("run   "), out.count("skip  ")),
+            ([run_dir], ["claude", "pi"], 1, 1),
+        )
+        self.assertEqual(len({t["trial_id"] for t in trials}), 2)
+        self.assertEqual([r["harness"] for r in rows_of(self.base)], ["claude", "pi"])
+        self.assertEqual({t["run_id"] for t in trials}, {run_dir.name})
+
+    def test_resume_of_a_finished_run_repeats_nothing(self) -> None:
+        run_dir = self.first_run()
+        before = (run_dir / "trials.jsonl").read_text(), (self.base / "results" / "results.jsonl").read_text()
+        out = self.cmd_run(resume=run_dir.name)
+        self.assertEqual(
+            (
+                out.count("run   "),
+                (run_dir / "trials.jsonl").read_text(),
+                (self.base / "results" / "results.jsonl").read_text(),
+            ),
+            (0, *before),
+        )
+
+    def test_a_trial_written_before_its_legacy_row_is_neither_repeated_nor_lost(self) -> None:
+        run_dir = self.first_run()
+        results = self.base / "results" / "results.jsonl"
+        lines = results.read_text().splitlines(keepends=True)
+        results.write_text(lines[0])  # the crash: the second trial reached trials.jsonl, its legacy row did not
+        trials_before = (run_dir / "trials.jsonl").read_text()
+        out = self.cmd_run(resume=run_dir.name)
+        rows = rows_of(self.base)
+        original = json.loads(lines[1])
+        self.assertEqual(
+            (out.count("run   "), (run_dir / "trials.jsonl").read_text(), [r["harness"] for r in rows]),
+            (0, trials_before, ["claude", "pi"]),
+        )
+        rewritten = rows[1]
+        for key in (
+            "task",
+            "harness",
+            "model",
+            "rep",
+            "passed",
+            "agent_rc",
+            "parse_ok",
+            "run_tag",
+            "sandboxed",
+            "input",
+            "output",
+            "turns",
+        ):
+            self.assertEqual(rewritten[key], original[key], key)
+
+    def test_the_trial_is_durable_before_the_legacy_row_is_written(self) -> None:
+        real_dumps = json.dumps
+
+        def dumps(obj: Any, *a: Any, **kw: Any) -> str:
+            if isinstance(obj, dict) and "agent_rc" in obj:  # the legacy row
+                raise OSError("killed before the legacy row")
+            return real_dumps(obj, *a, **kw)
+
+        self.cfg["matrix"] = [{"harness": "claude", "model": "fix"}]
+        with mock.patch.object(json, "dumps", dumps), self.assertRaises(OSError):
+            self.cmd_run()
+        (run_dir,) = self.run_dirs()
+        results = self.base / "results" / "results.jsonl"
+        self.assertEqual((len(self.trials(run_dir)), results.read_text()), (1, ""))
+        out = self.cmd_run(resume=run_dir.name)
+        self.assertEqual((out.count("run   "), len(self.trials(run_dir)), len(rows_of(self.base))), (0, 1, 1))
+
+    def test_a_second_resume_after_the_repair_changes_nothing(self) -> None:
+        run_dir = self.first_run()
+        results = self.base / "results" / "results.jsonl"
+        results.write_text(results.read_text().splitlines(keepends=True)[0])
+        self.cmd_run(resume=run_dir.name)
+        after_first = results.read_text()
+        self.cmd_run(resume=run_dir.name)
+        self.assertEqual(results.read_text(), after_first)
+
+    def test_resume_refuses_while_a_live_heartbeat_holds_the_run_and_force_overrides(self) -> None:
+        run_dir = self.first_run(only=["claude"])
+        write_heartbeat(run_dir / HEARTBEAT_FILE, updated_at=datetime.now(UTC).isoformat())
+        with self.assertRaises(SystemExit) as cm:
+            self.cmd_run(resume=run_dir.name)
+        self.assertIn("still running", str(cm.exception.code))
+        self.assertIn("--force", str(cm.exception.code))
+        self.assertEqual(len(self.trials(run_dir)), 1)
+        self.cmd_run(resume=run_dir.name, force=True)
+        self.assertEqual(len(self.trials(run_dir)), 2)
+
+    def test_a_heartbeat_of_a_dead_process_does_not_block_resume(self) -> None:
+        run_dir = self.first_run(only=["claude"])
+        write_heartbeat(run_dir / HEARTBEAT_FILE, pid=dead_pid(), updated_at=datetime.now(UTC).isoformat())
+        self.cmd_run(resume=run_dir.name)
+        self.assertEqual(len(self.trials(run_dir)), 2)
+        self.assertFalse((run_dir / HEARTBEAT_FILE).exists())
+
+    def test_resume_of_a_run_that_does_not_exist_or_a_path_exits_with_a_message(self) -> None:
+        self.first_run()
+        for run_id in ("c" * 32, "../results", "..", "/etc/passwd"):
+            with self.subTest(run_id=run_id), self.assertRaises(SystemExit) as cm:
+                self.cmd_run(resume=run_id)
+            self.assertIn("resume:", str(cm.exception.code))
+        self.assertEqual(len(self.run_dirs()), 1)
+
+    def test_resume_with_another_config_is_refused(self) -> None:
+        run_dir = self.first_run(only=["claude"])
+        self.cfg["timeout"] = 5
+        with self.assertRaises(SystemExit) as cm:
+            self.cmd_run(resume=run_dir.name)
+        self.assertIn("config changed", str(cm.exception.code))
+
+    def test_resume_cannot_be_a_dry_run(self) -> None:
+        run_dir = self.first_run()
+        with self.assertRaises(SystemExit) as cm:
+            self.cmd_run(resume=run_dir.name, dry_run=True)
+        self.assertIn("--dry-run", str(cm.exception.code))
+
+    def test_resume_without_the_flag_still_skips_done_keys_in_a_new_run(self) -> None:
+        self.first_run()
+        out = self.cmd_run()
+        self.assertEqual((out.count("skip  "), len(self.run_dirs())), (2, 2))
+
+    def test_the_heartbeat_is_written_during_the_run_and_gone_after_it(self) -> None:
+        phases: list[str] = []
+        real_beat = Heartbeat.beat
+
+        def spy(self: Heartbeat, trial_id: str | None, phase: str) -> None:
+            phases.append(phase)
+            real_beat(self, trial_id, phase)
+
+        with mock.patch.object(Heartbeat, "beat", spy):
+            run_dir = self.first_run(only=["claude"])
+        self.assertEqual(phases, ["setup", "agent", "grade", "record"])
+        self.assertFalse((run_dir / HEARTBEAT_FILE).exists())
+
+    def test_resume_removes_the_temp_dirs_an_interrupted_run_left_but_only_its_own_kind(self) -> None:
+        run_dir = self.first_run(only=["claude"])
+        tmp = Path(tempfile.gettempdir())
+        work = Path(tempfile.mkdtemp(prefix="harness-bench-work-"))
+        git = Path(tempfile.mkdtemp(prefix="harness-bench-git-"))
+        other = Path(tempfile.mkdtemp(prefix="something-else-"))
+        for path in (work, git, other):
+            self.addCleanup(shutil.rmtree, path, True)
+        (work / ".trial.env").write_text("SECRET=1")
+        write_heartbeat(
+            run_dir / HEARTBEAT_FILE,
+            pid=dead_pid(),
+            work_root=str(work),
+            work_token=hb.plant_token(work),
+            git_root=str(git),
+            git_token=hb.plant_token(git),
+            updated_at=NOW.isoformat(),
+        )
+        self.cmd_run(resume=run_dir.name)
+        self.assertEqual((work.exists(), git.exists(), other.exists()), (False, False, True))
+        write_heartbeat(
+            run_dir / HEARTBEAT_FILE,
+            pid=dead_pid(),
+            work_root=str(other),
+            git_root=str(tmp),
+            updated_at=NOW.isoformat(),
+        )
+        self.cmd_run(resume=run_dir.name)
+        self.assertEqual((other.exists(), tmp.exists()), (True, True))
+        write_heartbeat(run_dir / HEARTBEAT_FILE, pid=dead_pid(), work_root=5, updated_at=NOW.isoformat())
+        self.cmd_run(resume=run_dir.name)
+
+    def test_a_heartbeat_can_only_remove_a_temp_dir_that_holds_its_token(self) -> None:
+        run_dir = self.first_run(only=["claude"])
+        stranger = Path(tempfile.mkdtemp(prefix="harness-bench-work-"))  # the right name, but not made by that run
+        tokened = Path(tempfile.mkdtemp(prefix="harness-bench-git-"))
+        real = hb.plant_token(tokened)
+        for path in (stranger, tokened):
+            (path / "keep.txt").write_text("keep")
+            self.addCleanup(shutil.rmtree, path, True)
+        cases: list[dict[str, Any]] = [
+            {"work_root": str(stranger)},  # no token in the heartbeat nor in the dir
+            {"work_root": str(stranger), "work_token": "guess"},  # a token the dir does not hold
+            {"work_root": str(stranger), "work_token": 5},
+            {"git_root": str(tokened), "git_token": "not-" + real},  # the dir has a token, another one
+            {"git_root": str(tokened), "git_token": ""},
+        ]
+        for case in cases:
+            with self.subTest(case=case):
+                write_heartbeat(run_dir / HEARTBEAT_FILE, pid=dead_pid(), updated_at=NOW.isoformat(), **case)
+                self.cmd_run(resume=run_dir.name)
+                self.assertEqual((stranger / "keep.txt").exists(), (tokened / "keep.txt").exists(), True)
+
+    def test_the_private_temp_dirs_of_a_run_hold_a_token_that_its_heartbeat_names(self) -> None:
+        seen: list[dict[str, Any]] = []
+        real_beat = Heartbeat.beat
+
+        def spy(self: Heartbeat, trial_id: str | None, phase: str) -> None:
+            data = read_heartbeat(self.path)
+            if data:
+                seen.append(data)
+            real_beat(self, trial_id, phase)
+
+        with mock.patch.object(Heartbeat, "beat", spy):
+            self.first_run(only=["claude"])
+        beat = seen[0]
+        self.assertEqual(len(beat["work_token"]), 32)
+        self.assertEqual(len(beat["git_token"]), 32)
+        self.assertNotEqual(beat["work_token"], beat["git_token"])
+
+    def test_a_heartbeat_that_names_a_link_to_another_directory_removes_nothing(self) -> None:
+        run_dir = self.first_run(only=["claude"])
+        victim = fixtures.tmpdir(self)
+        (victim / "keep.txt").write_text("keep")
+        link = Path(tempfile.gettempdir()) / f"harness-bench-work-link-{os.getpid()}"
+        link.symlink_to(victim, target_is_directory=True)
+        self.addCleanup(link.unlink, True)
+        write_heartbeat(run_dir / HEARTBEAT_FILE, pid=dead_pid(), work_root=str(link), updated_at=NOW.isoformat())
+        self.cmd_run(resume=run_dir.name)
+        self.assertEqual(((victim / "keep.txt").read_text(), link.is_symlink()), ("keep", True))
+
+    def test_a_leftover_env_file_of_the_trial_is_removed_before_it_runs_again(self) -> None:
+        work = fixtures.tmpdir(self) / "work"
+        work.mkdir()
+        self.cfg["work_dir"] = str(work)
+        run_dir = self.first_run(only=["claude"])
+        leftover = work / ".fizzbuzz__pi__p_nofix__r1.env"
+        leftover.write_text("SECRET=1")
+        seen: list[bool] = []
+        real_write = hb.write_env_file
+
+        def spy(env: Any, path: Path) -> None:
+            seen.append(path.exists() and path.read_text() == "SECRET=1")
+            real_write(env, path)
+
+        with mock.patch.object(hb, "write_env_file", spy):
+            self.cmd_run(resume=run_dir.name)
+        self.assertEqual((bool(seen), any(seen), leftover.exists()), (True, False, False))
+
+    def test_resume_reclaims_the_containers_of_each_trial_it_runs_again_and_a_plain_run_does_not(self) -> None:
+        sandbox = RecordingSandbox()
+        with mock.patch.object(hb, "make_sandbox", return_value=sandbox):
+            run_dir = self.first_run(only=["claude"])
+            self.assertEqual([e for e in sandbox.events if e.startswith("reclaim")], [])
+            self.cmd_run(resume=run_dir.name)
+        pi_trial = self.trials(run_dir)[1]["trial_id"]
+        self.assertEqual([e for e in sandbox.events if e.startswith("reclaim")], [f"reclaim {pi_trial}"])
+        self.assertIn(f"create {pi_trial}", sandbox.events)
+
+    def test_the_trial_id_of_a_trial_is_known_before_it_runs(self) -> None:
+        run_dir = self.first_run()
+        run_id = run_dir.name
+        expected = {
+            trial_id(run_id, "fizzbuzz", f"{h}@unknown:{m}", 1) for h, m in (("claude", "fix"), ("pi", "p/nofix"))
+        }
+        self.assertEqual({t["trial_id"] for t in self.trials(run_dir)}, expected)
+
+    def test_the_run_records_the_matrix_of_the_run_it_resumes(self) -> None:
+        run_dir = self.first_run(only=["claude"])
+        before = RunInfo.from_dict(json.loads((run_dir / "run.json").read_text()))
+        self.cmd_run(resume=run_dir.name)
+        after = RunInfo.from_dict(json.loads((run_dir / "run.json").read_text()))
+        self.assertEqual(
+            (after.run_id, after.targets, after.started_at), (before.run_id, before.targets, before.started_at)
+        )
+        self.assertIsNotNone(after.finished_at)
+
+
+class KillAndResumeTests(unittest.TestCase):
+    """The acceptance test: SIGKILL a real run after its first trial, resume it, and check every trial exists once."""
+
+    def test_a_run_killed_after_its_first_trial_resumes_to_exactly_the_expected_trials(self) -> None:
+        base = fixtures.tmpdir(self)
+        fixtures.copy_engine(base)
+        shutil.copytree(fixtures.FIZZBUZZ, base / "tasks" / "fizzbuzz")
+        flag, pid_file, tags = base / "slow.flag", base / "slow.pid", base / "tags.txt"
+        flag.write_text("")
+        env_vars = {
+            "FAKE_TAGS_FILE": "${FAKE_TAGS_FILE}",
+            "FAKE_SLOW_FLAG": "${FAKE_SLOW_FLAG}",
+            "FAKE_SLOW_PID": "${FAKE_SLOW_PID}",
+        }
+        cfg = {
+            "reps": 1,
+            "harnesses": {
+                "fast": fixtures.harness("claude", env_vars, "fix"),
+                "slow": fixtures.harness("pi", env_vars, "slow-once"),
+            },
+            "matrix": [{"harness": "fast", "model": "m"}, {"harness": "slow", "model": "p/m"}],
+            "tasks": [fixtures.fizzbuzz_task()],
+        }
+        (base / "config.json").write_text(json.dumps(cfg))
+        env = dict(os.environ, FAKE_TAGS_FILE=str(tags), FAKE_SLOW_FLAG=str(flag), FAKE_SLOW_PID=str(pid_file))
+        command = [fixtures.PY, "harness_bench.py", "run", "--config", "config.json", "--allow-unsandboxed"]
+        with (base / "first.log").open("w") as log:
+            engine = subprocess.Popen(
+                command, cwd=base, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+            )
+        self.addCleanup(self.stop_everything, engine, pid_file)
+        trials_files = base / "results"
+        deadline = time.time() + 120
+        while time.time() < deadline and engine.poll() is None:
+            if any(p.stat().st_size for p in trials_files.glob("*/trials.jsonl")):
+                break
+            time.sleep(0.02)
+        self.assertIsNone(engine.poll(), (base / "first.log").read_text())
+        os.killpg(engine.pid, signal.SIGKILL)  # the engine only: the agent has its own session
+        engine.wait()
+        (run_dir,) = [p.parent for p in trials_files.glob("*/trials.jsonl")]
+        heartbeat = read_heartbeat(run_dir / HEARTBEAT_FILE)
+        assert heartbeat is not None
+        self.assertEqual(heartbeat["pid"], engine.pid)  # the killed run left its heartbeat behind
+        leftovers = [Path(heartbeat[k]) for k in ("work_root", "git_root")]
+        self.assertTrue(all(p.exists() for p in leftovers))
+        flag.unlink()
+        resumed = subprocess.run(
+            [*command, "--resume", run_dir.name], cwd=base, env=env, capture_output=True, text=True, timeout=300
+        )
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        run_id = run_dir.name
+        expected = {trial_id(run_id, "fizzbuzz", f"{h}@unknown:{m}", 1) for h, m in (("fast", "m"), ("slow", "p/m"))}
+        stored = [t["trial_id"] for t in fixtures.read_rows(run_dir / "trials.jsonl")]
+        keys = [
+            (r["task"], r["harness"], r["model"], r["rep"])
+            for r in fixtures.read_rows(base / "results" / "results.jsonl")
+        ]
+        self.assertEqual((sorted(stored), sorted(set(stored))), (sorted(expected), sorted(expected)))
+        self.assertEqual(sorted(keys), [("fizzbuzz", "fast", "m", 1), ("fizzbuzz", "slow", "p/m", 1)])
+        self.assertTrue(all(r["passed"] for r in fixtures.read_rows(base / "results" / "results.jsonl")))
+        self.assertEqual(
+            (len(list((base / "results").glob("*/trials.jsonl"))), (run_dir / HEARTBEAT_FILE).exists()), (1, False)
+        )
+        self.assertEqual([p.exists() for p in leftovers], [False, False])
+        self.assertIsNotNone(RunInfo.from_dict(json.loads((run_dir / "run.json").read_text())).finished_at)
+
+    @staticmethod
+    def stop_everything(engine: "subprocess.Popen[bytes]", pid_file: Path) -> None:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(engine.pid, signal.SIGKILL)
+        engine.wait()
+        if pid_file.exists():
+            with contextlib.suppress(ProcessLookupError, ValueError):
+                os.kill(int(pid_file.read_text()), signal.SIGKILL)
+```
+
+`tests/test_doctor.py`:
+
+```python
+"""`doctor` (ADR 0010, decision 10): every check passes and fails on its own, with a fake docker and a fake LiteLLM."""
+
+import io
+import json
+import os
+import tempfile
+import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
+from typing import Any
+from unittest import mock
+
+import fake_docker
+import fixtures
+import harness_bench as hb
+from hbench import cli
+from hbench.doctor import Check, run_checks
+from test_litellm import ServerTestCase, ok
+
+DIGEST = "a" * 64
+IMAGE = f"harness-bench-agents@sha256:{DIGEST}"
+
+
+def by_name(checks: list[Check]) -> dict[str, Check]:
+    return {c.name: c for c in checks}
+
+
+class DoctorCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.base = fixtures.tmpdir(self)
+        self.cfg: dict[str, Any] = fixtures.fake_config({})
+        self.cfg["matrix"] = [{"harness": "claude", "model": "fix"}, {"harness": "pi", "model": "p/fix"}]
+        bin_dir = fixtures.tmpdir(self)
+        fake_docker.install(bin_dir)
+        self.log = bin_dir / "docker.log"
+        patcher = mock.patch.dict(
+            os.environ,
+            {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "FAKE_DOCKER_LOG": str(self.log)},
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def checks(self, network: bool = False) -> dict[str, Check]:
+        return by_name(run_checks(self.cfg, self.base, network, hb))
+
+    def docker_calls(self) -> list[list[str]]:
+        return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+
+    def use_docker(self, **section: Any) -> None:
+        # The fake docker is a process of the run: it reads these through the env allowlist.
+        self.cfg["env_passthrough"] = [
+            "FAKE_DOCKER_LOG",
+            "FAKE_DOCKER_INSPECT",
+            "FAKE_DOCKER_INSPECT_RC",
+            "FAKE_DOCKER_MISSING",
+            "FAKE_DOCKER_VERSION",
+        ]
+        self.cfg["sandbox"] = {"type": "docker", "image": IMAGE, **section}
+
+
+class ConfigAndEnvTests(DoctorCase):
+    def test_a_good_local_config_passes_every_check(self) -> None:
+        checks = run_checks(self.cfg, self.base, False, hb)
+        self.assertTrue(all(c.ok for c in checks), [c for c in checks if not c.ok])
+        self.assertEqual(
+            [c.name for c in checks],
+            ["config", "env", "sandbox", "harness claude", "harness pi", "urls"],
+        )
+
+    def test_the_engine_is_found_when_it_is_not_given(self) -> None:
+        self.assertEqual(
+            [c.name for c in run_checks(self.cfg, self.base, False)],
+            [c.name for c in run_checks(self.cfg, self.base, False, hb)],
+        )
+
+    def test_an_invalid_config_is_one_failed_check_and_nothing_else_runs(self) -> None:
+        self.use_docker(image="harness-bench-agents:latest")
+        checks = run_checks(self.cfg, self.base, True, hb)
+        self.assertEqual([(c.name, c.ok) for c in checks], [("config", False)])
+        self.assertIn("pinned by digest", checks[0].detail)
+        self.assertEqual(self.docker_calls(), [])
+
+    def test_a_config_that_misses_a_section_is_a_failed_check_not_a_traceback(self) -> None:
+        del self.cfg["harnesses"]
+        (check,) = run_checks(self.cfg, self.base, False, hb)
+        self.assertEqual((check.name, check.ok), ("config", False))
+        self.assertIn("harnesses", check.detail)
+
+    def test_the_variables_the_config_names_must_be_set_and_only_their_names_are_shown(self) -> None:
+        self.cfg["litellm"] = {"base_url": "${HB_DOC_URL}", "api_key": "${HB_DOC_KEY}"}
+        self.cfg["harnesses"]["claude"]["env"]["TOKEN"] = "${HB_DOC_TOKEN}"
+        self.cfg["env_passthrough"] = ["HB_DOC_PASS"]
+        secret = fixtures.fake_secret("doctor")
+        with mock.patch.dict(os.environ, {"HB_DOC_KEY": secret, "HB_DOC_URL": "http://127.0.0.1:1"}):
+            check = self.checks()["env"]
+        self.assertFalse(check.ok)
+        self.assertIn("HB_DOC_TOKEN", check.detail)
+        self.assertIn("HB_DOC_PASS", check.detail)
+        self.assertNotIn("HB_DOC_KEY", check.detail)
+        self.assertNotIn(secret, check.detail)
+
+    def test_all_variables_set_passes(self) -> None:
+        self.cfg["litellm"] = {"base_url": "${HB_DOC_URL}", "api_key": "${HB_DOC_KEY}"}
+        self.cfg["judge"] = {"base_url": "${HB_DOC_URL}", "api_key": "${HB_DOC_KEY}", "model": "m"}
+        with mock.patch.dict(os.environ, {"HB_DOC_KEY": "k", "HB_DOC_URL": "http://127.0.0.1:1"}):
+            self.assertTrue(self.checks()["env"].ok)
+
+
+class HarnessCliTests(DoctorCase):
+    def test_a_local_cli_must_be_on_the_path(self) -> None:
+        self.cfg["harnesses"]["pi"]["command"] = ["no-such-cli-for-doctor", "--x"]
+        checks = self.checks()
+        self.assertEqual((checks["harness claude"].ok, checks["harness pi"].ok), (True, False))
+        self.assertIn("no-such-cli-for-doctor", checks["harness pi"].detail)
+
+    def test_a_prefix_sandbox_cannot_see_the_cli_so_a_missing_one_is_only_a_warning(self) -> None:
+        self.cfg["sandbox"] = {"prefix": ["env"]}
+        self.cfg["harnesses"]["pi"]["command"] = ["no-such-cli-for-doctor"]
+        check = self.checks()["harness pi"]
+        self.assertEqual((check.ok, check.warning), (True, True))
+
+    def test_the_cli_is_looked_up_once_per_harness_even_when_the_matrix_repeats_it(self) -> None:
+        self.cfg["matrix"] = [{"harness": "claude", "model": "a"}, {"harness": "claude", "model": "b"}]
+        self.assertEqual([n for n in self.checks() if n.startswith("harness")], ["harness claude"])
+
+    def test_a_harness_without_a_command_has_nothing_to_look_up(self) -> None:
+        self.cfg["harnesses"]["pi"]["command"] = []
+        check = self.checks()["harness pi"]
+        self.assertEqual((check.ok, check.detail), (True, "no command to look up"))
+
+    def test_a_harness_outside_the_matrix_is_not_checked(self) -> None:
+        self.cfg["matrix"] = [{"harness": "claude", "model": "a"}]
+        self.assertEqual([n for n in self.checks() if n.startswith("harness")], ["harness claude"])
+
+
+class DockerChecksTests(DoctorCase):
+    def inspect(self, rc: int = 0, **info: Any) -> None:
+        image = {"Id": f"sha256:{DIGEST}", "RepoDigests": [f"harness-bench-agents@sha256:{DIGEST}"], **info}
+        os.environ["FAKE_DOCKER_INSPECT"] = json.dumps([image])
+        os.environ["FAKE_DOCKER_INSPECT_RC"] = str(rc)
+        self.addCleanup(os.environ.pop, "FAKE_DOCKER_INSPECT", None)
+        self.addCleanup(os.environ.pop, "FAKE_DOCKER_INSPECT_RC", None)
+
+    def test_the_pinned_image_is_found_by_its_digest_and_each_cli_answers_through_the_sandbox(self) -> None:
+        self.use_docker()
+        self.inspect()
+        checks = self.checks()
+        self.assertTrue(all(c.ok for c in checks.values()), [c for c in checks.values() if not c.ok])
+        self.assertEqual(checks["sandbox"].detail, f"docker:{IMAGE}, image present")
+        runs = [c for c in self.docker_calls() if c[0] == "run"]
+        self.assertEqual(len(runs), 2)
+        for call in runs:  # the probe has the same limits as an agent: no network, no capabilities
+            self.assertEqual(call[call.index("--network") + 1], "none")
+            self.assertIn("--cap-drop", call)
+            self.assertEqual(call[-1], "--version")
+        self.assertEqual(checks["harness claude"].detail, "1.2.3")
+
+    def test_each_probe_container_is_removed_again_and_its_temp_dir_is_gone(self) -> None:
+        self.use_docker()
+        self.inspect()
+        self.checks()
+        removed = [c[2:] for c in self.docker_calls() if c[0] == "rm"]
+        self.assertEqual([len(r) for r in removed], [1, 1])
+        self.assertEqual(len({r[0] for r in removed}), 2)  # a name of its own per invocation
+        for (name,) in removed:
+            self.assertRegex(name, r"^hb-doctor-[0-9a-f]{8}-0$")
+        self.assertEqual(list(Path(tempfile.gettempdir()).glob("harness-bench-doctor-*")), [])
+
+    def test_a_digest_that_the_local_image_does_not_have_fails(self) -> None:
+        self.use_docker()
+        self.inspect(Id="sha256:" + "b" * 64, RepoDigests=["other@sha256:" + "c" * 64])
+        check = self.checks()["sandbox"]
+        self.assertFalse(check.ok)
+        self.assertIn("digest", check.detail)
+
+    def test_an_image_docker_does_not_have_fails_with_the_command_to_get_it(self) -> None:
+        self.use_docker()
+        self.inspect(rc=1)
+        check = self.checks()["sandbox"]
+        self.assertFalse(check.ok)
+        self.assertIn("docker pull", check.detail)
+
+    def test_a_machine_without_docker_fails_the_image_check_with_the_reason(self) -> None:
+        self.use_docker()
+        with mock.patch.object(hb, "run_proc", side_effect=FileNotFoundError(2, "No such file or directory")):
+            checks = self.checks()
+        self.assertFalse(checks["sandbox"].ok)
+        self.assertIn("docker: No such file or directory", checks["sandbox"].detail)
+        self.assertFalse(checks["harness claude"].ok)
+
+    def test_an_unreadable_inspect_reply_fails(self) -> None:
+        self.use_docker()
+        os.environ["FAKE_DOCKER_INSPECT"] = "not json"
+        self.addCleanup(os.environ.pop, "FAKE_DOCKER_INSPECT", None)
+        self.assertFalse(self.checks()["sandbox"].ok)
+
+    def test_a_cli_the_image_lacks_fails_and_the_others_still_pass(self) -> None:
+        self.use_docker()
+        self.inspect()
+        self.cfg["harnesses"]["pi"]["command"] = ["pi", "--mode", "json"]
+        with mock.patch.dict(os.environ, {"FAKE_DOCKER_MISSING": "pi"}):
+            checks = self.checks()
+        self.assertEqual((checks["harness claude"].ok, checks["harness pi"].ok), (True, False))
+        self.assertIn("pi --version failed in the image", checks["harness pi"].detail)
+        self.assertIn("executable file not found", checks["harness pi"].detail)
+
+    def test_the_cli_probes_are_skipped_when_the_image_is_missing(self) -> None:
+        self.use_docker()
+        self.inspect(rc=1)
+        checks = self.checks()
+        self.assertEqual([c for c in self.docker_calls() if c[0] == "run"], [])
+        self.assertFalse(checks["harness claude"].ok)
+        self.assertIn("image", checks["harness claude"].detail)
+
+    def test_no_network_is_fine_and_needs_no_docker_call(self) -> None:
+        self.use_docker()
+        self.inspect()
+        check = self.checks()["network"]
+        self.assertEqual(
+            (check.ok, check.warning, check.detail), (True, False, "none: no network inside the container")
+        )
+        self.assertEqual([c for c in self.docker_calls() if c[0] == "network"], [])
+
+    def test_an_internal_network_passes_and_a_routable_one_warns(self) -> None:
+        self.use_docker(network="hb-egress")
+        self.inspect()
+        for internal, expected in ((True, (True, False)), (False, (True, True))):
+            with self.subTest(internal=internal):
+                with mock.patch.dict(os.environ, {"FAKE_DOCKER_INSPECT": json.dumps([{"Internal": internal}])}):
+                    check = self.checks()["network"]
+                self.assertEqual((check.ok, check.warning), expected)
+        self.assertIn("docker network create --internal", check.detail)
+
+    def test_a_network_docker_does_not_know_fails(self) -> None:
+        self.use_docker(network="hb-egress")
+        self.inspect()
+        with mock.patch.dict(os.environ, {"FAKE_DOCKER_INSPECT_RC": "1"}):
+            check = self.checks()["network"]
+        self.assertFalse(check.ok)
+
+    def test_an_unreadable_network_reply_fails(self) -> None:
+        self.use_docker(network="hb-egress")
+        self.inspect()
+        with mock.patch.dict(os.environ, {"FAKE_DOCKER_INSPECT": "{}"}):
+            self.assertFalse(self.checks()["network"].ok)
+
+
+class UrlAndNetworkTests(ServerTestCase, DoctorCase):
+    def setUp(self) -> None:
+        ServerTestCase.setUp(self)
+        DoctorCase.setUp(self)
+        self.cfg["litellm"] = {"base_url": self.server.url, "api_key": "${HB_TEST_LITELLM_KEY}"}
+        self.cfg["env_passthrough"] = []
+
+    def test_a_plain_http_remote_url_fails_and_https_and_localhost_pass(self) -> None:
+        for url, expected in (("http://litellm.example.com", False), ("https://litellm.example.com", True)):
+            with self.subTest(url=url):
+                self.cfg["litellm"]["base_url"] = url
+                self.assertEqual(self.checks()["urls"].ok, expected)
+        self.cfg["litellm"]["base_url"] = self.server.url
+        self.assertTrue(self.checks()["urls"].ok)
+
+    def test_the_judge_url_follows_the_same_rule(self) -> None:
+        self.cfg["judge"] = {"base_url": "http://judge.example.com", "api_key": "${HB_TEST_LITELLM_KEY}", "model": "m"}
+        check = self.checks()["urls"]
+        self.assertFalse(check.ok)
+        self.assertIn("judge.base_url", check.detail)
+
+    def test_without_the_flag_nothing_goes_over_the_network(self) -> None:
+        self.checks()
+        self.assertEqual(self.server.requests, [])
+
+    def test_the_flag_makes_one_health_get_and_one_spend_logs_get_of_page_size_one(self) -> None:
+        self.server.route("/health/liveliness", ok("I'm alive!"))
+        self.server.route("/spend/logs/v2", ok({"data": [], "total_pages": 1}))
+        checks = self.checks(network=True)
+        self.assertEqual([r[0] for r in self.server.requests], ["/health/liveliness", "/spend/logs/v2"])
+        self.assertEqual([r[2] for r in self.server.requests], ["Bearer k-test"] * 2)
+        self.assertIn("page_size=1", self.server.requests[1][1])
+        self.assertEqual((checks["litellm health"].ok, checks["litellm spend key"].ok), (True, True))
+
+    def test_a_spend_key_without_permission_fails_that_check_only(self) -> None:
+        self.server.route("/health/liveliness", ok("I'm alive!"))
+        self.server.route("/spend/logs/v2", (403, {}, {}))
+        checks = self.checks(network=True)
+        self.assertEqual((checks["litellm health"].ok, checks["litellm spend key"].ok), (True, False))
+        self.assertIn("403", checks["litellm spend key"].detail)
+
+    def test_an_unreachable_gateway_fails_both_checks(self) -> None:
+        self.cfg["litellm"]["base_url"] = "http://127.0.0.1:1"
+        checks = self.checks(network=True)
+        self.assertEqual((checks["litellm health"].ok, checks["litellm spend key"].ok), (False, False))
+
+    def test_the_flag_without_a_litellm_section_adds_no_check(self) -> None:
+        del self.cfg["litellm"]
+        self.assertEqual([n for n in self.checks(network=True) if n.startswith("litellm")], [])
+
+    def test_a_gateway_variable_that_is_not_set_skips_the_url_and_network_checks_with_a_reason(self) -> None:
+        self.cfg["litellm"] = {"base_url": "${HB_DOC_UNSET_URL}", "api_key": "${HB_TEST_LITELLM_KEY}"}
+        checks = self.checks(network=True)
+        self.assertEqual(self.server.requests, [])
+        self.assertIn("HB_DOC_UNSET_URL", checks["urls"].detail)
+        self.assertEqual([n for n in checks if n.startswith("litellm")], [])
+
+
+class CommandTests(DoctorCase):
+    def write(self) -> str:
+        path = self.base / "config.json"
+        path.write_text(json.dumps(self.cfg))
+        return str(path)
+
+    def call(self, *argv: str) -> tuple[int, str]:
+        buf = io.StringIO()
+        code = 0
+        with redirect_stdout(buf):
+            try:
+                cli.main(["doctor", "--config", self.write(), *argv])
+            except SystemExit as e:
+                code = int(e.code) if isinstance(e.code, int) else 1
+        return code, buf.getvalue()
+
+    def test_a_good_config_prints_one_line_per_check_and_exits_zero(self) -> None:
+        code, out = self.call()
+        self.assertEqual(code, 0)
+        self.assertIn("ok    config", out)
+        self.assertIn("6 checks, 0 failed, 0 warnings", out)
+
+    def test_any_failed_check_exits_one(self) -> None:
+        self.cfg["harnesses"]["pi"]["command"] = ["no-such-cli-for-doctor"]
+        code, out = self.call()
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL  harness pi", out)
+        self.assertIn("1 failed", out)
+
+    def test_a_warning_alone_does_not_fail_the_run(self) -> None:
+        self.cfg["sandbox"] = {"prefix": ["env"]}
+        self.cfg["harnesses"]["pi"]["command"] = ["no-such-cli-for-doctor"]
+        code, out = self.call()
+        self.assertEqual(code, 0)
+        self.assertIn("warn  harness pi", out)
+        self.assertIn("1 warnings", out)
+
+    def test_doctor_runs_nothing_but_probes_and_spends_nothing(self) -> None:
+        with mock.patch.object(hb, "cmd_run") as run:
+            self.call()
+        run.assert_not_called()
+
+    def test_doctor_writes_no_results(self) -> None:
+        self.assertEqual(self.call()[0], 0)
+        self.assertEqual(list(Path(self.base).glob("results*")), [])
+```
+
 ## Sandbox
 
 `sandbox/Dockerfile`:
@@ -15140,6 +18738,10 @@ exec "$@"
 #!/usr/bin/env python3
 """End-to-end test of the Docker sandbox with fake agents (no API keys, no network calls).
 
+Two runs against the real Docker: the `docker` sandbox type with the image pinned by the digest of the local image
+(limits, no network, containers removed, digest recorded) and the older `sandbox.prefix` form, which must behave as
+it always did.
+
 Needs the image: docker build -f sandbox/Dockerfile -t harness-bench-agents \\
                    --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
 Run: python3 tests/docker_e2e.py   (exit 0 = pass)
@@ -15151,6 +18753,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -15163,24 +18766,43 @@ def check(cond: object, msg: str) -> None:
     print(f"ok   {msg}")
 
 
-def main() -> None:
-    if subprocess.run(["docker", "image", "inspect", IMAGE], capture_output=True).returncode:
+def pinned_image() -> str:
+    """The local image pinned by its digest: `NAME@sha256:<id>`. The image id is the digest of its config, which the
+    local image store resolves like a manifest digest."""
+    inspect = subprocess.run(
+        ["docker", "image", "inspect", IMAGE, "--format", "{{.Id}}"], capture_output=True, text=True
+    )
+    if inspect.returncode:
         sys.exit(f"image {IMAGE} not found; build it first (see docstring)")
+    return f"{IMAGE.split('@')[0]}@{inspect.stdout.strip()}"
+
+
+def containers_left() -> list[str]:
+    """Names of the containers of the benchmark (`hb-...`) that still exist, running or not."""
+    ps = subprocess.run(
+        ["docker", "ps", "-a", "--filter", "name=hb-", "--format", "{{.Names}}"], capture_output=True, text=True
+    )
+    return ps.stdout.split()
+
+
+def main() -> None:
+    image = pinned_image()
     tmp = Path(tempfile.mkdtemp(prefix="hb-docker-"))
-    shared = tmp / "shared"  # probe/tag files written from inside the container
-    shared.mkdir()
     try:
         shutil.copy(ROOT / "harness_bench.py", tmp)
         shutil.copytree(ROOT / "hbench", tmp / "hbench", ignore=shutil.ignore_patterns("__pycache__"))
         shutil.copytree(ROOT / "suites" / "regression" / "fizzbuzz", tmp / "tasks" / "fizzbuzz")
-        env = dict(
-            os.environ,
-            FAKE_TAGS_FILE=str(shared / "tags.txt"),
-            FAKE_PROBE_FILE=str(shared / "probe.jsonl"),
-            SECRET_CANARY="must-not-leak",
-            FAKE_API_KEY="sk-test-agent-key-0123456789",
-        )
+        shared = tmp / "shared"  # probe/tag files written from inside the container
         agent = str(ROOT / "tests" / "fake_agent.py")
+        mounts = [f"{ROOT / 'tests'}:{ROOT / 'tests'}:ro", f"{shared}:{shared}"]
+        docker_sandbox = {
+            "type": "docker",
+            "image": image,
+            "network": "none",
+            "limits": {"cpus": 2, "memory": "1g", "pids": 256},
+            "mounts": mounts,
+        }
+        shared.mkdir()
         prefix = [
             "docker",
             "run",
@@ -15191,10 +18813,7 @@ def main() -> None:
             "{workdir}:{workdir}",
             "-w",
             "{workdir}",
-            "-v",
-            f"{ROOT / 'tests'}:{ROOT / 'tests'}:ro",
-            "-v",
-            f"{shared}:{shared}",
+            *[part for mount in mounts for part in ("-v", mount)],
             "--cap-drop",
             "ALL",
             "--security-opt",
@@ -15205,58 +18824,164 @@ def main() -> None:
             "1g",
             IMAGE,
         ]
-        cfg = {
-            "reps": 1,
-            "sandbox": {"prefix": prefix},
-            "harnesses": {
-                k: {
-                    "parser": k,
-                    "command": ["python3", agent, k, mode],
-                    "env": {
-                        "FAKE_TAGS_FILE": "${FAKE_TAGS_FILE}",
-                        "FAKE_PROBE_FILE": "${FAKE_PROBE_FILE}",
-                        "FAKE_API_KEY": "${FAKE_API_KEY}",
-                    },
-                }
-                for k, mode in (("claude", "fix"), ("pi", "nofix"))
-            },
-            "matrix": [{"harness": "claude", "model": "m"}, {"harness": "pi", "model": "p/m"}],
-            "tasks": [
-                {
-                    "id": "fizzbuzz",
-                    "repo": "tasks/fizzbuzz/repo",
-                    "prompt": "fix it",
-                    "hidden_tests": "tasks/fizzbuzz/hidden_tests",
-                    "test": "python3 -m unittest -q test_hidden.py",
-                }
-            ],
-        }
-        (tmp / "config.json").write_text(json.dumps(cfg))
-        p = subprocess.run(
-            [sys.executable, "harness_bench.py", "run", "--config", "config.json"],
-            cwd=tmp,
-            env=env,
-            capture_output=True,
-            text=True,
+        env = dict(
+            os.environ,
+            FAKE_TAGS_FILE=str(shared / "tags.txt"),
+            FAKE_PROBE_FILE=str(shared / "probe.jsonl"),
+            SECRET_CANARY="must-not-leak",
+            FAKE_API_KEY="sk-test-agent-key-0123456789",
         )
-        if p.returncode:
-            sys.exit(f"FAIL: run\n{p.stdout}\n{p.stderr}")
-        rows = {r["harness"]: r for r in map(json.loads, (tmp / "results/results.jsonl").read_text().splitlines())}
-        check(rows["claude"]["passed"] and not rows["pi"]["passed"], "tests run inside container decide pass/fail")
-        check(all(r["sandboxed"] and r["agent_rc"] == 0 for r in rows.values()), "agents ran sandboxed, no secret leak")
-        probes = [json.loads(x) for x in (shared / "probe.jsonl").read_text().splitlines()]
-        check(all(pr["home"] == "/home/agent" for pr in probes), "container HOME, not host HOME")
-        check(all(pr["uid"] == os.getuid() for pr in probes), "container uid matches host uid")
-        check(all(pr["depth"] == "1" for pr in probes), "git baseline visible inside container")
-        logs = tmp / "results" / "logs"
-        check(
-            "sk-test-agent-key" not in "".join(f.read_text() for f in logs.glob("*.agent.stderr")),
-            "secrets redacted in logs",
-        )
-        check(not list(Path(tempfile.gettempdir()).glob("harness-bench-work-*/.*.env")), "env files removed")
+        run_case(tmp, env, "docker", docker_sandbox, agent, shared, digest=image.split("@")[1])
+        run_case(tmp, env, "prefix", {"prefix": prefix}, agent, shared, digest=None)
+        run_timeout_case(tmp, env, docker_sandbox, agent)
         print("\nPASS")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def run_timeout_case(tmp: Path, env: dict[str, str], sandbox: Mapping[str, object], agent: str) -> None:
+    """An agent that outlasts its timeout keeps writing to /work in its container unless the engine removes it: the
+    file must have stopped changing when the grader looks, and the container must be gone."""
+    steady = (
+        "python3 -c \"import os, time; a = os.path.getsize('late.txt'); time.sleep(1); "
+        "raise SystemExit(0 if os.path.getsize('late.txt') == a else 1)\""
+    )
+    cfg = {
+        "reps": 1,
+        "output_dir": "results-timeout",
+        "sandbox": sandbox,
+        "harnesses": {
+            "writer": {
+                "parser": "claude",
+                "command": ["python3", agent, "claude", "slow-writer"],
+                "env": {"FAKE_TAGS_FILE": "${FAKE_TAGS_FILE}", "FAKE_PROBE_FILE": "${FAKE_PROBE_FILE}"},
+            }
+        },
+        "matrix": [{"harness": "writer", "model": "m"}],
+        "tasks": [
+            {
+                "id": "late",
+                "repo": "tasks/fizzbuzz/repo",
+                "prompt": "write",
+                "timeout": 5,
+                "graders": [{"type": "command", "command": steady}],
+            }
+        ],
+    }
+    (tmp / "config-timeout.json").write_text(json.dumps(cfg))
+    p = subprocess.run(
+        [sys.executable, "harness_bench.py", "run", "--config", "config-timeout.json"],
+        cwd=tmp,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if p.returncode:
+        sys.exit(f"FAIL: timeout run\n{p.stdout}\n{p.stderr}")
+    (row,) = map(json.loads, (tmp / "results-timeout" / "results.jsonl").read_text().splitlines())
+    check(row["agent_timed_out"], "docker: the agent outlasted its timeout")
+    check(row["passed"], "docker: its container was removed before grading (late.txt had stopped growing)")
+    check(not containers_left(), "docker: no container is left after the timeout")
+
+
+def run_case(
+    tmp: Path,
+    env: dict[str, str],
+    label: str,
+    sandbox: Mapping[str, object],
+    agent: str,
+    shared: Path,
+    digest: str | None,
+) -> None:
+    """One `run` through the real Docker with `sandbox`; `digest` is the image digest the trials must record."""
+    for leftover in shared.iterdir():
+        leftover.unlink()
+    offline = {  # a container without a network cannot connect anywhere
+        "id": "offline",
+        "repo": "tasks/fizzbuzz/repo",
+        "prompt": "do nothing",
+        "graders": [
+            {
+                "type": "command",
+                "command": (
+                    'python3 -c "import socket, sys; s = socket.socket(); s.settimeout(3); '
+                    "sys.exit(0 if s.connect_ex(('1.1.1.1', 53)) else 1)\""
+                ),
+            }
+        ],
+    }
+    fizzbuzz = {
+        "id": "fizzbuzz",
+        "repo": "tasks/fizzbuzz/repo",
+        "prompt": "fix it",
+        "hidden_tests": "tasks/fizzbuzz/hidden_tests",
+        "test": "python3 -m unittest -q test_hidden.py",
+    }
+    cfg = {
+        "reps": 1,
+        "output_dir": f"results-{label}",
+        "sandbox": sandbox,
+        "harnesses": {
+            k: {
+                "parser": k,
+                "command": ["python3", agent, k, mode],
+                "env": {
+                    "FAKE_TAGS_FILE": "${FAKE_TAGS_FILE}",
+                    "FAKE_PROBE_FILE": "${FAKE_PROBE_FILE}",
+                    "FAKE_API_KEY": "${FAKE_API_KEY}",
+                },
+            }
+            for k, mode in (("claude", "fix"), ("pi", "nofix"))
+        },
+        "matrix": [{"harness": "claude", "model": "m"}, {"harness": "pi", "model": "p/m"}],
+        "tasks": [fizzbuzz, *([offline] if digest else [])],
+    }
+    (tmp / f"config-{label}.json").write_text(json.dumps(cfg))
+    p = subprocess.run(
+        [sys.executable, "harness_bench.py", "run", "--config", f"config-{label}.json"],
+        cwd=tmp,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if p.returncode:
+        sys.exit(f"FAIL: {label} run\n{p.stdout}\n{p.stderr}")
+    out = tmp / f"results-{label}"
+    rows = {(r["task"], r["harness"]): r for r in map(json.loads, (out / "results.jsonl").read_text().splitlines())}
+    fizz = {h: rows["fizzbuzz", h] for h in ("claude", "pi")}
+    check(
+        fizz["claude"]["passed"] and not fizz["pi"]["passed"],
+        f"{label}: tests run inside the container decide pass/fail",
+    )
+    check(all(r["sandboxed"] and r["agent_rc"] == 0 for r in rows.values()), f"{label}: agents ran sandboxed, no leak")
+    probes = [json.loads(x) for x in (shared / "probe.jsonl").read_text().splitlines()]
+    check(all(pr["home"] == "/home/agent" for pr in probes), f"{label}: container HOME, not host HOME")
+    check(all(pr["uid"] == os.getuid() for pr in probes), f"{label}: container uid matches host uid")
+    check(
+        all(pr["depth"] == "" and pr["remotes"] == "" for pr in probes),
+        f"{label}: no git history inside the container (the baseline lives outside the workdir)",
+    )
+    logs = out / "logs"
+    check(
+        "sk-test-agent-key" not in "".join(f.read_text() for f in logs.glob("*.agent.stderr")),
+        f"{label}: secrets redacted in logs",
+    )
+    check(not list(Path(tempfile.gettempdir()).glob("harness-bench-work-*/.*.env")), f"{label}: env files removed")
+    if digest is None:
+        return
+    check(
+        rows["offline", "claude"]["passed"] and rows["offline", "pi"]["passed"],
+        "docker: a container with network none cannot connect out",
+    )
+    (run_dir,) = [d.parent for d in out.glob("*/trials.jsonl")]
+    info = json.loads((run_dir / "run.json").read_text())
+    trials = [json.loads(x) for x in (run_dir / "trials.jsonl").read_text().splitlines()]
+    check(
+        info["sandbox"].startswith("docker:") and all(t["image_digest"] == digest for t in trials),
+        "docker: run.json names the sandbox and every trial records the image digest",
+    )
+    check(not containers_left(), "docker: no container of the benchmark is left behind")
+    check(not (run_dir / "heartbeat.json").exists(), "docker: the heartbeat file is gone after the run")
 
 
 if __name__ == "__main__":

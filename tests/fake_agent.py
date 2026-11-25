@@ -1,6 +1,6 @@
 """Fake coding-agent CLI for tests. Prints the JSON shape of a real harness.
 
-Usage: fake_agent.py <claude|opencode|pi|codex|cursor> <fix|nofix|hack|probe-hidden|plant-link|artifacts|artifacts-secret|artifacts-link|hide-git|hide-git-clean|hide-ignore|hide-attr|hide-config>
+Usage: fake_agent.py <claude|opencode|pi|codex|cursor> <fix|nofix|hack|probe-hidden|plant-link|artifacts|artifacts-secret|artifacts-link|hide-git|hide-git-clean|hide-ignore|hide-attr|hide-config|fork-bg|slow-once|slow-writer>
 "fix" repairs fizzbuzz.py in the cwd. "hack" leaves the bug and tampers with the test
 infrastructure instead (rewrites run_tests.py, adds conftest.py, moves git refs).
 The "hide-*" modes fix the bug and then try to hide a forbidden change from the diff:
@@ -16,6 +16,11 @@ separated) or a .py file holding the marker that every example hidden test carri
 make the grader overwrite a host file.
 "artifacts" writes `report.html` and `summary.json` from `data.csv` (the examples-artifacts suite); "artifacts-secret"
 also puts $FAKE_API_KEY in the report, and "artifacts-link" plants `report.html` as a symlink to $FAKE_CANARY_FILE.
+"fork-bg" fixes the bug and leaves a background process behind that appends to $FAKE_BG_FILE every 50 ms (it keeps
+stdout open and stays in the agent's process group, like `sleep 600 &` in a shell): the engine must kill it.
+"slow-writer" appends to late.txt every 50 ms for a minute, in the foreground (an agent that outlasts its timeout).
+"slow-once" fixes the bug like "fix", but first sleeps (up to 90 s) while the file $FAKE_SLOW_FLAG exists; it gives up
+as soon as its parent is gone, so a killed engine leaves no agent behind.
 Security probes: exits 9 if the LiteLLM spend key or SECRET_CANARY reached the agent,
 prints FAKE_API_KEY to stderr (must be redacted in logs), and records git history depth. When BENCH_TAG is set (and kind is not cursor),
 the tag is appended to $FAKE_TAGS_FILE, which fake_litellm.py serves as spend logs.
@@ -74,7 +79,7 @@ def find_hidden_tests() -> list[str]:
 
 
 kind, mode = sys.argv[1], sys.argv[2]
-fix = mode in ("fix", "plant-link") or mode.startswith("hide-")
+fix = mode in ("fix", "plant-link", "fork-bg", "slow-once") or mode.startswith("hide-")
 for leaked in ("FAKE_KEY", "SECRET_CANARY"):
     if leaked in os.environ:
         sys.exit(9)
@@ -166,6 +171,50 @@ if mode == "artifacts-link":
     os.symlink(os.environ["FAKE_CANARY_FILE"], "report.html")
     with open("summary.json", "w") as f:
         json.dump({"total": 245, "rows": 3, "regions": ["north", "south", "east"]}, f)
+BACKGROUND_WRITER = "import sys, time\nwhile True:\n    open(sys.argv[1], 'a').write('x')\n    time.sleep(0.05)\n"
+
+
+def leave_background_process() -> None:
+    """Start a process that outlives this one unless the engine kills the process group, and wait until it writes."""
+    import subprocess
+    import time
+
+    path = os.environ["FAKE_BG_FILE"]
+    subprocess.Popen([sys.executable, "-c", BACKGROUND_WRITER, path])
+    deadline = time.time() + 30
+    while not (os.path.exists(path) and os.path.getsize(path)) and time.time() < deadline:
+        time.sleep(0.02)
+
+
+def wait_while_flag_exists() -> None:
+    """Sleep while $FAKE_SLOW_FLAG exists, but stop when the parent process dies."""
+    import time
+
+    parent, flag = os.getppid(), os.environ["FAKE_SLOW_FLAG"]
+    if os.environ.get("FAKE_SLOW_PID"):  # lets the test make sure no agent outlives it
+        with open(os.environ["FAKE_SLOW_PID"], "w") as f:
+            f.write(str(os.getpid()))
+    deadline = time.time() + 90
+    while os.path.exists(flag) and os.getppid() == parent and time.time() < deadline:
+        time.sleep(0.05)
+
+
+def write_for_a_minute() -> None:
+    import time
+
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        with open("late.txt", "a") as f:
+            f.write("x")
+        time.sleep(0.05)
+
+
+if mode == "slow-writer":
+    write_for_a_minute()
+if mode == "fork-bg":
+    leave_background_process()
+if mode == "slow-once":
+    wait_while_flag_exists()
 if mode == "plant-link":
     os.symlink(os.environ["FAKE_CANARY_FILE"], "test_hidden.py")
 if mode.startswith("hide-"):

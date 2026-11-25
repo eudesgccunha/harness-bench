@@ -350,8 +350,40 @@ class ToolCallsTests(unittest.TestCase):
         loaded = TrialResult.from_dict(d)
         self.assertEqual((loaded.usage.tool_calls, loaded.schema_version), (None, "1.0.0"))
 
-    def test_the_current_contract_version_is_1_2_0(self) -> None:
-        self.assertEqual((SCHEMA_VERSION, trial().schema_version), ("1.2.0", "1.2.0"))
+    def test_the_current_contract_version_is_1_3_0(self) -> None:
+        self.assertEqual((SCHEMA_VERSION, trial().schema_version), ("1.3.0", "1.3.0"))
+
+
+class SandboxFieldTests(unittest.TestCase):
+    def test_a_run_names_its_sandbox_and_it_round_trips(self) -> None:
+        info = run_info(sandbox="docker:img@sha256:" + "a" * 64)
+        self.assertEqual(RunInfo.from_dict(info.to_dict()), info)
+        self.assertEqual(info.to_dict()["sandbox"], "docker:img@sha256:" + "a" * 64)
+
+    def test_the_sandbox_is_unknown_when_nothing_says_otherwise(self) -> None:
+        self.assertEqual(run_info().sandbox, "unknown")
+
+    def test_a_run_of_contract_1_0_to_1_2_loads_with_an_unknown_sandbox(self) -> None:
+        for version in ("1.0.0", "1.1.0", "1.2.0"):
+            d = run_info().to_dict()
+            del d["sandbox"]
+            d["schema_version"] = version
+            with self.subTest(version=version):
+                loaded = RunInfo.from_dict(d)
+                self.assertEqual((loaded.sandbox, loaded.schema_version), ("unknown", version))
+
+    def test_the_sandbox_must_be_a_string(self) -> None:
+        bad_values: list[Any] = [3, None, True, ["docker"]]
+        for bad in bad_values:
+            with self.subTest(bad=bad), self.assertRaises(ContractError):
+                run_info(sandbox=bad)
+
+    def test_a_trial_records_the_image_digest_and_a_1_2_trial_loads_without_one_set(self) -> None:
+        digest = "sha256:" + "b" * 64
+        self.assertEqual(TrialResult.from_dict(trial(image_digest=digest).to_dict()).image_digest, digest)
+        d = trial().to_dict()
+        d["schema_version"] = "1.2.0"
+        self.assertIsNone(TrialResult.from_dict(d).image_digest)
 
 
 class JudgeFieldTests(unittest.TestCase):

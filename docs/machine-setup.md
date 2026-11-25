@@ -33,6 +33,19 @@ How each person runs the benchmark on their own machine. The run itself is descr
 - Clone the repository and set `work_dir` on the Linux filesystem (`~/...`), **not** under `/mnt/c/...`, which is slow and breaks permissions.
 - Native PowerShell is not supported: `prefix` and the paths assume POSIX.
 
+## Limiting what the agent can reach
+
+The `docker` sandbox (`"sandbox": {"type": "docker", "image": "harness-bench-agents@sha256:<digest>", ...}`) gives a container no network (`--network none`) unless you name one. The agents must reach LiteLLM, so use an **internal** Docker network and attach only the gateway to it:
+
+```bash
+docker network create --internal hb-egress
+docker network connect hb-egress <litellm-container>      # the gateway answers on that network
+# in the config: "sandbox": {"type": "docker", "image": "...@sha256:...", "network": "hb-egress",
+#                            "limits": {"cpus": 2, "memory": "4g", "pids": 512}}
+```
+
+An internal network has no route out, so a prompt-injected agent can talk to the gateway and nothing else. The agents reach the gateway by its name on that network, so the `LITELLM_BASE_URL` they get (through `env_passthrough` or the harness `env`) must use that name; `litellm.base_url`, which the engine uses on the host for `reconcile`, must stay a URL the host can reach (https, or http for localhost). `python3 -m hbench doctor --config config.json` checks that the image has the pinned digest, that every CLI answers inside it and that the network is `Internal: true` (or `none`); it warns for any other network. The digest of a local image is `docker image inspect harness-bench-agents --format '{{.Id}}'`.
+
 ## Corporate networks
 
 - If LiteLLM is reachable only through a VPN, check that the container (default Docker bridge network, no `--network` flag in the example `prefix`) can reach it:

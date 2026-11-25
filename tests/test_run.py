@@ -22,6 +22,8 @@ def args(**overrides: Any) -> argparse.Namespace:
         "allow_unsandboxed": True,
         "no_report": True,
         "cost_source": None,
+        "resume": None,
+        "force": False,
     }
     values.update(overrides)
     return argparse.Namespace(**values)

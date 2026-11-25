@@ -129,6 +129,7 @@ RUN_SCHEMA: dict[str, Any] = {
             "python": _STRING,
             "platform": _STRING,
             "sandboxed": _BOOLEAN,
+            "sandbox": _STRING,
             "targets": {"type": "array", "items": {"$ref": "#/$defs/target"}},
         },
         [

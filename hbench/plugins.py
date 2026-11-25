@@ -1,8 +1,9 @@
 """Plugins through entry points (ADR 0007, decision 7).
 
 Third-party packages register a factory `(config) -> HarnessRunner | Grader | redactor` in the groups
-`harness_bench.runners`, `harness_bench.graders` and `harness_bench.redactors` (a redactor is a callable
-`(text: str) -> str` that runs on an artifact before it is sent to the judge). Built-in names always win: callers
+`harness_bench.runners`, `harness_bench.graders`, `harness_bench.redactors` and `harness_bench.sandboxes` (a
+redactor is a callable `(text: str) -> str` that runs on an artifact before it is sent to the judge; a sandbox
+factory takes the `sandbox` section and returns a `Sandbox`, ADR 0010). Built-in names always win: callers
 only come here for a name that is not built in, so a plain run never imports third-party code. Every failure is a
 `PluginError` with a message that names the plugin, never a traceback from the engine.
 """
@@ -14,6 +15,7 @@ from typing import Any, TypeGuard
 RUNNER_GROUP = "harness_bench.runners"
 GRADER_GROUP = "harness_bench.graders"
 REDACTOR_GROUP = "harness_bench.redactors"
+SANDBOX_GROUP = "harness_bench.sandboxes"
 
 
 class PluginError(ValueError):

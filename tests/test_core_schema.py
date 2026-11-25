@@ -89,8 +89,8 @@ class ValidateContractTests(unittest.TestCase):
     def test_schema_document_holds_both_schemas_with_ids(self) -> None:
         doc = schema_document()
         self.assertEqual((doc["trial"], doc["run"]), (TRIAL_SCHEMA, RUN_SCHEMA))
-        self.assertTrue(TRIAL_SCHEMA["$id"].endswith("/trial/1.2.0"))
-        self.assertTrue(RUN_SCHEMA["$id"].endswith("/run/1.2.0"))
+        self.assertTrue(TRIAL_SCHEMA["$id"].endswith("/trial/1.3.0"))
+        self.assertTrue(RUN_SCHEMA["$id"].endswith("/run/1.3.0"))
 
 
 class ValidatorKeywordTests(unittest.TestCase):

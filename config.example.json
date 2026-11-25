@@ -4,7 +4,7 @@
   "cost_source": "auto",
   "output_dir": "results",
   "sandbox": {
-    "_comment": "Image from sandbox/Dockerfile. Without Docker, leave prefix empty and use --allow-unsandboxed only inside a disposable VM.",
+    "_comment": "Image from sandbox/Dockerfile. Without Docker, leave prefix empty and use --allow-unsandboxed only inside a disposable VM. Alternative with limits, no network by default and a recorded image digest: replace this section with {\"type\": \"docker\", \"image\": \"harness-bench-agents@sha256:<digest of docker image inspect --format '{{.Id}}'>\", \"network\": \"none\", \"limits\": {\"cpus\": 2, \"memory\": \"4g\", \"pids\": 512}}; the agents then reach nothing unless you name an internal Docker network that holds only LiteLLM (docs/machine-setup.md).",
     "prefix": [
       "docker",
       "run",

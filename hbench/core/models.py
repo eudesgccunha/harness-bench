@@ -15,7 +15,7 @@ from enum import Enum, StrEnum
 from types import MappingProxyType, UnionType
 from typing import Any, ClassVar, Self, get_args, get_origin, get_type_hints
 
-SCHEMA_VERSION = "1.2.0"
+SCHEMA_VERSION = "1.3.0"
 _VERSION_RE = re.compile(r"^(\d+)\.\d+\.\d+$")
 _MAJOR = SCHEMA_VERSION.split(".")[0]
 
@@ -372,6 +372,7 @@ class RunInfo(_Model):
     platform: str
     sandboxed: bool
     targets: tuple[Target, ...]
+    sandbox: str = "unknown"  # what ran the commands: `docker:<image>`, `prefix`, `local-tmp`, a plugin's name
 
     DECODERS: ClassVar[Mapping[str, Callable[[Any], Any]]] = {
         "started_at": _parse_datetime,
