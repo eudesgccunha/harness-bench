@@ -1,4 +1,4 @@
-"""The single command line: `python3 -m hbench {run,report,reconcile,schema export,suite list,suite validate}`.
+"""The single command line: `python3 -m hbench {run,report,reconcile,compare,recommend,gate,schema export,suite ...}`.
 
 `harness_bench.py` and `harness_bench_litellm.py` are shims over `main`. `--litellm` applies the LiteLLM
 profile (see `hbench.profiles`) and, for `run`, waits for the spend logs and reconciles afterwards.
@@ -17,12 +17,15 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from hbench import api
+from hbench import api, decide
 from hbench.calibration import calibrate, calibration_status, read_labels, write_calibration
+from hbench.core.models import RunInfo, TrialResult
 from hbench.core.schema import schema_document
 from hbench.doctor import run_checks
+from hbench.importers import ImportRequest, run_import
 from hbench.judge import JudgeError
 from hbench.profiles import apply_litellm_profile
+from hbench.report import COST_SOURCES
 from hbench.results import ResumeError, read_run
 from hbench.sinks.feed import SinkFeed
 from hbench.suites import Suite, SuiteError, load_suite, suite_label, suite_tasks
@@ -38,12 +41,17 @@ _DESCRIPTION = (
     "  python3 -m hbench schema export [--out PATH]       # JSON Schema of trials.jsonl and run.json\n"
     "  python3 -m hbench suite list     [--config C | PATH...]\n"
     "  python3 -m hbench suite validate [--config C] [--run [--allow-unsandboxed]] [PATH...]\n"
+    "  python3 -m hbench suite import exercism --source DIR --out SUITE_DIR --name N --version V --license L\n"
+    "                              --source-url URL [--exercise SLUG ...]   # a local clone in, a new suite out\n"
     "  python3 -m hbench judge calibrate --config C --labels LABELS.jsonl --out calibration.json\n"
     "  python3 -m hbench export    --config C --run RUN_DIR   # replay a run into the configured sinks\n"
     "  python3 -m hbench doctor    --config C [--network]   # check env, CLIs, image and network; spends nothing\n"
     "  python3 -m hbench plan      --config C [--only H...] [--reps N] [--run RUN_ID]   # a TrialSpec per line\n"
     "  python3 -m hbench run-trial --config C [--allow-unsandboxed] --spec FILE|-   # run one spec, print the result\n"
-    "  python3 -m hbench finish    --config C --run RUN_ID [--no-report]   # close the run, write the report\n\n"
+    "  python3 -m hbench finish    --config C --run RUN_ID [--no-report]   # close the run, write the report\n"
+    "  python3 -m hbench compare   RUN_A RUN_B [--alpha 0.05] [--json] [--fail-on-regression]   # run directories\n"
+    "  python3 -m hbench recommend RUN_DIR [--min-pass-rate P] [--max-cost-per-solved USD] [--write-target FILE]\n"
+    "  python3 -m hbench gate      RUN_DIR --min-pass-rate P (--target FILE | --harness H --model M)   # CI gate\n\n"
     "Add --litellm to run, report or reconcile for the LiteLLM-only benchmark."
 )
 
@@ -63,6 +71,40 @@ def _add_drop_saturated(p: argparse.ArgumentParser) -> None:
         action="store_true",
         help="leave out tasks every non-null run solved before building the report",
     )
+
+
+def _add_cost_source(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--cost-source", choices=COST_SOURCES, help="which cost to use (default auto)")
+    p.add_argument("--litellm", action="store_true", help="use the LiteLLM (gateway) cost, as the LiteLLM report does")
+
+
+def _add_decision_commands(sub: Any) -> None:
+    """`compare`, `recommend` and `gate` (ADR 0013): they read run directories and need no config."""
+    compare = sub.add_parser("compare", help="compare two runs: ranking diff and paired regressions")
+    compare.add_argument("run_a", metavar="RUN_A", help="the baseline run directory: <output_dir>/<run_id>")
+    compare.add_argument("run_b", metavar="RUN_B", help="the run directory to check against the baseline")
+    _add_cost_source(compare)
+    compare.add_argument("--alpha", type=float, default=0.05, help="significance of the McNemar test (default 0.05)")
+    compare.add_argument("--json", action="store_true", help="print JSON instead of Markdown")
+    compare.add_argument(
+        "--fail-on-regression", action="store_true", help="exit 1 when a target regressed (default: exit 0)"
+    )
+    recommend = sub.add_parser("recommend", help="pick the cheapest target per solved task under constraints")
+    recommend.add_argument("run_dir", metavar="RUN_DIR")
+    _add_cost_source(recommend)
+    recommend.add_argument("--min-pass-rate", type=float, metavar="P", help="from 0 to 1")
+    recommend.add_argument("--max-cost-per-solved", type=float, metavar="USD")
+    recommend.add_argument("--max-cost-per-run", type=float, metavar="USD")
+    recommend.add_argument("--max-latency-s", type=float, metavar="S", help="average wall time per run")
+    recommend.add_argument("--json", action="store_true", help="print JSON instead of Markdown")
+    recommend.add_argument("--write-target", metavar="FILE", help="write the pick as a target file (JSON)")
+    gate = sub.add_parser("gate", help="CI gate: exit 1 when the target's pass rate on a suite is too low")
+    gate.add_argument("run_dir", metavar="RUN_DIR")
+    gate.add_argument("--min-pass-rate", type=float, required=True, metavar="P", help="from 0 to 1")
+    gate.add_argument("--suite", default="regression", help="suite name whose tasks are gated (default regression)")
+    gate.add_argument("--target", metavar="FILE", help="a target file written by `recommend --write-target`")
+    gate.add_argument("--harness")
+    gate.add_argument("--model")
 
 
 def _prog() -> str:
@@ -132,6 +174,17 @@ def build_parser(epilog: str | None = None) -> argparse.ArgumentParser:
         "--allow-unsandboxed", action="store_true", help="with --run: no sandbox (only inside a disposable VM)"
     )
     validate.add_argument("paths", nargs="*", metavar="PATH", help="suite directories")
+    import_cmd = suite_sub.add_parser(
+        "import", help="turn a local checkout of a task pack into a new suite (no network; review its license first)"
+    )
+    import_cmd.add_argument("importer", help="exercism, or the name of an importer plugin")
+    import_cmd.add_argument("--source", required=True, metavar="DIR", help="your local clone of the pack")
+    import_cmd.add_argument("--out", required=True, metavar="SUITE_DIR", help="a new directory; it must not exist")
+    import_cmd.add_argument("--name", required=True, help="suite name (a-z, 0-9 and -)")
+    import_cmd.add_argument("--version", required=True, metavar="MAJOR.MINOR.PATCH")
+    import_cmd.add_argument("--license", required=True, metavar="SPDX", help="license of the pack, for provenance")
+    import_cmd.add_argument("--source-url", required=True, metavar="URL", help="https:// URL of the pack's repository")
+    import_cmd.add_argument("--exercise", nargs="+", default=[], metavar="SLUG", help="only these exercises")
     doctor = sub.add_parser("doctor", help="check that the benchmark can run; starts no agent and spends nothing")
     doctor.add_argument("--config", required=True)
     doctor.add_argument(
@@ -157,6 +210,7 @@ def build_parser(epilog: str | None = None) -> argparse.ArgumentParser:
     _add_config(finish_cmd)
     finish_cmd.add_argument("--run", required=True, metavar="RUN_ID")
     finish_cmd.add_argument("--no-report", action="store_true", help="do not write summary.md and summary.csv")
+    _add_decision_commands(sub)
     judge = sub.add_parser("judge", help="LLM judge tools")
     judge_sub = judge.add_subparsers(dest="judge_cmd", required=True)
     calibrate_cmd = judge_sub.add_parser(
@@ -259,7 +313,30 @@ def _suite_check_behavior(engine: ModuleType, suites: list[Suite], cfg: dict[str
     return ok
 
 
+def _suite_import(args: argparse.Namespace) -> None:
+    """`suite import`: write a new suite from a local checkout; nothing is left behind when it fails."""
+    request = ImportRequest(
+        source=Path(args.source),
+        out=Path(args.out),
+        name=args.name,
+        version=args.version,
+        license=args.license,
+        source_url=args.source_url,
+        exercises=tuple(args.exercise),
+    )
+    try:
+        suite = run_import(args.importer, request)
+    except ValueError as e:  # ImporterError and PluginError
+        sys.exit(f"suite import: {e}")
+    count = len(suite.tasks)
+    print(f"imported {count} {'task' if count == 1 else 'tasks'} into {request.out}")
+    print(f"next: python3 -m hbench suite validate --run --allow-unsandboxed {request.out}")
+
+
 def _suite(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.suite_cmd == "import":
+        _suite_import(args)
+        return
     dirs, cfg, base = _suite_inputs(parser, args)
     if args.suite_cmd == "list":
         _suite_list(dirs)
@@ -395,6 +472,101 @@ def _finish(args: argparse.Namespace) -> None:
         print(f"reconcile, then report: python3 -m hbench reconcile --litellm --config {args.config}")
 
 
+def _read_run_or_exit(command: str, path: str) -> tuple[RunInfo, list[TrialResult]]:
+    try:
+        return read_run(Path(path).resolve())
+    except ResumeError as e:
+        sys.exit(f"{command}: {e}")
+
+
+def _cost_source(parser: argparse.ArgumentParser, args: argparse.Namespace) -> str:
+    """The cost source of `--cost-source` / `--litellm`, which exclude each other."""
+    if args.litellm:
+        if args.cost_source:
+            parser.error("--cost-source cannot be combined with --litellm (the cost always comes from LiteLLM)")
+        return "litellm"
+    return str(args.cost_source or "auto")
+
+
+def _compare(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """`compare`: print the comparison; exit 1 on a regression only with `--fail-on-regression`."""
+    source = _cost_source(parser, args)
+    runs = [_read_run_or_exit("compare", path) for path in (args.run_a, args.run_b)]
+    try:
+        comparison = decide.compare(runs[0], runs[1], source, args.alpha)
+    except ValueError as e:
+        sys.exit(f"compare: {e}")
+    if args.json:
+        print(json.dumps(comparison.to_dict(), indent=2, sort_keys=True, allow_nan=False))
+    else:
+        print(decide.render_comparison(comparison), end="")
+    if args.fail_on_regression and comparison.has_regression:
+        sys.exit(1)
+
+
+def _recommend(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """`recommend`: print every target with the constraints it failed and the pick; exit 1 without an eligible one."""
+    source = _cost_source(parser, args)
+    info, trials = _read_run_or_exit("recommend", args.run_dir)
+    try:
+        constraints = decide.Constraints(
+            min_pass_rate=args.min_pass_rate,
+            max_cost_per_solved=args.max_cost_per_solved,
+            max_cost_per_run=args.max_cost_per_run,
+            max_latency_s=args.max_latency_s,
+        )
+        recommendation = decide.recommend(info, trials, constraints, source)
+        output = (
+            json.dumps(decide.recommendation_json(recommendation), indent=2, sort_keys=True, allow_nan=False)
+            if args.json
+            else decide.render_recommendation(recommendation).rstrip("\n")
+        )
+        # A run.json of another tool may carry a run_id the decision file refuses: say so before printing or writing.
+        decision = decide.decision_for(recommendation) if recommendation.pick and args.write_target else None
+    except ValueError as e:  # ContractError too
+        sys.exit(f"recommend: {e}")
+    print(output)
+    if recommendation.pick is None:
+        sys.exit("recommend: no eligible target")
+    if decision is not None:
+        try:
+            decide.write_target(Path(args.write_target), decision)
+        except decide.TargetFileError as e:
+            sys.exit(f"recommend: {e}")
+        print(f"wrote {args.write_target}", file=sys.stderr)
+
+
+def _gate(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """`gate`: exit 1 (with the reason on stderr) unless the target meets the pass rate; it fails closed."""
+    if args.target:
+        if args.harness or args.model:
+            parser.error("give --target or --harness and --model, not both")
+        try:
+            decision = decide.load_target(Path(args.target))
+        except decide.TargetFileError as e:
+            sys.exit(f"gate: {e}")
+        harness, model = decision.harness, decision.model
+    elif args.harness and args.model:
+        harness, model = args.harness, args.model
+    else:
+        parser.error("give --target, or both --harness and --model")
+    info, trials = _read_run_or_exit("gate", args.run_dir)
+    try:
+        result = decide.gate(info, trials, harness, model, args.suite, args.min_pass_rate)
+    except ValueError as e:
+        sys.exit(f"gate: {e}")
+    if not result.ok:
+        sys.exit(f"gate: {result.message}")
+    print(f"gate: {result.message}")
+
+
+_DECISION_COMMANDS: Mapping[str, Callable[[argparse.ArgumentParser, argparse.Namespace], None]] = {
+    "compare": _compare,
+    "recommend": _recommend,
+    "gate": _gate,
+}
+
+
 def _run_litellm(engine: ModuleType, args: argparse.Namespace, cfg: dict[str, Any], base: Path) -> None:
     """`run` under the LiteLLM profile: report only after reconcile, when the gateway cost exists."""
     engine.cmd_run(args, cfg, base)
@@ -432,6 +604,9 @@ def main(argv: Sequence[str] | None = None, *, epilog: str | None = None) -> Non
         return
     if args.cmd == "doctor":
         _doctor(args)
+        return
+    if args.cmd in _DECISION_COMMANDS:
+        _DECISION_COMMANDS[args.cmd](parser, args)
         return
     if args.cmd in _ORCHESTRATOR_COMMANDS:
         _ORCHESTRATOR_COMMANDS[args.cmd](args)

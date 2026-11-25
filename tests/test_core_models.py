@@ -3,22 +3,26 @@
 import copy
 import dataclasses
 import json
+import operator
 import pickle
 import unittest
 from types import MappingProxyType
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 import fixtures  # noqa: F401  (puts the repo root on sys.path)
 from hbench.core.ids import new_run_id, sha256_json, trial_id
 from hbench.core.models import (
+    COST_SOURCE_NAMES,
     SCHEMA_VERSION,
     ContractError,
     Costs,
     CostSource,
     GraderResult,
+    Evidence,
     RunInfo,
     Target,
+    TargetDecision,
     TrialResult,
     TrialSpec,
     TrialStatus,
@@ -352,14 +356,14 @@ class ToolCallsTests(unittest.TestCase):
         loaded = TrialResult.from_dict(d)
         self.assertEqual((loaded.usage.tool_calls, loaded.schema_version), (None, "1.0.0"))
 
-    def test_the_current_contract_version_is_1_4_0(self) -> None:
-        self.assertEqual((SCHEMA_VERSION, trial().schema_version), ("1.4.0", "1.4.0"))
+    def test_the_current_contract_version_is_1_5_0(self) -> None:
+        self.assertEqual((SCHEMA_VERSION, trial().schema_version), ("1.5.0", "1.5.0"))
 
-    def test_a_1_3_0_trial_and_run_still_load(self) -> None:
+    def test_a_1_4_0_trial_and_run_still_load(self) -> None:
         for obj in (trial(), run_info()):
             d = obj.to_dict()
-            d["schema_version"] = "1.3.0"
-            self.assertEqual(type(obj).from_dict(d).schema_version, "1.3.0")
+            d["schema_version"] = "1.4.0"
+            self.assertEqual(type(obj).from_dict(d).schema_version, "1.4.0")
 
 
 class RunRepsTests(unittest.TestCase):
@@ -450,6 +454,124 @@ def trial_spec(**overrides: Any) -> TrialSpec:
     }
     values.update(overrides)
     return TrialSpec(**values)
+
+
+def evidence(**overrides: Any) -> Evidence:
+    values: dict[str, Any] = {
+        "runs": 6,
+        "solved": 5,
+        "pass_rate": 5 / 6,
+        "pass_ci_low": 0.43,
+        "pass_ci_high": 0.97,
+        "cost_per_solved": 0.12,
+        "cost_per_run": 0.1,
+        "avg_wall_s": 30.0,
+    }
+    values.update(overrides)
+    return Evidence(**values)
+
+
+def target_decision(**overrides: Any) -> TargetDecision:
+    values: dict[str, Any] = {
+        "harness": "claude",
+        "model": "sonnet",
+        "run_id": "a" * 32,
+        "config_sha256": "c" * 64,
+        "suite_version": "regression@1.0.0",
+        "cost_source": "auto",
+        "constraints": {"min_pass_rate": 0.5},
+        "evidence": evidence(),
+    }
+    values.update(overrides)
+    return TargetDecision(**values)
+
+
+class TargetDecisionTests(unittest.TestCase):
+    def test_a_decision_round_trips_through_json(self) -> None:
+        for decision in (
+            target_decision(),
+            target_decision(constraints={}, evidence=evidence(cost_per_solved=None, cost_per_run=None)),
+        ):
+            loaded = TargetDecision.from_dict(json.loads(json.dumps(decision.to_dict())))
+            self.assertEqual(loaded, decision)
+            self.assertEqual(loaded.schema_version, SCHEMA_VERSION)
+
+    def test_unknown_cost_stays_null_not_zero(self) -> None:
+        d = target_decision(evidence=evidence(cost_per_solved=None, cost_per_run=None)).to_dict()
+        self.assertEqual((d["evidence"]["cost_per_solved"], d["evidence"]["cost_per_run"]), (None, None))
+
+    def test_extra_and_missing_keys_are_refused(self) -> None:
+        extra = {**target_decision().to_dict(), "command": ["x"]}
+        nested = target_decision().to_dict()
+        nested["evidence"]["env"] = {}
+        missing = target_decision().to_dict()
+        del missing["run_id"]
+        for bad in (extra, nested, missing):
+            with self.assertRaises(ContractError):
+                TargetDecision.from_dict(bad)
+
+    def test_a_forged_schema_version_is_refused(self) -> None:
+        for version in ("2.0.0", "abc"):
+            with self.assertRaises(ContractError):
+                TargetDecision.from_dict({**target_decision().to_dict(), "schema_version": version})
+
+    def test_evidence_is_validated(self) -> None:
+        bad_cases: list[dict[str, Any]] = [
+            {"pass_rate": 1.5},
+            {"pass_rate": -0.1},
+            {"pass_ci_low": 2.0},
+            {"pass_ci_high": -1.0},
+            {"cost_per_solved": -1.0},
+            {"cost_per_run": float("inf")},
+            {"avg_wall_s": float("nan")},
+            {"runs": 0},
+            {"solved": 7},
+            {"solved": -1},
+            {"runs": "6"},
+            {"pass_ci_low": 0.9},  # above the pass rate
+            {"pass_ci_high": 0.5},  # below the pass rate
+            {"pass_rate": 0.5},  # not solved / runs
+        ]
+        for overrides in bad_cases:
+            with self.subTest(overrides=overrides), self.assertRaises(ContractError):
+                evidence(**overrides)
+
+    def test_the_decision_is_validated(self) -> None:
+        bad_cases: list[dict[str, Any]] = [
+            {"harness": ""},
+            {"model": ""},
+            {"run_id": ""},
+            {"run_id": "r" * 32},
+            {"run_id": "a" * 31},
+            {"cost_source": "gateway"},
+            {"cost_source": "bogus"},
+            {"config_sha256": "short"},
+            {"suite_version": ""},
+            {"cost_source": ""},
+            {"constraints": {"min_pass_rate": 1.5}},
+            {"constraints": {"max_cost_per_run": -1.0}},
+            {"constraints": {"max_latency_s": float("inf")}},
+            {"constraints": {"command": 1.0}},
+            {"constraints": {"min_pass_rate": "x"}},
+        ]
+        for overrides in bad_cases:
+            with self.subTest(overrides=overrides), self.assertRaises(ContractError):
+                target_decision(**overrides)
+
+    def test_every_cost_source_the_commands_accept_is_valid(self) -> None:
+        from hbench.report import COST_SOURCES
+
+        self.assertEqual(tuple(COST_SOURCE_NAMES), COST_SOURCES)
+        for name in COST_SOURCE_NAMES:
+            self.assertEqual(target_decision(cost_source=name).cost_source, name)
+
+    def test_constraints_are_a_private_read_only_copy(self) -> None:
+        given = {"min_pass_rate": 0.5}
+        decision = target_decision(constraints=given)
+        given["min_pass_rate"] = 0.9
+        self.assertEqual(decision.constraints["min_pass_rate"], 0.5)
+        with self.assertRaises(TypeError):
+            operator.setitem(cast(Any, decision.constraints), "x", 1.0)
 
 
 class TrialSpecTests(unittest.TestCase):

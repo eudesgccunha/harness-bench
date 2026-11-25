@@ -219,7 +219,7 @@ class HeartbeatTests(unittest.TestCase):
     def test_a_write_that_fails_warns_once_and_the_beat_goes_on(self) -> None:
         path = fixtures.tmpdir(self) / HEARTBEAT_FILE
         attempts: list[int] = []
-        real_write = results._atomic_write
+        real_write = results.atomic_write
 
         def flaky(target: Path, text: str) -> None:
             attempts.append(1)
@@ -228,7 +228,7 @@ class HeartbeatTests(unittest.TestCase):
             real_write(target, text)
 
         stderr = io.StringIO()
-        with mock.patch.object(results, "_atomic_write", flaky), contextlib.redirect_stderr(stderr):
+        with mock.patch.object(results, "atomic_write", flaky), contextlib.redirect_stderr(stderr):
             with Heartbeat(path, interval=0.02) as heartbeat:
                 heartbeat.beat("t", "agent")  # a phase change on the main thread fails too, and must not raise
                 deadline = time.time() + 30

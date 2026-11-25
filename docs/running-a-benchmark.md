@@ -130,6 +130,10 @@ python3 -m hbench finish --config config.json --run RUN_ID
 
 Run `finish` only after every trial has ended, and `reconcile` only after `finish` (it replaces `trials.jsonl` atomically, so a worker still writing would lose its line). A spec names a trial and holds no command, prompt, path or secret; each worker uses its own copy of the config. See [Orchestrator integration](orchestrator-integration.md) and the examples in `adapters/`.
 
+### Turn the results into a decision (optional)
+
+Once you have two runs, `python3 -m hbench compare RUN_A RUN_B` shows the ranking diff and the targets that regressed, `python3 -m hbench recommend RUN_DIR --min-pass-rate 0.8 --write-target target.json` picks the cheapest target per solved task under your constraints and writes it as a versionable file, and `python3 -m hbench gate RUN_DIR --target target.json --min-pass-rate 0.9` fails CI when that target drops on the regression suite. `python3 -m hbench suite import exercism ...` turns a local clone of Exercism into a suite. See [From benchmark to decision](from-benchmark-to-decision.md) ([ADR 0013](adr/0013-compare-recommend-gate-import.md)).
+
 ### Send the results to a database and traces (optional)
 
 `trials.jsonl` always holds the results. A `sinks` list in the config also sends each trial, as it finishes, to a SQLite database and to OpenTelemetry traces (see [ADR 0011](adr/0011-sinks-and-telemetry.md)):

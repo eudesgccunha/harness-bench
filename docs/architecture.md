@@ -173,10 +173,25 @@ Decisions: [ADR 0012](adr/0012-plan-and-run-trial-api.md). `_run_trial` stays th
 | Module | Role |
 |---|---|
 | `hbench/api.py` | The stable surface: `load_config`, `start_run`, `open_run`, `plan`, `parse_spec`, `run_trial`, `finish_run`, and the errors `ConfigError`, `SpecError`, `RunError`, `SandboxRequiredError` (all `ApiError`). It validates a spec against the config and the run, returns the recorded result of a trial that is already in `trials.jsonl`, and calls the engine. |
-| `hbench/core/models.py` | `TrialSpec` (contract 1.4.0): names a trial, carries no command, prompt, path, env or secret. |
+| `hbench/core/models.py` | `TrialSpec` (contract 1.4.0; 1.5.0 adds `TargetDecision`): names a trial, carries no command, prompt, path, env or secret. |
 | `hbench/results.py` | `locked_append` (`flock`, write, flush, `fsync`) for `trials.jsonl`, `results.jsonl` and the OTLP file; `RunWriter.append_once` (check and write under one lock); `open_existing(repair=False)` for workers. |
 | `harness_bench.py` | `planned_trials` and `planned_trial` (the order of `run`, shared with `plan`); `run_trial_isolated` (private work dir, git dir, sandbox session and sink feed around `_run_trial`); `sink_feed`. |
 | `hbench/cli.py` | `plan`, `run-trial` (the engine's progress goes to stderr, stdout is the result) and `finish`. |
 | `adapters/` | Shell, GitHub Actions, Kubernetes and Python examples over the three calls. |
 
 The guide is [`orchestrator-integration.md`](orchestrator-integration.md). Plan: [`superpowers/plans/2026-11-25-phase-8-orchestrator-api.md`](superpowers/plans/2026-11-25-phase-8-orchestrator-api.md).
+
+## Phase 9: from benchmark to decision
+
+Decisions: [ADR 0013](adr/0013-compare-recommend-gate-import.md). Everything reads run directories and reuses `report.aggregate`, so the commands and the report never disagree.
+
+| Module | Role |
+|---|---|
+| `hbench/decide.py` | Pure functions over `RunInfo` and `TrialResult`: `recommend` (constraints, `unknown cost` excluded, null control apart, tie warning), `decision_for`, `encode_target`, `write_target` (atomic, no symlink), `load_target`, `gate` (fails closed) and `compare` (ranking diff, paired McNemar regressions) with their Markdown and JSON renderers. |
+| `hbench/core/models.py` | `Evidence` and `TargetDecision` (contract 1.5.0, additive; JSON Schema `target_decision`). |
+| `hbench/importers/` | `ImportRequest`, `ImporterError`, the registry (`IMPORTERS` plus the entry-point group `harness_bench.importers`) and `run_import`, which creates a new `--out`, runs the importer, loads the result as a suite and removes `--out` on any failure. `exercism.py` reads a local checkout through `hbench/graders/_files.py`. |
+| `hbench/results.py` | `atomic_write` is now public (the target file uses it). |
+| `hbench/cli.py` | `compare`, `recommend`, `gate` and `suite import`. |
+| `adapters/github-actions/regression-gate.yml` | Example CI job over `gate`. |
+
+The guide is [`from-benchmark-to-decision.md`](from-benchmark-to-decision.md). Plan: [`superpowers/plans/2026-11-25-phase-9-decision.md`](superpowers/plans/2026-11-25-phase-9-decision.md).

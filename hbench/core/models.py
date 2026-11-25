@@ -15,7 +15,7 @@ from enum import Enum, StrEnum
 from types import MappingProxyType, UnionType
 from typing import Any, ClassVar, Self, get_args, get_origin, get_type_hints
 
-SCHEMA_VERSION = "1.4.0"
+SCHEMA_VERSION = "1.5.0"
 _VERSION_RE = re.compile(r"^(\d+)\.\d+\.\d+$")
 _MAJOR = SCHEMA_VERSION.split(".")[0]
 _RUN_ID_RE = re.compile(r"[0-9a-f]{32}")  # `new_run_id()`: a UUID4 in hex
@@ -102,6 +102,12 @@ def _check_non_negative(name: str, value: float | None) -> None:
     """Known numbers must be finite and >= 0 (types are checked before, so bool and str never get here)."""
     if value is not None and not (math.isfinite(value) and value >= 0):
         raise ContractError(f"{name} must be a finite number >= 0, got {value}")
+
+
+def _check_unit(name: str, value: float) -> None:
+    """A rate: a number in [0, 1] (NaN and infinity fail the comparison)."""
+    if not 0 <= value <= 1:
+        raise ContractError(f"{name} must be in [0, 1], got {value}")
 
 
 def describe_value(value: object) -> str:
@@ -423,3 +429,77 @@ class TrialSpec(_Model):
                 raise ContractError(f"TrialSpec.{name} must not be empty")
         if self.rep < 1:
             raise ContractError(f"rep must be >= 1, got {self.rep}")
+
+
+# The cost source names of `--cost-source` and the configs (`report.COST_SOURCES` repeats them; a test checks it).
+COST_SOURCE_NAMES = ("auto", "litellm", "computed", "reported")
+# The constraints `recommend` accepts, and so the only keys a `TargetDecision` may record.
+CONSTRAINT_KEYS = ("min_pass_rate", "max_cost_per_solved", "max_cost_per_run", "max_latency_s")
+
+
+@dataclass(frozen=True, kw_only=True)
+class Evidence(_Model):
+    """The measured figures behind a `TargetDecision`; `None` means unknown (never 0)."""
+
+    runs: int
+    solved: int
+    pass_rate: float
+    pass_ci_low: float
+    pass_ci_high: float
+    cost_per_solved: float | None
+    cost_per_run: float | None
+    avg_wall_s: float | None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.runs < 1 or not 0 <= self.solved <= self.runs:
+            raise ContractError(f"need 0 <= solved <= runs and runs >= 1, got {self.solved}/{self.runs}")
+        for name in ("pass_rate", "pass_ci_low", "pass_ci_high"):
+            _check_unit(name, getattr(self, name))
+        if abs(self.pass_rate - self.solved / self.runs) > 1e-9:
+            raise ContractError(f"pass_rate {self.pass_rate} is not solved / runs ({self.solved}/{self.runs})")
+        if not self.pass_ci_low - 1e-9 <= self.pass_rate <= self.pass_ci_high + 1e-9:
+            raise ContractError("the pass-rate interval must contain pass_rate")
+        for name in ("cost_per_solved", "cost_per_run", "avg_wall_s"):
+            _check_non_negative(name, getattr(self, name))
+
+
+@dataclass(frozen=True, kw_only=True)
+class TargetDecision(_Model):
+    """The winning harness x model of a run (ADR 0013), as a versionable file. It holds no command, env, secret or
+    path: only what names the target, the run it was measured in, the constraints given and the evidence."""
+
+    schema_version: str = SCHEMA_VERSION
+    harness: str
+    model: str
+    run_id: str
+    config_sha256: str
+    suite_version: str
+    cost_source: str
+    constraints: Mapping[str, float]
+    evidence: Evidence
+
+    DECODERS: ClassVar[Mapping[str, Callable[[Any], Any]]] = {"evidence": Evidence.from_dict}
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _check_schema_version(self.schema_version)
+        for name in ("harness", "model", "suite_version"):
+            if not getattr(self, name):
+                raise ContractError(f"TargetDecision.{name} must not be empty")
+        if _RUN_ID_RE.fullmatch(self.run_id) is None:
+            raise ContractError(f"TargetDecision.run_id must match {_RUN_ID_RE.pattern}")
+        if self.cost_source not in COST_SOURCE_NAMES:
+            raise ContractError(f"TargetDecision.cost_source must be one of {', '.join(COST_SOURCE_NAMES)}")
+        if _SHA256_RE.fullmatch(self.config_sha256) is None:
+            raise ContractError(f"TargetDecision.config_sha256 must match {_SHA256_RE.pattern}")
+        unknown = sorted(set(self.constraints) - set(CONSTRAINT_KEYS))
+        if unknown:
+            raise ContractError(f"TargetDecision.constraints: unknown constraint(s) {unknown}")
+        for key, value in self.constraints.items():
+            if key == "min_pass_rate":
+                _check_unit(key, value)
+            else:
+                _check_non_negative(key, value)
+        # A private read-only copy: the caller's dict cannot change a frozen model afterwards.
+        object.__setattr__(self, "constraints", MappingProxyType(dict(self.constraints)))

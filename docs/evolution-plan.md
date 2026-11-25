@@ -402,16 +402,20 @@ Decisions: [ADR 0012](adr/0012-plan-and-run-trial-api.md). Plan:
 
 ### Phase 9 — From benchmark to decision
 
-- [ ] `harness-bench compare <run_a> <run_b>`: ranking diff and regressions.
-- [ ] `harness-bench recommend`: best target under constraints (for example minimum pass
-      rate, maximum cost, maximum latency).
-- [ ] CI gate: fail when the current target's pass rate drops below the threshold on the
-      regression suite.
-- [ ] Export the decision as a versionable config file (the "winning target").
-- [ ] M12 task importers (Exercism, Terminal-Bench) into suites, with license and provenance per
-      task (moved from Phase 4: they need network access and a license review per pack).
+- [x] `python3 -m hbench compare <run_a> <run_b>`: ranking diff and regressions (paired exact McNemar).
+- [x] `python3 -m hbench recommend`: best target under constraints (minimum pass rate, maximum cost per
+      solved task or per run, maximum latency); an unknown cost never meets a cost constraint.
+- [x] CI gate: `python3 -m hbench gate` fails when the target's pass rate drops below the threshold on the
+      regression suite (fails closed); example in `adapters/github-actions/regression-gate.yml`.
+- [x] Export the decision as a versionable config file (the "winning target", `TargetDecision`, contract 1.5.0).
+- [x] M12 task importers into suites, with license and provenance per task: Exercism done
+      (`suite import exercism`, offline). Terminal-Bench is deferred: it needs a per-task container image and a
+      script solution, which the suite format does not have; it can come as an importer plugin later.
 
 Acceptance: a model/harness switch is justified by a reproducible report.
+Decisions: [ADR 0013](adr/0013-compare-recommend-gate-import.md). Plan:
+[`superpowers/plans/2026-11-25-phase-9-decision.md`](superpowers/plans/2026-11-25-phase-9-decision.md). Guide:
+[`from-benchmark-to-decision.md`](from-benchmark-to-decision.md).
 
 ---
 

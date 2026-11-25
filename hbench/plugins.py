@@ -1,12 +1,13 @@
 """Plugins through entry points (ADR 0007, decision 7).
 
 Third-party packages register a factory `(config) -> HarnessRunner | Grader | redactor` in the groups
-`harness_bench.runners`, `harness_bench.graders`, `harness_bench.redactors`, `harness_bench.sandboxes` and
-`harness_bench.sinks` (a redactor is a callable `(text: str) -> str` that runs on an artifact before it is sent to
-the judge; a sandbox factory takes the `sandbox` section and returns a `Sandbox`, ADR 0010; a sink factory takes one
-entry of the `sinks` list and returns a `Sink`, ADR 0011). Built-in names always win: callers
-only come here for a name that is not built in, so a plain run never imports third-party code. Every failure is a
-`PluginError` with a message that names the plugin, never a traceback from the engine.
+`harness_bench.runners`, `harness_bench.graders`, `harness_bench.redactors`, `harness_bench.sandboxes`,
+`harness_bench.sinks` and `harness_bench.importers`. A redactor is a callable `(text: str) -> str` that runs on an
+artifact before it is sent to the judge; a sandbox factory takes the `sandbox` section and returns a `Sandbox`
+(ADR 0010); a sink factory takes one entry of the `sinks` list and returns a `Sink` (ADR 0011); an importer factory
+takes an empty config and returns a callable that writes a suite from a local checkout (ADR 0013). Built-in names
+always win: callers only come here for a name that is not built in, so a plain run never imports third-party code.
+Every failure is a `PluginError` with a message that names the plugin, never a traceback from the engine.
 """
 
 from collections.abc import Callable, Collection, Mapping
@@ -18,6 +19,7 @@ GRADER_GROUP = "harness_bench.graders"
 REDACTOR_GROUP = "harness_bench.redactors"
 SANDBOX_GROUP = "harness_bench.sandboxes"
 SINK_GROUP = "harness_bench.sinks"
+IMPORTER_GROUP = "harness_bench.importers"
 
 
 class PluginError(ValueError):

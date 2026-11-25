@@ -54,7 +54,7 @@ If a run shows cost `n/a`, its tag did not reach LiteLLM. See the "LiteLLM: what
 harness-bench/
 ├── harness_bench.py
 ├── harness_bench_litellm.py     # LiteLLM-only variant (no Cursor)
-├── hbench/                      # data contract, report, suites, sinks, orchestrator API and single CLI (ADR 0005, 0008, 0011, 0012)
+├── hbench/                      # data contract, report, suites, sinks, orchestrator API, decisions, importers and single CLI (ADR 0005, 0008, 0011, 0012, 0013)
 ├── adapters/                    # shell, GitHub Actions, Kubernetes and Python examples over plan / run-trial / finish (ADR 0012)
 ├── docs/sql/                    # reference schema and scorecard queries of the sqlite sink (ADR 0011)
 ├── docs/dashboards/             # example Grafana dashboard; scripts/synthetic_db.py writes demo data
@@ -120,6 +120,8 @@ Outputs in `results/`:
 To also send each trial to a SQLite database and OTLP traces, add a `sinks` list to the config (see `docs/running-a-benchmark.md` and `config.example.json`): `{"type": "sqlite", "path": "results/bench.sqlite"}` and `{"type": "otlp", "endpoint": "https://collector:4318", "headers": {"x-key": "${OTLP_KEY}"}}`. `trials.jsonl` is written first and stays the source of truth; a sink that fails is warned about once and left out for that run, and `python3 -m hbench export --config config.json --run results/<run_id>` sends a run again (idempotent by `trial_id`). Spans hold ids, status, model, tokens and cost, never a prompt, response or log. The agent gets `BENCH_RUN_ID` and `BENCH_TRIAL_ID` in its environment.
 
 To run the trials of one run on several workers (processes, CI jobs, pods), use the three orchestrator commands: `python3 -m hbench plan --config config.json > specs.jsonl` starts the run and prints one `TrialSpec` JSON per line, `python3 -m hbench run-trial --config config.json --spec -` runs the spec on its stdin and prints the `TrialResult`, and `python3 -m hbench finish --config config.json --run RUN_ID` closes the run and writes the report. A spec names a trial and carries no command, prompt, path, env or secret: each worker resolves everything from its own copy of the config, and a spec that does not match it is refused before anything runs. Running a spec twice is safe (the second returns the first result). Workers on one run directory need a shared filesystem with working `flock`. The Python API is `hbench/api.py` (`load_config`, `start_run`, `plan`, `run_trial`, `finish_run`); examples are in `adapters/` and the guide is `docs/orchestrator-integration.md` ([ADR 0012](docs/adr/0012-plan-and-run-trial-api.md)).
+
+To turn results into a decision, work from the run directories (no config, no network): `python3 -m hbench compare RUN_A RUN_B [--fail-on-regression]` prints the ranking diff and the targets that regressed (passed in A and failed in B more often than the reverse, exact McNemar `p < 0.05`); `python3 -m hbench recommend RUN_DIR --min-pass-rate 0.8 --max-cost-per-solved 0.5 --write-target target.json` picks the cheapest target per solved task under the constraints (an unknown cost never meets a cost constraint) and writes it as a versionable `TargetDecision` file; `python3 -m hbench gate RUN_DIR --target target.json --min-pass-rate 0.9` exits 1 when that target's pass rate on the `regression` suite is too low, and fails closed. `python3 -m hbench suite import exercism --source DIR --out SUITE_DIR --name N --version V --license SPDX --source-url https://...` turns a local clone of Exercism into a suite (no network). See `docs/from-benchmark-to-decision.md` ([ADR 0013](docs/adr/0013-compare-recommend-gate-import.md)).
 
 `run` only starts with a sandbox configured (`sandbox.type` `docker`, or a `sandbox.prefix`; see [Security](#security)). Inside a disposable VM, add `--allow-unsandboxed`. To continue a run that was killed, use `run --resume RUN_ID` (see [Sandbox types, limits, resume and doctor](#sandbox-types-limits-resume-and-doctor)).
 
@@ -2281,7 +2283,7 @@ from enum import Enum, StrEnum
 from types import MappingProxyType, UnionType
 from typing import Any, ClassVar, Self, get_args, get_origin, get_type_hints
 
-SCHEMA_VERSION = "1.4.0"
+SCHEMA_VERSION = "1.5.0"
 _VERSION_RE = re.compile(r"^(\d+)\.\d+\.\d+$")
 _MAJOR = SCHEMA_VERSION.split(".")[0]
 _RUN_ID_RE = re.compile(r"[0-9a-f]{32}")  # `new_run_id()`: a UUID4 in hex
@@ -2368,6 +2370,12 @@ def _check_non_negative(name: str, value: float | None) -> None:
     """Known numbers must be finite and >= 0 (types are checked before, so bool and str never get here)."""
     if value is not None and not (math.isfinite(value) and value >= 0):
         raise ContractError(f"{name} must be a finite number >= 0, got {value}")
+
+
+def _check_unit(name: str, value: float) -> None:
+    """A rate: a number in [0, 1] (NaN and infinity fail the comparison)."""
+    if not 0 <= value <= 1:
+        raise ContractError(f"{name} must be in [0, 1], got {value}")
 
 
 def describe_value(value: object) -> str:
@@ -2689,6 +2697,80 @@ class TrialSpec(_Model):
                 raise ContractError(f"TrialSpec.{name} must not be empty")
         if self.rep < 1:
             raise ContractError(f"rep must be >= 1, got {self.rep}")
+
+
+# The cost source names of `--cost-source` and the configs (`report.COST_SOURCES` repeats them; a test checks it).
+COST_SOURCE_NAMES = ("auto", "litellm", "computed", "reported")
+# The constraints `recommend` accepts, and so the only keys a `TargetDecision` may record.
+CONSTRAINT_KEYS = ("min_pass_rate", "max_cost_per_solved", "max_cost_per_run", "max_latency_s")
+
+
+@dataclass(frozen=True, kw_only=True)
+class Evidence(_Model):
+    """The measured figures behind a `TargetDecision`; `None` means unknown (never 0)."""
+
+    runs: int
+    solved: int
+    pass_rate: float
+    pass_ci_low: float
+    pass_ci_high: float
+    cost_per_solved: float | None
+    cost_per_run: float | None
+    avg_wall_s: float | None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.runs < 1 or not 0 <= self.solved <= self.runs:
+            raise ContractError(f"need 0 <= solved <= runs and runs >= 1, got {self.solved}/{self.runs}")
+        for name in ("pass_rate", "pass_ci_low", "pass_ci_high"):
+            _check_unit(name, getattr(self, name))
+        if abs(self.pass_rate - self.solved / self.runs) > 1e-9:
+            raise ContractError(f"pass_rate {self.pass_rate} is not solved / runs ({self.solved}/{self.runs})")
+        if not self.pass_ci_low - 1e-9 <= self.pass_rate <= self.pass_ci_high + 1e-9:
+            raise ContractError("the pass-rate interval must contain pass_rate")
+        for name in ("cost_per_solved", "cost_per_run", "avg_wall_s"):
+            _check_non_negative(name, getattr(self, name))
+
+
+@dataclass(frozen=True, kw_only=True)
+class TargetDecision(_Model):
+    """The winning harness x model of a run (ADR 0013), as a versionable file. It holds no command, env, secret or
+    path: only what names the target, the run it was measured in, the constraints given and the evidence."""
+
+    schema_version: str = SCHEMA_VERSION
+    harness: str
+    model: str
+    run_id: str
+    config_sha256: str
+    suite_version: str
+    cost_source: str
+    constraints: Mapping[str, float]
+    evidence: Evidence
+
+    DECODERS: ClassVar[Mapping[str, Callable[[Any], Any]]] = {"evidence": Evidence.from_dict}
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _check_schema_version(self.schema_version)
+        for name in ("harness", "model", "suite_version"):
+            if not getattr(self, name):
+                raise ContractError(f"TargetDecision.{name} must not be empty")
+        if _RUN_ID_RE.fullmatch(self.run_id) is None:
+            raise ContractError(f"TargetDecision.run_id must match {_RUN_ID_RE.pattern}")
+        if self.cost_source not in COST_SOURCE_NAMES:
+            raise ContractError(f"TargetDecision.cost_source must be one of {', '.join(COST_SOURCE_NAMES)}")
+        if _SHA256_RE.fullmatch(self.config_sha256) is None:
+            raise ContractError(f"TargetDecision.config_sha256 must match {_SHA256_RE.pattern}")
+        unknown = sorted(set(self.constraints) - set(CONSTRAINT_KEYS))
+        if unknown:
+            raise ContractError(f"TargetDecision.constraints: unknown constraint(s) {unknown}")
+        for key, value in self.constraints.items():
+            if key == "min_pass_rate":
+                _check_unit(key, value)
+            else:
+                _check_non_negative(key, value)
+        # A private read-only copy: the caller's dict cannot change a frozen model afterwards.
+        object.__setattr__(self, "constraints", MappingProxyType(dict(self.constraints)))
 ```
 
 `hbench/core/schema.py`:
@@ -2705,7 +2787,7 @@ import math
 from collections.abc import Mapping
 from typing import Any
 
-from hbench.core.models import SCHEMA_VERSION, CostSource, TrialStatus
+from hbench.core.models import CONSTRAINT_KEYS, SCHEMA_VERSION, CostSource, TrialStatus
 
 _ID_BASE = "https://harness-bench.local/schema"
 _DIALECT = "https://json-schema.org/draft/2020-12/schema"
@@ -2866,9 +2948,68 @@ TRIAL_SPEC_SCHEMA: dict[str, Any] = {
 }
 
 
+_RATE: dict[str, Any] = {"type": "number", "minimum": 0, "maximum": 1}
+
+_EVIDENCE = _object(
+    {
+        "runs": {"type": "integer", "minimum": 1},
+        "solved": _COUNT,
+        "pass_rate": _RATE,
+        "pass_ci_low": _RATE,
+        "pass_ci_high": _RATE,
+        "cost_per_solved": _COST,
+        "cost_per_run": _COST,
+        "avg_wall_s": _COST,
+    },
+    ["runs", "solved", "pass_rate", "pass_ci_low", "pass_ci_high", "cost_per_solved", "cost_per_run", "avg_wall_s"],
+)
+
+TARGET_DECISION_SCHEMA: dict[str, Any] = {
+    "$schema": _DIALECT,
+    "$id": f"{_ID_BASE}/target_decision/{SCHEMA_VERSION}",
+    "title": "Target decision",
+    "$defs": {"evidence": _EVIDENCE},
+    **_object(
+        {
+            "schema_version": _STRING,
+            "harness": _STRING,
+            "model": _STRING,
+            "run_id": _STRING,
+            "config_sha256": _STRING,
+            "suite_version": _STRING,
+            "cost_source": _STRING,
+            "constraints": _object(
+                {
+                    key: {"type": "number", "minimum": 0, **({"maximum": 1} if key == "min_pass_rate" else {})}
+                    for key in CONSTRAINT_KEYS
+                },
+                [],
+            ),
+            "evidence": {"$ref": "#/$defs/evidence"},
+        },
+        [
+            "schema_version",
+            "harness",
+            "model",
+            "run_id",
+            "config_sha256",
+            "suite_version",
+            "cost_source",
+            "constraints",
+            "evidence",
+        ],
+    ),
+}
+
+
 def schema_document() -> dict[str, Any]:
     """All schemas in one document, as `schema export` prints it."""
-    return {"trial": TRIAL_SCHEMA, "run": RUN_SCHEMA, "trial_spec": TRIAL_SPEC_SCHEMA}
+    return {
+        "trial": TRIAL_SCHEMA,
+        "run": RUN_SCHEMA,
+        "trial_spec": TRIAL_SPEC_SCHEMA,
+        "target_decision": TARGET_DECISION_SCHEMA,
+    }
 
 
 # ---------------------------------------------------------------- validator
@@ -5000,12 +5141,13 @@ __all__ = ["GRADERS", "GRADER_GROUP", "GradePlan", "grade_plan", "grader_for"]
 """Plugins through entry points (ADR 0007, decision 7).
 
 Third-party packages register a factory `(config) -> HarnessRunner | Grader | redactor` in the groups
-`harness_bench.runners`, `harness_bench.graders`, `harness_bench.redactors`, `harness_bench.sandboxes` and
-`harness_bench.sinks` (a redactor is a callable `(text: str) -> str` that runs on an artifact before it is sent to
-the judge; a sandbox factory takes the `sandbox` section and returns a `Sandbox`, ADR 0010; a sink factory takes one
-entry of the `sinks` list and returns a `Sink`, ADR 0011). Built-in names always win: callers
-only come here for a name that is not built in, so a plain run never imports third-party code. Every failure is a
-`PluginError` with a message that names the plugin, never a traceback from the engine.
+`harness_bench.runners`, `harness_bench.graders`, `harness_bench.redactors`, `harness_bench.sandboxes`,
+`harness_bench.sinks` and `harness_bench.importers`. A redactor is a callable `(text: str) -> str` that runs on an
+artifact before it is sent to the judge; a sandbox factory takes the `sandbox` section and returns a `Sandbox`
+(ADR 0010); a sink factory takes one entry of the `sinks` list and returns a `Sink` (ADR 0011); an importer factory
+takes an empty config and returns a callable that writes a suite from a local checkout (ADR 0013). Built-in names
+always win: callers only come here for a name that is not built in, so a plain run never imports third-party code.
+Every failure is a `PluginError` with a message that names the plugin, never a traceback from the engine.
 """
 
 from collections.abc import Callable, Collection, Mapping
@@ -5017,6 +5159,7 @@ GRADER_GROUP = "harness_bench.graders"
 REDACTOR_GROUP = "harness_bench.redactors"
 SANDBOX_GROUP = "harness_bench.sandboxes"
 SINK_GROUP = "harness_bench.sinks"
+IMPORTER_GROUP = "harness_bench.importers"
 
 
 class PluginError(ValueError):
@@ -6643,7 +6786,7 @@ from typing import IO, Any, Self, TextIO
 from hbench.core.models import ContractError, Costs, RunInfo, TrialResult
 
 
-def _atomic_write(path: Path, text: str) -> None:
+def atomic_write(path: Path, text: str) -> None:
     """Write via a private temp file in the same directory, then replace, so readers never see a partial file.
 
     The file keeps the permissions of the one it replaces; a new file is 0644 like other result files."""
@@ -6784,7 +6927,7 @@ class RunWriter:
     def _drop_partial_last_line(self) -> None:
         text = self.trials_path.read_text() if self.trials_path.exists() else ""
         if text and not text.endswith("\n"):
-            _atomic_write(self.trials_path, text[: text.rfind("\n") + 1])
+            atomic_write(self.trials_path, text[: text.rfind("\n") + 1])
 
     def trials(self) -> list[TrialResult]:
         """The trials written so far. Raises `ResumeError` when `trials.jsonl` holds anything else."""
@@ -6823,7 +6966,7 @@ class RunWriter:
         self._write_info()
 
     def _write_info(self) -> None:
-        _atomic_write(self.run_dir / "run.json", json.dumps(self.info.to_dict(), indent=2) + "\n")
+        atomic_write(self.run_dir / "run.json", json.dumps(self.info.to_dict(), indent=2) + "\n")
 
 
 def _line_trial_id(line: str) -> object:
@@ -6846,6 +6989,8 @@ def read_run(run_dir: Path) -> tuple[RunInfo, list[TrialResult]]:
         return info, [TrialResult.from_dict(json.loads(line)) for line in lines if line.strip()]
     except FileNotFoundError as e:
         raise ResumeError(f"{run_dir} is not a run directory: {e.filename} does not exist") from e
+    except OSError as e:  # a file instead of a directory, no permission
+        raise ResumeError(f"{run_dir} cannot be read ({e.strerror or e})") from e
     except ValueError as e:  # ContractError and json.JSONDecodeError are both ValueErrors
         raise ResumeError(f"{run_dir} is not valid run data: {e}") from e
 
@@ -6910,7 +7055,7 @@ def apply_gateway_costs(out_dir: Path, costs_by_tag: Mapping[str, float]) -> int
             print(f"warning: {path} skipped, not valid trial data: {e}")
             continue
         if matched:
-            _atomic_write(path, "".join(json.dumps(t.to_dict()) + "\n" for t in trials))
+            atomic_write(path, "".join(json.dumps(t.to_dict()) + "\n" for t in trials))
             updated += matched
     return updated
 
@@ -6955,7 +7100,7 @@ class Heartbeat:
             "updated_at": datetime.now(UTC).isoformat(timespec="seconds"),
         }
         try:
-            _atomic_write(self.path, json.dumps(state, indent=2) + "\n")
+            atomic_write(self.path, json.dumps(state, indent=2) + "\n")
         except OSError as e:
             if not self._warned:
                 self._warned = True
@@ -8285,7 +8430,7 @@ def finish_run(config: Config, run_id: str, *, report: bool = True) -> RunInfo:
 `hbench/cli.py`:
 
 ```python
-"""The single command line: `python3 -m hbench {run,report,reconcile,schema export,suite list,suite validate}`.
+"""The single command line: `python3 -m hbench {run,report,reconcile,compare,recommend,gate,schema export,suite ...}`.
 
 `harness_bench.py` and `harness_bench_litellm.py` are shims over `main`. `--litellm` applies the LiteLLM
 profile (see `hbench.profiles`) and, for `run`, waits for the spend logs and reconciles afterwards.
@@ -8304,12 +8449,15 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from hbench import api
+from hbench import api, decide
 from hbench.calibration import calibrate, calibration_status, read_labels, write_calibration
+from hbench.core.models import RunInfo, TrialResult
 from hbench.core.schema import schema_document
 from hbench.doctor import run_checks
+from hbench.importers import ImportRequest, run_import
 from hbench.judge import JudgeError
 from hbench.profiles import apply_litellm_profile
+from hbench.report import COST_SOURCES
 from hbench.results import ResumeError, read_run
 from hbench.sinks.feed import SinkFeed
 from hbench.suites import Suite, SuiteError, load_suite, suite_label, suite_tasks
@@ -8325,12 +8473,17 @@ _DESCRIPTION = (
     "  python3 -m hbench schema export [--out PATH]       # JSON Schema of trials.jsonl and run.json\n"
     "  python3 -m hbench suite list     [--config C | PATH...]\n"
     "  python3 -m hbench suite validate [--config C] [--run [--allow-unsandboxed]] [PATH...]\n"
+    "  python3 -m hbench suite import exercism --source DIR --out SUITE_DIR --name N --version V --license L\n"
+    "                              --source-url URL [--exercise SLUG ...]   # a local clone in, a new suite out\n"
     "  python3 -m hbench judge calibrate --config C --labels LABELS.jsonl --out calibration.json\n"
     "  python3 -m hbench export    --config C --run RUN_DIR   # replay a run into the configured sinks\n"
     "  python3 -m hbench doctor    --config C [--network]   # check env, CLIs, image and network; spends nothing\n"
     "  python3 -m hbench plan      --config C [--only H...] [--reps N] [--run RUN_ID]   # a TrialSpec per line\n"
     "  python3 -m hbench run-trial --config C [--allow-unsandboxed] --spec FILE|-   # run one spec, print the result\n"
-    "  python3 -m hbench finish    --config C --run RUN_ID [--no-report]   # close the run, write the report\n\n"
+    "  python3 -m hbench finish    --config C --run RUN_ID [--no-report]   # close the run, write the report\n"
+    "  python3 -m hbench compare   RUN_A RUN_B [--alpha 0.05] [--json] [--fail-on-regression]   # run directories\n"
+    "  python3 -m hbench recommend RUN_DIR [--min-pass-rate P] [--max-cost-per-solved USD] [--write-target FILE]\n"
+    "  python3 -m hbench gate      RUN_DIR --min-pass-rate P (--target FILE | --harness H --model M)   # CI gate\n\n"
     "Add --litellm to run, report or reconcile for the LiteLLM-only benchmark."
 )
 
@@ -8350,6 +8503,40 @@ def _add_drop_saturated(p: argparse.ArgumentParser) -> None:
         action="store_true",
         help="leave out tasks every non-null run solved before building the report",
     )
+
+
+def _add_cost_source(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--cost-source", choices=COST_SOURCES, help="which cost to use (default auto)")
+    p.add_argument("--litellm", action="store_true", help="use the LiteLLM (gateway) cost, as the LiteLLM report does")
+
+
+def _add_decision_commands(sub: Any) -> None:
+    """`compare`, `recommend` and `gate` (ADR 0013): they read run directories and need no config."""
+    compare = sub.add_parser("compare", help="compare two runs: ranking diff and paired regressions")
+    compare.add_argument("run_a", metavar="RUN_A", help="the baseline run directory: <output_dir>/<run_id>")
+    compare.add_argument("run_b", metavar="RUN_B", help="the run directory to check against the baseline")
+    _add_cost_source(compare)
+    compare.add_argument("--alpha", type=float, default=0.05, help="significance of the McNemar test (default 0.05)")
+    compare.add_argument("--json", action="store_true", help="print JSON instead of Markdown")
+    compare.add_argument(
+        "--fail-on-regression", action="store_true", help="exit 1 when a target regressed (default: exit 0)"
+    )
+    recommend = sub.add_parser("recommend", help="pick the cheapest target per solved task under constraints")
+    recommend.add_argument("run_dir", metavar="RUN_DIR")
+    _add_cost_source(recommend)
+    recommend.add_argument("--min-pass-rate", type=float, metavar="P", help="from 0 to 1")
+    recommend.add_argument("--max-cost-per-solved", type=float, metavar="USD")
+    recommend.add_argument("--max-cost-per-run", type=float, metavar="USD")
+    recommend.add_argument("--max-latency-s", type=float, metavar="S", help="average wall time per run")
+    recommend.add_argument("--json", action="store_true", help="print JSON instead of Markdown")
+    recommend.add_argument("--write-target", metavar="FILE", help="write the pick as a target file (JSON)")
+    gate = sub.add_parser("gate", help="CI gate: exit 1 when the target's pass rate on a suite is too low")
+    gate.add_argument("run_dir", metavar="RUN_DIR")
+    gate.add_argument("--min-pass-rate", type=float, required=True, metavar="P", help="from 0 to 1")
+    gate.add_argument("--suite", default="regression", help="suite name whose tasks are gated (default regression)")
+    gate.add_argument("--target", metavar="FILE", help="a target file written by `recommend --write-target`")
+    gate.add_argument("--harness")
+    gate.add_argument("--model")
 
 
 def _prog() -> str:
@@ -8419,6 +8606,17 @@ def build_parser(epilog: str | None = None) -> argparse.ArgumentParser:
         "--allow-unsandboxed", action="store_true", help="with --run: no sandbox (only inside a disposable VM)"
     )
     validate.add_argument("paths", nargs="*", metavar="PATH", help="suite directories")
+    import_cmd = suite_sub.add_parser(
+        "import", help="turn a local checkout of a task pack into a new suite (no network; review its license first)"
+    )
+    import_cmd.add_argument("importer", help="exercism, or the name of an importer plugin")
+    import_cmd.add_argument("--source", required=True, metavar="DIR", help="your local clone of the pack")
+    import_cmd.add_argument("--out", required=True, metavar="SUITE_DIR", help="a new directory; it must not exist")
+    import_cmd.add_argument("--name", required=True, help="suite name (a-z, 0-9 and -)")
+    import_cmd.add_argument("--version", required=True, metavar="MAJOR.MINOR.PATCH")
+    import_cmd.add_argument("--license", required=True, metavar="SPDX", help="license of the pack, for provenance")
+    import_cmd.add_argument("--source-url", required=True, metavar="URL", help="https:// URL of the pack's repository")
+    import_cmd.add_argument("--exercise", nargs="+", default=[], metavar="SLUG", help="only these exercises")
     doctor = sub.add_parser("doctor", help="check that the benchmark can run; starts no agent and spends nothing")
     doctor.add_argument("--config", required=True)
     doctor.add_argument(
@@ -8444,6 +8642,7 @@ def build_parser(epilog: str | None = None) -> argparse.ArgumentParser:
     _add_config(finish_cmd)
     finish_cmd.add_argument("--run", required=True, metavar="RUN_ID")
     finish_cmd.add_argument("--no-report", action="store_true", help="do not write summary.md and summary.csv")
+    _add_decision_commands(sub)
     judge = sub.add_parser("judge", help="LLM judge tools")
     judge_sub = judge.add_subparsers(dest="judge_cmd", required=True)
     calibrate_cmd = judge_sub.add_parser(
@@ -8546,7 +8745,30 @@ def _suite_check_behavior(engine: ModuleType, suites: list[Suite], cfg: dict[str
     return ok
 
 
+def _suite_import(args: argparse.Namespace) -> None:
+    """`suite import`: write a new suite from a local checkout; nothing is left behind when it fails."""
+    request = ImportRequest(
+        source=Path(args.source),
+        out=Path(args.out),
+        name=args.name,
+        version=args.version,
+        license=args.license,
+        source_url=args.source_url,
+        exercises=tuple(args.exercise),
+    )
+    try:
+        suite = run_import(args.importer, request)
+    except ValueError as e:  # ImporterError and PluginError
+        sys.exit(f"suite import: {e}")
+    count = len(suite.tasks)
+    print(f"imported {count} {'task' if count == 1 else 'tasks'} into {request.out}")
+    print(f"next: python3 -m hbench suite validate --run --allow-unsandboxed {request.out}")
+
+
 def _suite(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.suite_cmd == "import":
+        _suite_import(args)
+        return
     dirs, cfg, base = _suite_inputs(parser, args)
     if args.suite_cmd == "list":
         _suite_list(dirs)
@@ -8682,6 +8904,101 @@ def _finish(args: argparse.Namespace) -> None:
         print(f"reconcile, then report: python3 -m hbench reconcile --litellm --config {args.config}")
 
 
+def _read_run_or_exit(command: str, path: str) -> tuple[RunInfo, list[TrialResult]]:
+    try:
+        return read_run(Path(path).resolve())
+    except ResumeError as e:
+        sys.exit(f"{command}: {e}")
+
+
+def _cost_source(parser: argparse.ArgumentParser, args: argparse.Namespace) -> str:
+    """The cost source of `--cost-source` / `--litellm`, which exclude each other."""
+    if args.litellm:
+        if args.cost_source:
+            parser.error("--cost-source cannot be combined with --litellm (the cost always comes from LiteLLM)")
+        return "litellm"
+    return str(args.cost_source or "auto")
+
+
+def _compare(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """`compare`: print the comparison; exit 1 on a regression only with `--fail-on-regression`."""
+    source = _cost_source(parser, args)
+    runs = [_read_run_or_exit("compare", path) for path in (args.run_a, args.run_b)]
+    try:
+        comparison = decide.compare(runs[0], runs[1], source, args.alpha)
+    except ValueError as e:
+        sys.exit(f"compare: {e}")
+    if args.json:
+        print(json.dumps(comparison.to_dict(), indent=2, sort_keys=True, allow_nan=False))
+    else:
+        print(decide.render_comparison(comparison), end="")
+    if args.fail_on_regression and comparison.has_regression:
+        sys.exit(1)
+
+
+def _recommend(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """`recommend`: print every target with the constraints it failed and the pick; exit 1 without an eligible one."""
+    source = _cost_source(parser, args)
+    info, trials = _read_run_or_exit("recommend", args.run_dir)
+    try:
+        constraints = decide.Constraints(
+            min_pass_rate=args.min_pass_rate,
+            max_cost_per_solved=args.max_cost_per_solved,
+            max_cost_per_run=args.max_cost_per_run,
+            max_latency_s=args.max_latency_s,
+        )
+        recommendation = decide.recommend(info, trials, constraints, source)
+        output = (
+            json.dumps(decide.recommendation_json(recommendation), indent=2, sort_keys=True, allow_nan=False)
+            if args.json
+            else decide.render_recommendation(recommendation).rstrip("\n")
+        )
+        # A run.json of another tool may carry a run_id the decision file refuses: say so before printing or writing.
+        decision = decide.decision_for(recommendation) if recommendation.pick and args.write_target else None
+    except ValueError as e:  # ContractError too
+        sys.exit(f"recommend: {e}")
+    print(output)
+    if recommendation.pick is None:
+        sys.exit("recommend: no eligible target")
+    if decision is not None:
+        try:
+            decide.write_target(Path(args.write_target), decision)
+        except decide.TargetFileError as e:
+            sys.exit(f"recommend: {e}")
+        print(f"wrote {args.write_target}", file=sys.stderr)
+
+
+def _gate(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """`gate`: exit 1 (with the reason on stderr) unless the target meets the pass rate; it fails closed."""
+    if args.target:
+        if args.harness or args.model:
+            parser.error("give --target or --harness and --model, not both")
+        try:
+            decision = decide.load_target(Path(args.target))
+        except decide.TargetFileError as e:
+            sys.exit(f"gate: {e}")
+        harness, model = decision.harness, decision.model
+    elif args.harness and args.model:
+        harness, model = args.harness, args.model
+    else:
+        parser.error("give --target, or both --harness and --model")
+    info, trials = _read_run_or_exit("gate", args.run_dir)
+    try:
+        result = decide.gate(info, trials, harness, model, args.suite, args.min_pass_rate)
+    except ValueError as e:
+        sys.exit(f"gate: {e}")
+    if not result.ok:
+        sys.exit(f"gate: {result.message}")
+    print(f"gate: {result.message}")
+
+
+_DECISION_COMMANDS: Mapping[str, Callable[[argparse.ArgumentParser, argparse.Namespace], None]] = {
+    "compare": _compare,
+    "recommend": _recommend,
+    "gate": _gate,
+}
+
+
 def _run_litellm(engine: ModuleType, args: argparse.Namespace, cfg: dict[str, Any], base: Path) -> None:
     """`run` under the LiteLLM profile: report only after reconcile, when the gateway cost exists."""
     engine.cmd_run(args, cfg, base)
@@ -8719,6 +9036,9 @@ def main(argv: Sequence[str] | None = None, *, epilog: str | None = None) -> Non
         return
     if args.cmd == "doctor":
         _doctor(args)
+        return
+    if args.cmd in _DECISION_COMMANDS:
+        _DECISION_COMMANDS[args.cmd](parser, args)
         return
     if args.cmd in _ORCHESTRATOR_COMMANDS:
         _ORCHESTRATOR_COMMANDS[args.cmd](args)
@@ -10315,6 +10635,70 @@ def main() -> None:
             and (tmp / "results-plan" / plan_run_id / "trials.jsonl").read_text() == before,
             "run-trial: a spec of another config is refused and writes nothing",
         )
+
+        # --- decision commands (ADR 0013): compare, recommend --write-target and gate on two runs, the second regressed
+        plan_dir = tmp / "results-plan" / plan_run_id
+        base_info = json.loads((plan_dir / "run.json").read_text())
+        base_trials = results(plan_dir / "trials.jsonl")
+
+        def decision_run(run_id: str, regressed: str | None) -> Path:
+            run_dir = tmp / "results-decide" / run_id
+            run_dir.mkdir(parents=True)
+            lines = []
+            for trial in base_trials:
+                for i in range(6):
+                    row = dict(
+                        trial, run_id=run_id, task_id=f"regression/t{i}", trial_id=f"{i:02d}{trial['trial_id'][2:]}"
+                    )
+                    if trial["target"]["harness"] == regressed:
+                        row["status"] = "failed"
+                    lines.append(json.dumps(row))
+            (run_dir / "trials.jsonl").write_text("\n".join(lines) + "\n")
+            (run_dir / "run.json").write_text(json.dumps(dict(base_info, run_id=run_id)))
+            return run_dir
+
+        good_run = decision_run("a" * 32, None)
+        regressed_run = decision_run("b" * 32, "claude")
+        p = subprocess.run(
+            [PY, "-m", "hbench", "compare", str(good_run), str(regressed_run)], cwd=tmp, capture_output=True, text=True
+        )
+        check(p.returncode == 0 and "claude/fix: b=6" in p.stdout, "compare: the regressed target is reported, exit 0")
+        p = subprocess.run(
+            [PY, "-m", "hbench", "compare", str(good_run), str(regressed_run), "--fail-on-regression"],
+            cwd=tmp,
+            capture_output=True,
+            text=True,
+        )
+        check(p.returncode == 1, "compare --fail-on-regression: exit 1 on a regression")
+        target_file = tmp / "target.json"
+        p = subprocess.run(
+            [
+                PY,
+                "-m",
+                "hbench",
+                "recommend",
+                str(regressed_run),
+                "--min-pass-rate",
+                "0.9",
+                "--write-target",
+                str(target_file),
+            ],
+            cwd=tmp,
+            capture_output=True,
+            text=True,
+        )
+        picked = json.loads(target_file.read_text()) if target_file.exists() else {}
+        check(
+            p.returncode == 0 and picked.get("harness") not in (None, "claude", "opencode"),
+            "recommend --write-target: another target than the regressed one is written",
+        )
+        gate_cmd = [PY, "-m", "hbench", "gate", str(regressed_run), "--min-pass-rate", "0.9", "--suite", "regression"]
+        p = subprocess.run([*gate_cmd, "--target", str(target_file)], cwd=tmp, capture_output=True, text=True)
+        check(p.returncode == 0, "gate: the target file passes")
+        p = subprocess.run(
+            [*gate_cmd, "--harness", "claude", "--model", "fix"], cwd=tmp, capture_output=True, text=True
+        )
+        check(p.returncode == 1 and "below the minimum" in p.stderr, "gate: the regressed target fails")
 
         # --- config validation and URL policy
         for bad, why in (
@@ -13118,22 +13502,26 @@ if __name__ == "__main__":
 import copy
 import dataclasses
 import json
+import operator
 import pickle
 import unittest
 from types import MappingProxyType
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 import fixtures  # noqa: F401  (puts the repo root on sys.path)
 from hbench.core.ids import new_run_id, sha256_json, trial_id
 from hbench.core.models import (
+    COST_SOURCE_NAMES,
     SCHEMA_VERSION,
     ContractError,
     Costs,
     CostSource,
     GraderResult,
+    Evidence,
     RunInfo,
     Target,
+    TargetDecision,
     TrialResult,
     TrialSpec,
     TrialStatus,
@@ -13467,14 +13855,14 @@ class ToolCallsTests(unittest.TestCase):
         loaded = TrialResult.from_dict(d)
         self.assertEqual((loaded.usage.tool_calls, loaded.schema_version), (None, "1.0.0"))
 
-    def test_the_current_contract_version_is_1_4_0(self) -> None:
-        self.assertEqual((SCHEMA_VERSION, trial().schema_version), ("1.4.0", "1.4.0"))
+    def test_the_current_contract_version_is_1_5_0(self) -> None:
+        self.assertEqual((SCHEMA_VERSION, trial().schema_version), ("1.5.0", "1.5.0"))
 
-    def test_a_1_3_0_trial_and_run_still_load(self) -> None:
+    def test_a_1_4_0_trial_and_run_still_load(self) -> None:
         for obj in (trial(), run_info()):
             d = obj.to_dict()
-            d["schema_version"] = "1.3.0"
-            self.assertEqual(type(obj).from_dict(d).schema_version, "1.3.0")
+            d["schema_version"] = "1.4.0"
+            self.assertEqual(type(obj).from_dict(d).schema_version, "1.4.0")
 
 
 class RunRepsTests(unittest.TestCase):
@@ -13567,6 +13955,124 @@ def trial_spec(**overrides: Any) -> TrialSpec:
     return TrialSpec(**values)
 
 
+def evidence(**overrides: Any) -> Evidence:
+    values: dict[str, Any] = {
+        "runs": 6,
+        "solved": 5,
+        "pass_rate": 5 / 6,
+        "pass_ci_low": 0.43,
+        "pass_ci_high": 0.97,
+        "cost_per_solved": 0.12,
+        "cost_per_run": 0.1,
+        "avg_wall_s": 30.0,
+    }
+    values.update(overrides)
+    return Evidence(**values)
+
+
+def target_decision(**overrides: Any) -> TargetDecision:
+    values: dict[str, Any] = {
+        "harness": "claude",
+        "model": "sonnet",
+        "run_id": "a" * 32,
+        "config_sha256": "c" * 64,
+        "suite_version": "regression@1.0.0",
+        "cost_source": "auto",
+        "constraints": {"min_pass_rate": 0.5},
+        "evidence": evidence(),
+    }
+    values.update(overrides)
+    return TargetDecision(**values)
+
+
+class TargetDecisionTests(unittest.TestCase):
+    def test_a_decision_round_trips_through_json(self) -> None:
+        for decision in (
+            target_decision(),
+            target_decision(constraints={}, evidence=evidence(cost_per_solved=None, cost_per_run=None)),
+        ):
+            loaded = TargetDecision.from_dict(json.loads(json.dumps(decision.to_dict())))
+            self.assertEqual(loaded, decision)
+            self.assertEqual(loaded.schema_version, SCHEMA_VERSION)
+
+    def test_unknown_cost_stays_null_not_zero(self) -> None:
+        d = target_decision(evidence=evidence(cost_per_solved=None, cost_per_run=None)).to_dict()
+        self.assertEqual((d["evidence"]["cost_per_solved"], d["evidence"]["cost_per_run"]), (None, None))
+
+    def test_extra_and_missing_keys_are_refused(self) -> None:
+        extra = {**target_decision().to_dict(), "command": ["x"]}
+        nested = target_decision().to_dict()
+        nested["evidence"]["env"] = {}
+        missing = target_decision().to_dict()
+        del missing["run_id"]
+        for bad in (extra, nested, missing):
+            with self.assertRaises(ContractError):
+                TargetDecision.from_dict(bad)
+
+    def test_a_forged_schema_version_is_refused(self) -> None:
+        for version in ("2.0.0", "abc"):
+            with self.assertRaises(ContractError):
+                TargetDecision.from_dict({**target_decision().to_dict(), "schema_version": version})
+
+    def test_evidence_is_validated(self) -> None:
+        bad_cases: list[dict[str, Any]] = [
+            {"pass_rate": 1.5},
+            {"pass_rate": -0.1},
+            {"pass_ci_low": 2.0},
+            {"pass_ci_high": -1.0},
+            {"cost_per_solved": -1.0},
+            {"cost_per_run": float("inf")},
+            {"avg_wall_s": float("nan")},
+            {"runs": 0},
+            {"solved": 7},
+            {"solved": -1},
+            {"runs": "6"},
+            {"pass_ci_low": 0.9},  # above the pass rate
+            {"pass_ci_high": 0.5},  # below the pass rate
+            {"pass_rate": 0.5},  # not solved / runs
+        ]
+        for overrides in bad_cases:
+            with self.subTest(overrides=overrides), self.assertRaises(ContractError):
+                evidence(**overrides)
+
+    def test_the_decision_is_validated(self) -> None:
+        bad_cases: list[dict[str, Any]] = [
+            {"harness": ""},
+            {"model": ""},
+            {"run_id": ""},
+            {"run_id": "r" * 32},
+            {"run_id": "a" * 31},
+            {"cost_source": "gateway"},
+            {"cost_source": "bogus"},
+            {"config_sha256": "short"},
+            {"suite_version": ""},
+            {"cost_source": ""},
+            {"constraints": {"min_pass_rate": 1.5}},
+            {"constraints": {"max_cost_per_run": -1.0}},
+            {"constraints": {"max_latency_s": float("inf")}},
+            {"constraints": {"command": 1.0}},
+            {"constraints": {"min_pass_rate": "x"}},
+        ]
+        for overrides in bad_cases:
+            with self.subTest(overrides=overrides), self.assertRaises(ContractError):
+                target_decision(**overrides)
+
+    def test_every_cost_source_the_commands_accept_is_valid(self) -> None:
+        from hbench.report import COST_SOURCES
+
+        self.assertEqual(tuple(COST_SOURCE_NAMES), COST_SOURCES)
+        for name in COST_SOURCE_NAMES:
+            self.assertEqual(target_decision(cost_source=name).cost_source, name)
+
+    def test_constraints_are_a_private_read_only_copy(self) -> None:
+        given = {"min_pass_rate": 0.5}
+        decision = target_decision(constraints=given)
+        given["min_pass_rate"] = 0.9
+        self.assertEqual(decision.constraints["min_pass_rate"], 0.5)
+        with self.assertRaises(TypeError):
+            operator.setitem(cast(Any, decision.constraints), "x", 1.0)
+
+
 class TrialSpecTests(unittest.TestCase):
     def test_a_spec_round_trips_through_json(self) -> None:
         spec = trial_spec()
@@ -13634,8 +14140,16 @@ from typing import Any
 
 import fixtures  # noqa: F401  (puts the repo root on sys.path)
 from hbench.core import models
-from hbench.core.schema import RUN_SCHEMA, TRIAL_SCHEMA, TRIAL_SPEC_SCHEMA, check_schema, schema_document, validate
-from test_core_models import run_info, trial, trial_spec
+from hbench.core.schema import (
+    RUN_SCHEMA,
+    TARGET_DECISION_SCHEMA,
+    TRIAL_SCHEMA,
+    TRIAL_SPEC_SCHEMA,
+    check_schema,
+    schema_document,
+    validate,
+)
+from test_core_models import run_info, target_decision, trial, trial_spec
 
 
 class ValidateContractTests(unittest.TestCase):
@@ -13715,9 +14229,28 @@ class ValidateContractTests(unittest.TestCase):
     def test_schema_document_holds_both_schemas_with_ids(self) -> None:
         doc = schema_document()
         self.assertEqual((doc["trial"], doc["run"], doc["trial_spec"]), (TRIAL_SCHEMA, RUN_SCHEMA, TRIAL_SPEC_SCHEMA))
-        self.assertTrue(TRIAL_SCHEMA["$id"].endswith("/trial/1.4.0"))
-        self.assertTrue(RUN_SCHEMA["$id"].endswith("/run/1.4.0"))
-        self.assertTrue(TRIAL_SPEC_SCHEMA["$id"].endswith("/trial_spec/1.4.0"))
+        self.assertTrue(TRIAL_SCHEMA["$id"].endswith("/trial/1.5.0"))
+        self.assertTrue(RUN_SCHEMA["$id"].endswith("/run/1.5.0"))
+        self.assertTrue(TRIAL_SPEC_SCHEMA["$id"].endswith("/trial_spec/1.5.0"))
+        self.assertTrue(TARGET_DECISION_SCHEMA["$id"].endswith("/target_decision/1.5.0"))
+        self.assertEqual(doc["target_decision"], TARGET_DECISION_SCHEMA)
+
+    def test_a_target_decision_validates_and_a_forged_one_does_not(self) -> None:
+        self.assertEqual(validate(target_decision().to_dict(), TARGET_DECISION_SCHEMA), [])
+        forged = {**target_decision().to_dict(), "command": ["x"]}
+        self.assertEqual(validate(forged, TARGET_DECISION_SCHEMA), ["$.command: unexpected property"])
+        bad = target_decision().to_dict()
+        bad["evidence"]["pass_rate"] = 2
+        self.assertEqual(validate(bad, TARGET_DECISION_SCHEMA), ["$.evidence.pass_rate: must be <= 1"])
+        bad_constraint = target_decision().to_dict()
+        bad_constraint["constraints"]["min_pass_rate"] = "x"
+        self.assertEqual(
+            validate(bad_constraint, TARGET_DECISION_SCHEMA), ["$.constraints.min_pass_rate: expected number"]
+        )
+        above = target_decision().to_dict()
+        above["constraints"]["min_pass_rate"] = 1.5
+        self.assertEqual(validate(above, TARGET_DECISION_SCHEMA), ["$.constraints.min_pass_rate: must be <= 1"])
+        self.assertEqual(check_schema(TARGET_DECISION_SCHEMA), TARGET_DECISION_SCHEMA)
 
     def test_a_trial_spec_validates_and_a_forged_one_does_not(self) -> None:
         self.assertEqual(validate(trial_spec().to_dict(), TRIAL_SPEC_SCHEMA), [])
@@ -13828,6 +14361,8 @@ class SchemaMatchesModelsTests(unittest.TestCase):
         (models.Costs, TRIAL_SCHEMA, "costs"),
         (models.RunInfo, RUN_SCHEMA, None),
         (models.TrialSpec, TRIAL_SPEC_SCHEMA, None),
+        (models.TargetDecision, TARGET_DECISION_SCHEMA, None),
+        (models.Evidence, TARGET_DECISION_SCHEMA, "evidence"),
         (models.Target, RUN_SCHEMA, "target"),
     )
 
@@ -15038,6 +15573,7 @@ if __name__ == "__main__":
 
 import contextlib
 import copy
+import dataclasses
 import importlib
 import io
 import json
@@ -15051,9 +15587,12 @@ from unittest import mock
 
 import fixtures
 from hbench import cli
+from hbench.core.models import TrialResult
 from hbench.core.schema import schema_document
 from hbench.profiles import apply_litellm_profile
 from test_api import ApiTestCase
+from test_core_models import T0, run_info
+from test_decide import make, null_trial
 from test_litellm import ScriptedServer, ok
 
 ROOT = fixtures.ROOT
@@ -15584,6 +16123,158 @@ class OrchestratorCommandTests(ApiTestCase):
             ):
                 hbl.main()
             cli_main.assert_called_once_with([command, "--litellm", "--config", "c"], epilog=mock.ANY)
+
+
+class DecisionCommandTests(unittest.TestCase):
+    """`compare`, `recommend` and `gate` (ADR 0013) on run directories written from contract objects."""
+
+    def setUp(self) -> None:
+        self.root = fixtures.tmpdir(self)
+
+    def write_run(self, run_id: str, trials: list[TrialResult], *, finished: bool = True) -> str:
+        targets = tuple(sorted({t.target for t in trials}, key=lambda t: t.harness))
+        info = run_info(run_id=run_id, finished_at=T0 if finished else None, targets=targets)
+        run_dir = self.root / run_id
+        run_dir.mkdir()
+        (run_dir / "run.json").write_text(json.dumps(info.to_dict()))
+        lines = (json.dumps(dataclasses.replace(t, run_id=run_id).to_dict()) for t in trials)
+        (run_dir / "trials.jsonl").write_text("".join(f"{line}\n" for line in lines))
+        return str(run_dir)
+
+    def runs(self) -> tuple[str, str]:
+        """Run A: x and y solve six tasks. Run B: x solves none (a regression), y still solves all."""
+        tasks = [f"regression/t{i}" for i in range(6)]
+        a = [make(h, "m", t, True, cost=c) for h, c in (("x", 0.2), ("y", 0.4)) for t in tasks]
+        b = [make("x", "m", t, False, cost=0.2) for t in tasks] + [make("y", "m", t, True, cost=0.4) for t in tasks]
+        return self.write_run("a" * 32, a), self.write_run("b" * 32, b)
+
+    def main(self, *argv: str) -> tuple[str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            cli.main(list(argv))
+        return out.getvalue(), err.getvalue()
+
+    def fails(self, *argv: str) -> object:
+        with self.assertRaises(SystemExit) as cm:
+            self.main(*argv)
+        return cm.exception.code
+
+    def test_the_regressed_target_is_reported_and_the_exit_code_is_opt_in(self) -> None:
+        run_a, run_b = self.runs()
+        out, _ = self.main("compare", run_a, run_b)
+        self.assertIn("## Regressions", out)
+        self.assertIn("- x/m: b=6", out)
+        self.assertEqual(self.fails("compare", run_a, run_b, "--fail-on-regression"), 1)
+        clean, _ = self.main("compare", run_a, run_a, "--fail-on-regression")
+        self.assertIn("No regression.", clean)
+
+    def test_a_target_that_breaks_completely_fails_the_compare_gate(self) -> None:
+        tasks = [f"regression/t{i}" for i in range(6)]
+        good = self.write_run("a" * 32, [make("x", "m", t, True) for t in tasks])
+        silent = [null_trial(t, harness="x") for t in tasks]
+        broken = self.write_run("b" * 32, silent)
+        self.assertEqual(self.fails("compare", good, broken, "--fail-on-regression"), 1)
+
+    def test_compare_json_is_valid_and_deterministic(self) -> None:
+        run_a, run_b = self.runs()
+        first, _ = self.main("compare", run_a, run_b, "--json", "--alpha", "0.01")
+        second, _ = self.main("compare", run_a, run_b, "--json", "--alpha", "0.01")
+        self.assertEqual(first, second)
+        self.assertEqual(json.loads(first)["alpha"], 0.01)
+
+    def test_a_run_directory_that_is_a_file_or_unreadable_exits_with_a_message(self) -> None:
+        plain = self.root / "plain.txt"
+        plain.write_text("x")
+        self.assertIn(
+            "cannot be read",
+            str(self.fails("gate", str(plain), "--harness", "a", "--model", "b", "--min-pass-rate", "0.5")),
+        )
+        run_a, _ = self.runs()
+        os.chmod(run_a + "/run.json", 0)
+        self.addCleanup(os.chmod, run_a + "/run.json", 0o600)
+        if os.access(run_a + "/run.json", os.R_OK):  # running as root: permissions do not apply
+            return
+        self.assertIn("cannot be read", str(self.fails("recommend", run_a)))
+
+    def test_compare_errors_exit_with_a_message(self) -> None:
+        run_a, run_b = self.runs()
+        self.assertIn("not a run directory", str(self.fails("compare", run_a, str(self.root / "missing"))))
+        self.assertIn("alpha", str(self.fails("compare", run_a, run_b, "--alpha", "2")))
+        self.assertEqual(self.fails("compare", run_a, run_b, "--litellm", "--cost-source", "computed"), 2)
+
+    def test_litellm_forces_the_gateway_cost_source(self) -> None:
+        run_a, run_b = self.runs()
+        out, _ = self.main("compare", run_a, run_b, "--litellm", "--json")
+        self.assertEqual(json.loads(out)["cost_source"], "litellm")
+        out, _ = self.main("compare", run_a, run_b, "--json", "--cost-source", "computed")
+        self.assertEqual(json.loads(out)["cost_source"], "computed")
+
+    def test_the_switch_story_from_two_runs_to_a_passing_gate(self) -> None:
+        run_a, run_b = self.runs()
+        target = self.root / "target.json"
+        out, err = self.main("recommend", run_b, "--min-pass-rate", "0.9", "--write-target", str(target))
+        self.assertIn("**Pick:** y/m", out)
+        self.assertIn(f"wrote {target}", err)
+        decision = json.loads(target.read_text())
+        self.assertEqual((decision["harness"], decision["constraints"]), ("y", {"min_pass_rate": 0.9}))
+        gate_out, _ = self.main("gate", run_b, "--target", str(target), "--min-pass-rate", "0.9")
+        self.assertIn("gate: y/m on suite 'regression': pass rate 100%", gate_out)
+        message = str(self.fails("gate", run_b, "--harness", "x", "--model", "m", "--min-pass-rate", "0.9"))
+        self.assertIn("below the minimum 90%", message)
+
+    def test_recommend_json_and_no_eligible_target(self) -> None:
+        _, run_b = self.runs()
+        target = self.root / "target.json"
+        out, _ = self.main("recommend", run_b, "--json", "--max-cost-per-run", "1")
+        self.assertEqual(json.loads(out)["pick"]["harness"], "y")
+        code = self.fails(
+            "recommend", run_b, "--min-pass-rate", "1", "--max-latency-s", "1", "--write-target", str(target)
+        )
+        self.assertEqual(code, "recommend: no eligible target")
+        self.assertFalse(target.exists())
+
+    def test_a_legacy_run_id_gives_a_message_and_writes_nothing(self) -> None:
+        run = self.write_run("legacy-run", [make("x", "m", "regression/t0", True)])
+        target = self.root / "target.json"
+        for extra in (["--json"], ["--write-target", str(target)]):
+            with self.subTest(extra=extra):
+                code = str(self.fails("recommend", run, *extra))
+                self.assertIn("recommend: ", code)
+                self.assertIn("run_id", code)
+        self.assertFalse(target.exists())
+        out, _ = self.main("recommend", run)  # the plain report needs no decision
+        self.assertIn("**Pick:** x/m", out)
+
+    def test_recommend_errors_exit_with_a_message(self) -> None:
+        _, run_b = self.runs()
+        self.assertIn("min_pass_rate", str(self.fails("recommend", run_b, "--min-pass-rate", "2")))
+        self.assertIn("not a run directory", str(self.fails("recommend", str(self.root / "missing"))))
+        link = self.root / "link.json"
+        link.symlink_to(self.root / "elsewhere")
+        self.assertIn("symlink", str(self.fails("recommend", run_b, "--write-target", str(link))))
+
+    def test_gate_fails_closed_and_reads_arguments_strictly(self) -> None:
+        run_a, run_b = self.runs()
+        unfinished = self.write_run("c" * 32, [make("x", "m", "regression/t0", True)], finished=False)
+        self.assertIn(
+            "not finished",
+            str(self.fails("gate", unfinished, "--harness", "x", "--model", "m", "--min-pass-rate", "0")),
+        )
+        bad = self.root / "bad.json"
+        bad.write_text(json.dumps({"harness": "x"}))
+        self.assertIn("target file", str(self.fails("gate", run_b, "--target", str(bad), "--min-pass-rate", "0.5")))
+        self.assertIn(
+            "min_pass_rate", str(self.fails("gate", run_b, "--harness", "x", "--model", "m", "--min-pass-rate", "2"))
+        )
+        self.assertEqual(self.fails("gate", run_b, "--harness", "x", "--min-pass-rate", "0.5"), 2)
+        self.assertEqual(self.fails("gate", run_b, "--target", str(bad), "--harness", "x", "--min-pass-rate", "0.5"), 2)
+        self.assertIn(
+            "not a run directory",
+            str(self.fails("gate", str(self.root / "no"), "--harness", "x", "--model", "m", "--min-pass-rate", "0")),
+        )
+        self.assertIn(
+            "pass rate 100%", self.main("gate", run_a, "--harness", "x", "--model", "m", "--min-pass-rate", "1")[0]
+        )
 
 
 class ShimMainTests(unittest.TestCase):
@@ -19580,7 +20271,7 @@ class FakeDockerRunTests(RunTestCase):
                 trial["image_digest"],
                 trial["schema_version"],
             ),
-            (f"docker:{IMAGE}", True, "1.4.0", f"sha256:{DIGEST}", "1.4.0"),
+            (f"docker:{IMAGE}", True, "1.5.0", f"sha256:{DIGEST}", "1.5.0"),
         )
 
     def test_a_container_that_outlives_the_timeout_is_removed_before_the_next_step(self) -> None:
@@ -19840,7 +20531,7 @@ class HeartbeatTests(unittest.TestCase):
     def test_a_write_that_fails_warns_once_and_the_beat_goes_on(self) -> None:
         path = fixtures.tmpdir(self) / HEARTBEAT_FILE
         attempts: list[int] = []
-        real_write = results._atomic_write
+        real_write = results.atomic_write
 
         def flaky(target: Path, text: str) -> None:
             attempts.append(1)
@@ -19849,7 +20540,7 @@ class HeartbeatTests(unittest.TestCase):
             real_write(target, text)
 
         stderr = io.StringIO()
-        with mock.patch.object(results, "_atomic_write", flaky), contextlib.redirect_stderr(stderr):
+        with mock.patch.object(results, "atomic_write", flaky), contextlib.redirect_stderr(stderr):
             with Heartbeat(path, interval=0.02) as heartbeat:
                 heartbeat.beat("t", "agent")  # a phase change on the main thread fails too, and must not raise
                 deadline = time.time() + 30

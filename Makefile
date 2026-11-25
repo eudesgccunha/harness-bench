@@ -66,7 +66,7 @@ security: ## bandit + gitleaks (missing gitleaks fails only when CI is set)
 	fi
 
 actionlint: ## Lint the GitHub workflow and the example workflow of the adapters
-	$(UV_RUN) actionlint .github/workflows/ci.yml adapters/github-actions/benchmark.yml
+	$(UV_RUN) actionlint .github/workflows/ci.yml adapters/github-actions/benchmark.yml adapters/github-actions/regression-gate.yml
 
 docs: ## Regenerate HARNESS_BENCH.md
 	$(PYTHON) scripts/build_md.py

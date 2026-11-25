@@ -25,7 +25,7 @@ from typing import IO, Any, Self, TextIO
 from hbench.core.models import ContractError, Costs, RunInfo, TrialResult
 
 
-def _atomic_write(path: Path, text: str) -> None:
+def atomic_write(path: Path, text: str) -> None:
     """Write via a private temp file in the same directory, then replace, so readers never see a partial file.
 
     The file keeps the permissions of the one it replaces; a new file is 0644 like other result files."""
@@ -166,7 +166,7 @@ class RunWriter:
     def _drop_partial_last_line(self) -> None:
         text = self.trials_path.read_text() if self.trials_path.exists() else ""
         if text and not text.endswith("\n"):
-            _atomic_write(self.trials_path, text[: text.rfind("\n") + 1])
+            atomic_write(self.trials_path, text[: text.rfind("\n") + 1])
 
     def trials(self) -> list[TrialResult]:
         """The trials written so far. Raises `ResumeError` when `trials.jsonl` holds anything else."""
@@ -205,7 +205,7 @@ class RunWriter:
         self._write_info()
 
     def _write_info(self) -> None:
-        _atomic_write(self.run_dir / "run.json", json.dumps(self.info.to_dict(), indent=2) + "\n")
+        atomic_write(self.run_dir / "run.json", json.dumps(self.info.to_dict(), indent=2) + "\n")
 
 
 def _line_trial_id(line: str) -> object:
@@ -228,6 +228,8 @@ def read_run(run_dir: Path) -> tuple[RunInfo, list[TrialResult]]:
         return info, [TrialResult.from_dict(json.loads(line)) for line in lines if line.strip()]
     except FileNotFoundError as e:
         raise ResumeError(f"{run_dir} is not a run directory: {e.filename} does not exist") from e
+    except OSError as e:  # a file instead of a directory, no permission
+        raise ResumeError(f"{run_dir} cannot be read ({e.strerror or e})") from e
     except ValueError as e:  # ContractError and json.JSONDecodeError are both ValueErrors
         raise ResumeError(f"{run_dir} is not valid run data: {e}") from e
 
@@ -292,7 +294,7 @@ def apply_gateway_costs(out_dir: Path, costs_by_tag: Mapping[str, float]) -> int
             print(f"warning: {path} skipped, not valid trial data: {e}")
             continue
         if matched:
-            _atomic_write(path, "".join(json.dumps(t.to_dict()) + "\n" for t in trials))
+            atomic_write(path, "".join(json.dumps(t.to_dict()) + "\n" for t in trials))
             updated += matched
     return updated
 
@@ -337,7 +339,7 @@ class Heartbeat:
             "updated_at": datetime.now(UTC).isoformat(timespec="seconds"),
         }
         try:
-            _atomic_write(self.path, json.dumps(state, indent=2) + "\n")
+            atomic_write(self.path, json.dumps(state, indent=2) + "\n")
         except OSError as e:
             if not self._warned:
                 self._warned = True

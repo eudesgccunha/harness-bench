@@ -1,0 +1,45 @@
+# Example for ADR 0013: gate a pull request on the regression suite. A run of the regression suite already exists
+# as an artifact of another workflow run (for example the `report` artifact of benchmark.yml); this job downloads it
+# from that GitHub Actions run (`source_workflow_run`, not the hbench run id) and exits 1 when the
+# target file in the repository (`recommend --write-target`) passes less than the minimum on that suite. It fails
+# closed: an unfinished run, a target that is not in the run and no regression trial all fail the job.
+# Copy it to .github/workflows/ to use it; it sits here so it does not run in this repository.
+name: regression-gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_workflow_run:
+        description: Id of the GitHub Actions run that holds the artifact `report` (the benchmark workflow run)
+        required: true
+      run_id:
+        description: hbench run id of the finished regression run (the directory name inside the artifact)
+        required: true
+      min_pass_rate:
+        description: Minimum pass rate on the regression suite, from 0 to 1
+        required: true
+        default: "0.9"
+
+permissions:
+  contents: read
+  actions: read  # download an artifact of another workflow run
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: report
+          path: results
+          run-id: ${{ inputs.source_workflow_run }}
+          github-token: ${{ github.token }}
+      - name: Gate on the regression suite
+        env:
+          RUN_ID: ${{ inputs.run_id }}
+          MIN_PASS_RATE: ${{ inputs.min_pass_rate }}
+        run: python3 -m hbench gate "results/$RUN_ID" --target target.json --min-pass-rate "$MIN_PASS_RATE" --suite regression

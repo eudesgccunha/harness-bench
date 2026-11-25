@@ -9,7 +9,7 @@ import math
 from collections.abc import Mapping
 from typing import Any
 
-from hbench.core.models import SCHEMA_VERSION, CostSource, TrialStatus
+from hbench.core.models import CONSTRAINT_KEYS, SCHEMA_VERSION, CostSource, TrialStatus
 
 _ID_BASE = "https://harness-bench.local/schema"
 _DIALECT = "https://json-schema.org/draft/2020-12/schema"
@@ -170,9 +170,68 @@ TRIAL_SPEC_SCHEMA: dict[str, Any] = {
 }
 
 
+_RATE: dict[str, Any] = {"type": "number", "minimum": 0, "maximum": 1}
+
+_EVIDENCE = _object(
+    {
+        "runs": {"type": "integer", "minimum": 1},
+        "solved": _COUNT,
+        "pass_rate": _RATE,
+        "pass_ci_low": _RATE,
+        "pass_ci_high": _RATE,
+        "cost_per_solved": _COST,
+        "cost_per_run": _COST,
+        "avg_wall_s": _COST,
+    },
+    ["runs", "solved", "pass_rate", "pass_ci_low", "pass_ci_high", "cost_per_solved", "cost_per_run", "avg_wall_s"],
+)
+
+TARGET_DECISION_SCHEMA: dict[str, Any] = {
+    "$schema": _DIALECT,
+    "$id": f"{_ID_BASE}/target_decision/{SCHEMA_VERSION}",
+    "title": "Target decision",
+    "$defs": {"evidence": _EVIDENCE},
+    **_object(
+        {
+            "schema_version": _STRING,
+            "harness": _STRING,
+            "model": _STRING,
+            "run_id": _STRING,
+            "config_sha256": _STRING,
+            "suite_version": _STRING,
+            "cost_source": _STRING,
+            "constraints": _object(
+                {
+                    key: {"type": "number", "minimum": 0, **({"maximum": 1} if key == "min_pass_rate" else {})}
+                    for key in CONSTRAINT_KEYS
+                },
+                [],
+            ),
+            "evidence": {"$ref": "#/$defs/evidence"},
+        },
+        [
+            "schema_version",
+            "harness",
+            "model",
+            "run_id",
+            "config_sha256",
+            "suite_version",
+            "cost_source",
+            "constraints",
+            "evidence",
+        ],
+    ),
+}
+
+
 def schema_document() -> dict[str, Any]:
     """All schemas in one document, as `schema export` prints it."""
-    return {"trial": TRIAL_SCHEMA, "run": RUN_SCHEMA, "trial_spec": TRIAL_SPEC_SCHEMA}
+    return {
+        "trial": TRIAL_SCHEMA,
+        "run": RUN_SCHEMA,
+        "trial_spec": TRIAL_SPEC_SCHEMA,
+        "target_decision": TARGET_DECISION_SCHEMA,
+    }
 
 
 # ---------------------------------------------------------------- validator

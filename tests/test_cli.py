@@ -2,6 +2,7 @@
 
 import contextlib
 import copy
+import dataclasses
 import importlib
 import io
 import json
@@ -15,9 +16,12 @@ from unittest import mock
 
 import fixtures
 from hbench import cli
+from hbench.core.models import TrialResult
 from hbench.core.schema import schema_document
 from hbench.profiles import apply_litellm_profile
 from test_api import ApiTestCase
+from test_core_models import T0, run_info
+from test_decide import make, null_trial
 from test_litellm import ScriptedServer, ok
 
 ROOT = fixtures.ROOT
@@ -548,6 +552,158 @@ class OrchestratorCommandTests(ApiTestCase):
             ):
                 hbl.main()
             cli_main.assert_called_once_with([command, "--litellm", "--config", "c"], epilog=mock.ANY)
+
+
+class DecisionCommandTests(unittest.TestCase):
+    """`compare`, `recommend` and `gate` (ADR 0013) on run directories written from contract objects."""
+
+    def setUp(self) -> None:
+        self.root = fixtures.tmpdir(self)
+
+    def write_run(self, run_id: str, trials: list[TrialResult], *, finished: bool = True) -> str:
+        targets = tuple(sorted({t.target for t in trials}, key=lambda t: t.harness))
+        info = run_info(run_id=run_id, finished_at=T0 if finished else None, targets=targets)
+        run_dir = self.root / run_id
+        run_dir.mkdir()
+        (run_dir / "run.json").write_text(json.dumps(info.to_dict()))
+        lines = (json.dumps(dataclasses.replace(t, run_id=run_id).to_dict()) for t in trials)
+        (run_dir / "trials.jsonl").write_text("".join(f"{line}\n" for line in lines))
+        return str(run_dir)
+
+    def runs(self) -> tuple[str, str]:
+        """Run A: x and y solve six tasks. Run B: x solves none (a regression), y still solves all."""
+        tasks = [f"regression/t{i}" for i in range(6)]
+        a = [make(h, "m", t, True, cost=c) for h, c in (("x", 0.2), ("y", 0.4)) for t in tasks]
+        b = [make("x", "m", t, False, cost=0.2) for t in tasks] + [make("y", "m", t, True, cost=0.4) for t in tasks]
+        return self.write_run("a" * 32, a), self.write_run("b" * 32, b)
+
+    def main(self, *argv: str) -> tuple[str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            cli.main(list(argv))
+        return out.getvalue(), err.getvalue()
+
+    def fails(self, *argv: str) -> object:
+        with self.assertRaises(SystemExit) as cm:
+            self.main(*argv)
+        return cm.exception.code
+
+    def test_the_regressed_target_is_reported_and_the_exit_code_is_opt_in(self) -> None:
+        run_a, run_b = self.runs()
+        out, _ = self.main("compare", run_a, run_b)
+        self.assertIn("## Regressions", out)
+        self.assertIn("- x/m: b=6", out)
+        self.assertEqual(self.fails("compare", run_a, run_b, "--fail-on-regression"), 1)
+        clean, _ = self.main("compare", run_a, run_a, "--fail-on-regression")
+        self.assertIn("No regression.", clean)
+
+    def test_a_target_that_breaks_completely_fails_the_compare_gate(self) -> None:
+        tasks = [f"regression/t{i}" for i in range(6)]
+        good = self.write_run("a" * 32, [make("x", "m", t, True) for t in tasks])
+        silent = [null_trial(t, harness="x") for t in tasks]
+        broken = self.write_run("b" * 32, silent)
+        self.assertEqual(self.fails("compare", good, broken, "--fail-on-regression"), 1)
+
+    def test_compare_json_is_valid_and_deterministic(self) -> None:
+        run_a, run_b = self.runs()
+        first, _ = self.main("compare", run_a, run_b, "--json", "--alpha", "0.01")
+        second, _ = self.main("compare", run_a, run_b, "--json", "--alpha", "0.01")
+        self.assertEqual(first, second)
+        self.assertEqual(json.loads(first)["alpha"], 0.01)
+
+    def test_a_run_directory_that_is_a_file_or_unreadable_exits_with_a_message(self) -> None:
+        plain = self.root / "plain.txt"
+        plain.write_text("x")
+        self.assertIn(
+            "cannot be read",
+            str(self.fails("gate", str(plain), "--harness", "a", "--model", "b", "--min-pass-rate", "0.5")),
+        )
+        run_a, _ = self.runs()
+        os.chmod(run_a + "/run.json", 0)
+        self.addCleanup(os.chmod, run_a + "/run.json", 0o600)
+        if os.access(run_a + "/run.json", os.R_OK):  # running as root: permissions do not apply
+            return
+        self.assertIn("cannot be read", str(self.fails("recommend", run_a)))
+
+    def test_compare_errors_exit_with_a_message(self) -> None:
+        run_a, run_b = self.runs()
+        self.assertIn("not a run directory", str(self.fails("compare", run_a, str(self.root / "missing"))))
+        self.assertIn("alpha", str(self.fails("compare", run_a, run_b, "--alpha", "2")))
+        self.assertEqual(self.fails("compare", run_a, run_b, "--litellm", "--cost-source", "computed"), 2)
+
+    def test_litellm_forces_the_gateway_cost_source(self) -> None:
+        run_a, run_b = self.runs()
+        out, _ = self.main("compare", run_a, run_b, "--litellm", "--json")
+        self.assertEqual(json.loads(out)["cost_source"], "litellm")
+        out, _ = self.main("compare", run_a, run_b, "--json", "--cost-source", "computed")
+        self.assertEqual(json.loads(out)["cost_source"], "computed")
+
+    def test_the_switch_story_from_two_runs_to_a_passing_gate(self) -> None:
+        run_a, run_b = self.runs()
+        target = self.root / "target.json"
+        out, err = self.main("recommend", run_b, "--min-pass-rate", "0.9", "--write-target", str(target))
+        self.assertIn("**Pick:** y/m", out)
+        self.assertIn(f"wrote {target}", err)
+        decision = json.loads(target.read_text())
+        self.assertEqual((decision["harness"], decision["constraints"]), ("y", {"min_pass_rate": 0.9}))
+        gate_out, _ = self.main("gate", run_b, "--target", str(target), "--min-pass-rate", "0.9")
+        self.assertIn("gate: y/m on suite 'regression': pass rate 100%", gate_out)
+        message = str(self.fails("gate", run_b, "--harness", "x", "--model", "m", "--min-pass-rate", "0.9"))
+        self.assertIn("below the minimum 90%", message)
+
+    def test_recommend_json_and_no_eligible_target(self) -> None:
+        _, run_b = self.runs()
+        target = self.root / "target.json"
+        out, _ = self.main("recommend", run_b, "--json", "--max-cost-per-run", "1")
+        self.assertEqual(json.loads(out)["pick"]["harness"], "y")
+        code = self.fails(
+            "recommend", run_b, "--min-pass-rate", "1", "--max-latency-s", "1", "--write-target", str(target)
+        )
+        self.assertEqual(code, "recommend: no eligible target")
+        self.assertFalse(target.exists())
+
+    def test_a_legacy_run_id_gives_a_message_and_writes_nothing(self) -> None:
+        run = self.write_run("legacy-run", [make("x", "m", "regression/t0", True)])
+        target = self.root / "target.json"
+        for extra in (["--json"], ["--write-target", str(target)]):
+            with self.subTest(extra=extra):
+                code = str(self.fails("recommend", run, *extra))
+                self.assertIn("recommend: ", code)
+                self.assertIn("run_id", code)
+        self.assertFalse(target.exists())
+        out, _ = self.main("recommend", run)  # the plain report needs no decision
+        self.assertIn("**Pick:** x/m", out)
+
+    def test_recommend_errors_exit_with_a_message(self) -> None:
+        _, run_b = self.runs()
+        self.assertIn("min_pass_rate", str(self.fails("recommend", run_b, "--min-pass-rate", "2")))
+        self.assertIn("not a run directory", str(self.fails("recommend", str(self.root / "missing"))))
+        link = self.root / "link.json"
+        link.symlink_to(self.root / "elsewhere")
+        self.assertIn("symlink", str(self.fails("recommend", run_b, "--write-target", str(link))))
+
+    def test_gate_fails_closed_and_reads_arguments_strictly(self) -> None:
+        run_a, run_b = self.runs()
+        unfinished = self.write_run("c" * 32, [make("x", "m", "regression/t0", True)], finished=False)
+        self.assertIn(
+            "not finished",
+            str(self.fails("gate", unfinished, "--harness", "x", "--model", "m", "--min-pass-rate", "0")),
+        )
+        bad = self.root / "bad.json"
+        bad.write_text(json.dumps({"harness": "x"}))
+        self.assertIn("target file", str(self.fails("gate", run_b, "--target", str(bad), "--min-pass-rate", "0.5")))
+        self.assertIn(
+            "min_pass_rate", str(self.fails("gate", run_b, "--harness", "x", "--model", "m", "--min-pass-rate", "2"))
+        )
+        self.assertEqual(self.fails("gate", run_b, "--harness", "x", "--min-pass-rate", "0.5"), 2)
+        self.assertEqual(self.fails("gate", run_b, "--target", str(bad), "--harness", "x", "--min-pass-rate", "0.5"), 2)
+        self.assertIn(
+            "not a run directory",
+            str(self.fails("gate", str(self.root / "no"), "--harness", "x", "--model", "m", "--min-pass-rate", "0")),
+        )
+        self.assertIn(
+            "pass rate 100%", self.main("gate", run_a, "--harness", "x", "--model", "m", "--min-pass-rate", "1")[0]
+        )
 
 
 class ShimMainTests(unittest.TestCase):

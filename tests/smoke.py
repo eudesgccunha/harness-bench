@@ -603,6 +603,70 @@ def main() -> None:
             "run-trial: a spec of another config is refused and writes nothing",
         )
 
+        # --- decision commands (ADR 0013): compare, recommend --write-target and gate on two runs, the second regressed
+        plan_dir = tmp / "results-plan" / plan_run_id
+        base_info = json.loads((plan_dir / "run.json").read_text())
+        base_trials = results(plan_dir / "trials.jsonl")
+
+        def decision_run(run_id: str, regressed: str | None) -> Path:
+            run_dir = tmp / "results-decide" / run_id
+            run_dir.mkdir(parents=True)
+            lines = []
+            for trial in base_trials:
+                for i in range(6):
+                    row = dict(
+                        trial, run_id=run_id, task_id=f"regression/t{i}", trial_id=f"{i:02d}{trial['trial_id'][2:]}"
+                    )
+                    if trial["target"]["harness"] == regressed:
+                        row["status"] = "failed"
+                    lines.append(json.dumps(row))
+            (run_dir / "trials.jsonl").write_text("\n".join(lines) + "\n")
+            (run_dir / "run.json").write_text(json.dumps(dict(base_info, run_id=run_id)))
+            return run_dir
+
+        good_run = decision_run("a" * 32, None)
+        regressed_run = decision_run("b" * 32, "claude")
+        p = subprocess.run(
+            [PY, "-m", "hbench", "compare", str(good_run), str(regressed_run)], cwd=tmp, capture_output=True, text=True
+        )
+        check(p.returncode == 0 and "claude/fix: b=6" in p.stdout, "compare: the regressed target is reported, exit 0")
+        p = subprocess.run(
+            [PY, "-m", "hbench", "compare", str(good_run), str(regressed_run), "--fail-on-regression"],
+            cwd=tmp,
+            capture_output=True,
+            text=True,
+        )
+        check(p.returncode == 1, "compare --fail-on-regression: exit 1 on a regression")
+        target_file = tmp / "target.json"
+        p = subprocess.run(
+            [
+                PY,
+                "-m",
+                "hbench",
+                "recommend",
+                str(regressed_run),
+                "--min-pass-rate",
+                "0.9",
+                "--write-target",
+                str(target_file),
+            ],
+            cwd=tmp,
+            capture_output=True,
+            text=True,
+        )
+        picked = json.loads(target_file.read_text()) if target_file.exists() else {}
+        check(
+            p.returncode == 0 and picked.get("harness") not in (None, "claude", "opencode"),
+            "recommend --write-target: another target than the regressed one is written",
+        )
+        gate_cmd = [PY, "-m", "hbench", "gate", str(regressed_run), "--min-pass-rate", "0.9", "--suite", "regression"]
+        p = subprocess.run([*gate_cmd, "--target", str(target_file)], cwd=tmp, capture_output=True, text=True)
+        check(p.returncode == 0, "gate: the target file passes")
+        p = subprocess.run(
+            [*gate_cmd, "--harness", "claude", "--model", "fix"], cwd=tmp, capture_output=True, text=True
+        )
+        check(p.returncode == 1 and "below the minimum" in p.stderr, "gate: the regressed target fails")
+
         # --- config validation and URL policy
         for bad, why in (
             (dict(fizz, id="/etc"), "absolute task id"),

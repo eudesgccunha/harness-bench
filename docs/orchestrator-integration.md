@@ -66,6 +66,7 @@ All are small and add no dependency to the engine. Run them from the repository 
 | [`adapters/shell/run.sh`](../adapters/shell/run.sh) | `plan`, then `xargs -P N` over the lines, each line to `run-trial` on stdin, then `finish`. |
 | [`adapters/python/run_parallel.py`](../adapters/python/run_parallel.py) | The API with `concurrent.futures.ProcessPoolExecutor`: `PYTHONPATH=. python3 adapters/python/run_parallel.py --config config.json --workers 4`. Tested. |
 | [`adapters/github-actions/benchmark.yml`](../adapters/github-actions/benchmark.yml) | A `plan` job, a matrix of `run-trial` jobs (the spec in the matrix, the run directory as an artifact), a `finish` job that merges the trial files. Copy it to `.github/workflows/`. |
+| [`adapters/github-actions/regression-gate.yml`](../adapters/github-actions/regression-gate.yml) | One job over `gate` (ADR 0013): downloads the finished run and fails when the target file passes less than the minimum on the regression suite. |
 | [`adapters/kubernetes/indexed-job.yaml`](../adapters/kubernetes/indexed-job.yaml) | An Indexed Job: pod N runs line N of the specs (a ConfigMap), results on a shared volume. |
 
 Adapters for packaged orchestrators are a few lines over the same API and live outside this repository. The pattern:

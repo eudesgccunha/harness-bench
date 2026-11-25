@@ -8,8 +8,16 @@ from typing import Any
 
 import fixtures  # noqa: F401  (puts the repo root on sys.path)
 from hbench.core import models
-from hbench.core.schema import RUN_SCHEMA, TRIAL_SCHEMA, TRIAL_SPEC_SCHEMA, check_schema, schema_document, validate
-from test_core_models import run_info, trial, trial_spec
+from hbench.core.schema import (
+    RUN_SCHEMA,
+    TARGET_DECISION_SCHEMA,
+    TRIAL_SCHEMA,
+    TRIAL_SPEC_SCHEMA,
+    check_schema,
+    schema_document,
+    validate,
+)
+from test_core_models import run_info, target_decision, trial, trial_spec
 
 
 class ValidateContractTests(unittest.TestCase):
@@ -89,9 +97,28 @@ class ValidateContractTests(unittest.TestCase):
     def test_schema_document_holds_both_schemas_with_ids(self) -> None:
         doc = schema_document()
         self.assertEqual((doc["trial"], doc["run"], doc["trial_spec"]), (TRIAL_SCHEMA, RUN_SCHEMA, TRIAL_SPEC_SCHEMA))
-        self.assertTrue(TRIAL_SCHEMA["$id"].endswith("/trial/1.4.0"))
-        self.assertTrue(RUN_SCHEMA["$id"].endswith("/run/1.4.0"))
-        self.assertTrue(TRIAL_SPEC_SCHEMA["$id"].endswith("/trial_spec/1.4.0"))
+        self.assertTrue(TRIAL_SCHEMA["$id"].endswith("/trial/1.5.0"))
+        self.assertTrue(RUN_SCHEMA["$id"].endswith("/run/1.5.0"))
+        self.assertTrue(TRIAL_SPEC_SCHEMA["$id"].endswith("/trial_spec/1.5.0"))
+        self.assertTrue(TARGET_DECISION_SCHEMA["$id"].endswith("/target_decision/1.5.0"))
+        self.assertEqual(doc["target_decision"], TARGET_DECISION_SCHEMA)
+
+    def test_a_target_decision_validates_and_a_forged_one_does_not(self) -> None:
+        self.assertEqual(validate(target_decision().to_dict(), TARGET_DECISION_SCHEMA), [])
+        forged = {**target_decision().to_dict(), "command": ["x"]}
+        self.assertEqual(validate(forged, TARGET_DECISION_SCHEMA), ["$.command: unexpected property"])
+        bad = target_decision().to_dict()
+        bad["evidence"]["pass_rate"] = 2
+        self.assertEqual(validate(bad, TARGET_DECISION_SCHEMA), ["$.evidence.pass_rate: must be <= 1"])
+        bad_constraint = target_decision().to_dict()
+        bad_constraint["constraints"]["min_pass_rate"] = "x"
+        self.assertEqual(
+            validate(bad_constraint, TARGET_DECISION_SCHEMA), ["$.constraints.min_pass_rate: expected number"]
+        )
+        above = target_decision().to_dict()
+        above["constraints"]["min_pass_rate"] = 1.5
+        self.assertEqual(validate(above, TARGET_DECISION_SCHEMA), ["$.constraints.min_pass_rate: must be <= 1"])
+        self.assertEqual(check_schema(TARGET_DECISION_SCHEMA), TARGET_DECISION_SCHEMA)
 
     def test_a_trial_spec_validates_and_a_forged_one_does_not(self) -> None:
         self.assertEqual(validate(trial_spec().to_dict(), TRIAL_SPEC_SCHEMA), [])
@@ -202,6 +229,8 @@ class SchemaMatchesModelsTests(unittest.TestCase):
         (models.Costs, TRIAL_SCHEMA, "costs"),
         (models.RunInfo, RUN_SCHEMA, None),
         (models.TrialSpec, TRIAL_SPEC_SCHEMA, None),
+        (models.TargetDecision, TARGET_DECISION_SCHEMA, None),
+        (models.Evidence, TARGET_DECISION_SCHEMA, "evidence"),
         (models.Target, RUN_SCHEMA, "target"),
     )
 
