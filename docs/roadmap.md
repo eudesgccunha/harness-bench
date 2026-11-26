@@ -11,7 +11,7 @@ Each item is scheduled in a phase of the [evolution plan](evolution-plan.md):
 | M10 efficiency (tool calls) | 3 (done, [ADR 0007](adr/0007-runner-and-grader-protocols.md)) |
 | M2 `validate` | 4 (done, [ADR 0008](adr/0008-suites-as-data.md): `suite validate --run`) |
 | Artifact graders and LLM judge (extension of M9) | 5 (done, [ADR 0009](adr/0009-artifact-graders-and-judge.md)) |
-| M12 task packs | 9 (done for Exercism; Terminal-Bench deferred, see M12) |
+| M12 task packs | 9 (done for Exercism; Terminal-Bench dropped, see M12) |
 | M3 `null` harness | 2 (done: negative control) |
 | M6 failure breakdown, M14 transcript hygiene | 1 |
 | M7 provenance | 1 (versions in the contract), 6 (image digest, done) |
@@ -95,7 +95,7 @@ Every pair runs the same tasks, so a paired test (McNemar) can say whether pair 
 
 Import tasks from Exercism (MIT) and Terminal-Bench (Apache-2.0), with provenance and license per task, and report them in a tier separate from your own tasks.
 
-Done in Phase 9 for Exercism ([ADR 0013](adr/0013-compare-recommend-gate-import.md)): `python3 -m hbench suite import exercism` reads a local clone (no network; you review the license), writes a `capability` suite with the license text and `provenance` per task, and refuses unsafe input. **Terminal-Bench is deferred:** its tasks need a per-task container image (`environment/Dockerfile`) and a script solution (`solution/solve.sh`), and its tests download tools at run time; none of that fits the suite format (one sandbox image per run, a solution directory, offline tests). It needs a per-task image in the suite format first, and can then come as an importer plugin (entry-point group `harness_bench.importers`).
+Done in Phase 9 for Exercism ([ADR 0013](adr/0013-compare-recommend-gate-import.md)): `python3 -m hbench suite import exercism` reads a local clone (no network; you review the license), writes a `capability` suite with the license text and `provenance` per task, and refuses unsafe input. **Terminal-Bench is dropped** ([ADR 0013](adr/0013-compare-recommend-gate-import.md) §6): all 89 Terminal-Bench 2.0 tasks need their own image (published by date tag, not digest), every test script downloads uv, Python and pytest at verify time, the reference solutions are scripts that often use the network, and tasks carry no license or source of their own. It measures terminal and ops work, outside the coding-in-a-repo use of this benchmark, and does not fit the suite format or the network rule.
 
 ## M13. Trace export to Lens (L)
 

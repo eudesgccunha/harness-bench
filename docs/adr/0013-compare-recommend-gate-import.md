@@ -79,11 +79,11 @@ one AGENTS.md lists, and `hbench/report.py` already computes every per-target fi
      inside the exercise; no symlink anywhere, regular files only, a size limit per file
      (1 MB); `--source-url` must be `https://`. The result must pass `suite validate`
      (the importer runs the static validation before it returns; `--run` is up to the user).
-   - **Terminal-Bench is deferred:** its tasks need a per-task container image
-     (`environment/Dockerfile`) and a script solution (`solution/solve.sh`), and its
-     tests download tools at run time; none of it fits the suite format (one sandbox
-     image per run, a solution directory, offline tests). A Terminal-Bench importer needs a
-     per-task image in the suite format first; it can then come as a plugin. The importer
+   - **Terminal-Bench is dropped** (decided 2026-11-25, after a review of the 2.0 pack):
+     all 89 Terminal-Bench 2.0 tasks need their own image (published by date tag, not digest), every test script downloads uv, Python and pytest at verify time, the reference solutions are scripts that often use the network, and tasks carry no license or source of their own. Importing it would need a per-task image, network at verify time
+     (or 89 rebuilt images), script solutions and a license review per task: a phase of
+     its own for tasks (terminal and ops work) outside the coding-in-a-repo use this
+     benchmark measures. Nobody should start it again without a new decision. The importer
      registry is a dict plus the entry-point group `harness_bench.importers`
      (`hbench/plugins.py`), like sandboxes and sinks.
 7. **Docs:** `docs/from-benchmark-to-decision.md` (compare, recommend, target file, gate,
@@ -95,4 +95,4 @@ one AGENTS.md lists, and `hbench/report.py` already computes every per-target fi
 - A model or harness switch is a reviewed change to the target file, backed by the run,
   the comparison and the recommendation, all reproducible from `trials.jsonl`.
 - No new network access and no new runtime dependency.
-- Terminal-Bench needs a suite-format change before it can be imported.
+- Terminal-Bench is not imported (dropped, §6): its pack does not fit the suite format or the network rule.

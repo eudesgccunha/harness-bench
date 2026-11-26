@@ -409,8 +409,8 @@ Decisions: [ADR 0012](adr/0012-plan-and-run-trial-api.md). Plan:
       regression suite (fails closed); example in `adapters/github-actions/regression-gate.yml`.
 - [x] Export the decision as a versionable config file (the "winning target", `TargetDecision`, contract 1.5.0).
 - [x] M12 task importers into suites, with license and provenance per task: Exercism done
-      (`suite import exercism`, offline). Terminal-Bench is deferred: it needs a per-task container image and a
-      script solution, which the suite format does not have; it can come as an importer plugin later.
+      (`suite import exercism`, offline). Terminal-Bench is dropped (ADR 0013 §6): per-task
+      images, network at verify time, script solutions and no per-task license.
 
 Acceptance: a model/harness switch is justified by a reproducible report.
 Decisions: [ADR 0013](adr/0013-compare-recommend-gate-import.md). Plan:

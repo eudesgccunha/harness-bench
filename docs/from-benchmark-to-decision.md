@@ -57,7 +57,7 @@ The importer uses **no network**: it reads your local clone and writes a new sui
 
 The checkout is untrusted input: a source without a `LICENSE` file is refused; slugs match `[a-z0-9-]+`; file names from `config.json` must be relative, without `..`, and stay inside the exercise; a symlink anywhere in an exercise, a file over 1 MB and a `--source-url` that is not `https://` are refused. The result is loaded as a suite before the command returns; `--run` (the behavioral check) is up to you.
 
-Importers are a registry (`hbench/importers/`) plus the entry-point group `harness_bench.importers`, like sandboxes and sinks. **Terminal-Bench is deferred:** its tasks need a per-task container image (`environment/Dockerfile`) and a script solution (`solution/solve.sh`), and its tests download tools at run time; none of that fits the suite format (one sandbox image per run, a solution directory, offline tests). It needs a per-task image in the suite format first, and can then come as a plugin.
+Importers are a registry (`hbench/importers/`) plus the entry-point group `harness_bench.importers`, like sandboxes and sinks. **Terminal-Bench is dropped** ([ADR 0013](adr/0013-compare-recommend-gate-import.md) §6): all 89 Terminal-Bench 2.0 tasks need their own image (published by date tag, not digest), every test script downloads uv, Python and pytest at verify time, the reference solutions are scripts that often use the network, and tasks carry no license or source of their own.
 
 ## How a switch is justified
 
