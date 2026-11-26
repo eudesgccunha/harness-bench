@@ -1,8 +1,10 @@
 """Tests for the single CLI (`python3 -m hbench`), the LiteLLM profile and the two shims."""
 
+import argparse
 import contextlib
 import copy
 import dataclasses
+import hashlib
 import importlib
 import io
 import json
@@ -15,7 +17,9 @@ from typing import Any
 from unittest import mock
 
 import fixtures
-from hbench import cli
+import harness_bench as hb
+from hbench import cli, report
+from hbench.core.convert import trials_from_rows
 from hbench.core.models import TrialResult
 from hbench.core.schema import schema_document
 from hbench.profiles import apply_litellm_profile
@@ -412,6 +416,102 @@ class ReportOptionsTests(unittest.TestCase):
         out = self.report()
         self.assertIn("within 60 pp", out)
         self.assertIn("CI width of 0.40", out)
+
+    def test_only_reports_the_named_harnesses_into_separate_files(self) -> None:
+        self.write_rows(self.row("t", "a", True), self.row("t", "b", False), self.row("t", "c", True))
+        full = self.report()
+        out = self.report("--only", "b", "a")
+        results = self.base / "results"
+        md = (results / "summary.only-a+b.md").read_text()
+        self.assertIn("Filtered: harnesses a, b.", md.splitlines()[2])
+        self.assertIn("| a | m |", md)
+        self.assertNotIn("| c | m |", md)
+        self.assertIn("a,m", (results / "summary.only-a+b.csv").read_text())
+        self.assertNotIn("c,m", (results / "summary.only-a+b.csv").read_text())
+        self.assertIn("summary.only-a+b.md", out)
+        self.assertNotIn("Filtered", (results / "summary.md").read_text())
+        self.assertIn("| c | m |", full)
+
+    def test_only_names_that_differ_by_a_dash_do_not_share_a_file(self) -> None:
+        self.write_rows(self.row("t", "a", True), self.row("t", "b", True), self.row("t", "a-b", False))
+        self.report("--only", "a", "b")
+        self.report("--only", "a-b")
+        results = self.base / "results"
+        self.assertEqual(
+            sorted(p.name for p in results.glob("summary.only-*.md")), ["summary.only-a+b.md", "summary.only-a-b.md"]
+        )
+        self.assertIn("Filtered: harnesses a-b.", (results / "summary.only-a-b.md").read_text())
+
+    def test_only_with_long_names_uses_a_hashed_file_name_and_keeps_the_list_in_the_report(self) -> None:
+        names = [f"harness-{i:02d}-" + "x" * 30 for i in range(20)]
+        self.write_rows(*(self.row("t", n, True) for n in names))
+        self.report("--only", *names)
+        digest = hashlib.sha256("+".join(sorted(names)).encode()).hexdigest()[:12]
+        md = self.base / "results" / f"summary.only-{digest}.md"
+        self.assertIn(f"Filtered: harnesses {', '.join(sorted(names))}.", md.read_text())
+        self.assertTrue(md.with_suffix(".csv").exists())
+
+    def test_only_filters_the_judged_trials_too(self) -> None:
+        self.write_rows(self.row("t", "a", True), self.row("t", "b", True))
+        self.cfg["judge"] = {"model": "j"}
+        everything = trials_from_rows(fixtures.read_rows(self.base / "results" / "results.jsonl"))
+        real_render = report.render_markdown
+        judged_harnesses: list[set[str]] = []
+
+        def spy(*a: Any, **kw: Any) -> str:
+            judged_harnesses.append({t.target.harness for t in kw["judged"]})
+            return str(real_render(*a, **kw))
+
+        with (
+            mock.patch.object(hb, "read_trials", return_value=everything),
+            mock.patch.object(report, "render_markdown", spy),
+        ):
+            self.report("--only", "a")
+            self.report()
+        self.assertEqual(judged_harnesses, [{"a"}, {"a", "b"}])
+
+    def test_litellm_profile_writes_the_filtered_files_in_its_output_dir(self) -> None:
+        self.cfg["litellm"] = {"base_url": "http://localhost:4000", "api_key": "${HB_TEST_KEY}"}
+        self.cfg["matrix"] = []
+        del self.cfg["output_dir"]
+        (self.base / "results-litellm").mkdir()
+        fixtures.write_rows(
+            self.base / "results-litellm" / "results.jsonl",
+            fixtures.run_row(harness="a", cost_litellm=1.0),
+            fixtures.run_row(harness="b", cost_litellm=1.0),
+        )
+        out = self.report("--litellm", "--only", "a")
+        self.assertIn("Filtered: harnesses a.", out)
+        names = sorted(p.name for p in (self.base / "results-litellm").glob("summary*"))
+        self.assertEqual(names, ["summary.only-a.csv", "summary.only-a.md"])
+
+    def test_only_with_drop_saturated_works_on_the_filtered_set(self) -> None:
+        self.write_rows(self.row("easy", "a", True), self.row("hard", "a", False), self.row("easy", "b", True))
+        out = self.report("--only", "a", "--drop-saturated")
+        self.assertIn("Filtered: harnesses a.", out)
+        self.assertNotIn("| easy |", out)
+
+    def test_only_with_an_unknown_name_lists_the_known_harnesses_and_writes_nothing(self) -> None:
+        self.write_rows(self.row("t", "a", True), self.row("t", "b", True))
+        with fixtures.quiet(), self.assertRaises(SystemExit) as cm:
+            self.report("--only", "a", "zzz")
+        self.assertIn("zzz", str(cm.exception.code))
+        self.assertIn("a, b", str(cm.exception.code))
+        self.assertEqual(list((self.base / "results").glob("summary*")), [])
+
+    def test_only_rejects_an_empty_list_and_a_bad_name(self) -> None:
+        self.write_rows(self.row("t", "a", True))
+        for argv in (("--only",), ("--only", "../x"), ("--only", "a/b")):
+            with self.subTest(argv=argv), fixtures.quiet(), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    self.report(*argv)
+                self.assertEqual(cm.exception.code, 2)
+        self.assertEqual(list((self.base / "results").glob("summary*")), [])
+
+    def test_run_only_does_not_filter_the_report(self) -> None:
+        self.write_rows(self.row("t", "a", True), self.row("t", "b", True))
+        fixtures.call_quiet(hb.cmd_report, argparse.Namespace(only=["a"], cost_source=None), self.cfg, self.base)
+        self.assertIn("| b | m |", (self.base / "results" / "summary.md").read_text())
 
 
 class OrchestratorCommandTests(ApiTestCase):

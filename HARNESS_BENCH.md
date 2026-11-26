@@ -140,6 +140,7 @@ Besides the cost and token columns, the main table of `summary.md` shows how sur
 | Recommendation | The cheapest pair per solved task among pairs within `recommend_within_pp` points (config, default 5) of the best pass rate, with at least one pass. |
 | Negative control | Pairs whose harness uses `parser: null`. Any pass prints a warning: the tests are too lenient. Null pairs are left out of the recommendation, ties, frontier and discrimination, and sort last. |
 | Discrimination | Tasks every non-null run solved (saturated) and tasks no run solved. They do not separate the pairs. `report --drop-saturated` removes the saturated ones before aggregating (also accepted by `run` and `reconcile`, which print the report). |
+| Filtered | Only with `report --only H [H ...]`: a `Filtered: harnesses ...` line under the title. Every figure is computed on those harnesses alone. The files are `summary.only-<names>.md` and `.csv` (names sorted and joined by `+`, or a 12-hex hash of them when the list is longer than 100 bytes), and the full `summary.md` is not touched. `run` and `reconcile` always write the full report. |
 | Paired comparison | Exact two-sided McNemar test between the best-ranked pair and every other pair, pairing runs by task and rep. `b` counts runs only the best pair solved, `c` runs only the other pair solved. |
 | By suite kind | Only when the trials come from more than one suite kind (`capability`, `regression`): solved/runs per pair for each kind, and a warning for every regression task a non-null pair did not solve. |
 | Judges | Only when a trial has an `llm_rubric` result: each rubric version × judge model pair in use, **calibrated** or **experimental** (see [Artifact graders and the LLM judge](#artifact-graders-and-the-llm-judge)). |
@@ -469,6 +470,7 @@ Usage:
 import argparse
 import contextlib
 import functools
+import hashlib
 import json
 import os
 import platform
@@ -2111,6 +2113,26 @@ def load_calibration(cfg: Mapping[str, Any], base: Path) -> Calibration | None:
         return None
 
 
+MAX_ONLY_SUFFIX = 100  # bytes of joined harness names kept in a file name; longer lists are hashed
+
+
+def only_suffix(only: Sequence[str]) -> str:
+    """The file-name part of a filtered report: names joined by `+` (not allowed in a name, so two lists never
+    collide), or a short hash of them when the list would not fit in a file name. `only` is sorted."""
+    if not only:
+        return ""
+    joined = "+".join(only)
+    if len(joined.encode()) > MAX_ONLY_SUFFIX:
+        joined = hashlib.sha256(joined.encode()).hexdigest()[:12]
+    return f".only-{joined}"
+
+
+def judged_trials(out_dir: Path, only: Sequence[str]) -> list[TrialResult]:
+    """The contract trials of `out_dir`, limited to the harnesses of a filtered report."""
+    trials = read_trials(out_dir)
+    return [t for t in trials if t.target.harness in only] if only else trials
+
+
 def cmd_report(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path) -> None:
     out_dir = base / cfg.get("output_dir", "results")
     results_path = out_dir / "results.jsonl"
@@ -2124,13 +2146,21 @@ def cmd_report(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path) -> 
     within_pp, target_width = report_options(cfg)
     null_harnesses = {name for name, h in cfg.get("harnesses", {}).items() if h.get("parser") == "null"}
     trials = trials_from_rows(rows, warn=print)
+    only = sorted(set(getattr(args, "report_only", None) or []))
+    if only:
+        known = sorted({t.target.harness for t in trials})
+        unknown = [name for name in only if name not in known]
+        if unknown:
+            sys.exit(f"no trials for harness {', '.join(unknown)}; known harnesses: {', '.join(known)}")
+        trials = [t for t in trials if t.target.harness in only]
+    suffix = only_suffix(only)
     if getattr(args, "drop_saturated", False):
         trials = report.drop_saturated(trials, null_harnesses)
         if not trials:
             print("no tasks left after --drop-saturated")
             return
     table = report.aggregate(trials, cost_source, null_harnesses=null_harnesses, target_ci_width=target_width)
-    report.write_csv(table, out_dir / "summary.csv")
+    report.write_csv(table, out_dir / f"summary{suffix}.csv")
     try:
         suite_kinds = {suite.name: suite.kind for suite in load_config_suites(cfg, base)}
     except SuiteError as e:
@@ -2144,12 +2174,13 @@ def cmd_report(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path) -> 
         recommend_within_pp=within_pp,
         target_ci_width=target_width,
         suite_kinds=suite_kinds,
-        judged=read_trials(out_dir) if isinstance(cfg.get("judge"), Mapping) else (),
+        judged=judged_trials(out_dir, only) if isinstance(cfg.get("judge"), Mapping) else (),
         calibration=load_calibration(cfg, base),
+        only=only,
     )
-    (out_dir / "summary.md").write_text(md)
+    (out_dir / f"summary{suffix}.md").write_text(md)
     print("\n" + md)
-    print(f"saved {out_dir / 'summary.md'} and {out_dir / 'summary.csv'}")
+    print(f"saved {out_dir / f'summary{suffix}.md'} and {out_dir / f'summary{suffix}.csv'}")
 
 
 # ---------------------------------------------------------------- main
@@ -7771,13 +7802,16 @@ def render_markdown(
     suite_kinds: Mapping[str, str] | None = None,
     judged: Sequence[TrialResult] = (),
     calibration: Calibration | None = None,
+    only: Sequence[str] = (),
 ) -> str:
-    """The summary. `suite_kinds` maps a suite name to its kind and adds the `## By suite kind` section. `judged`
+    """The summary. `only` names the harnesses the report was limited to and adds a `Filtered:` line.
+    `suite_kinds` maps a suite name to its kind and adds the `## By suite kind` section. `judged`
     are the contract trials with grader results (`trials.jsonl`): when one has an `llm_rubric` result, the
     `## Judges` section lists each rubric x judge pair, checked against `calibration`."""
     lines = [
         f"# Harness x model — {now.strftime('%Y-%m-%d %H:%M')}",
         "",
+        *([f"Filtered: harnesses {', '.join(sorted(only))}.", ""] if only else []),
         f"Cost source: `{cost_source}` (auto = litellm > computed > reported). Sorted by cost per solved task.",
         "",
         _HEAD,
@@ -8441,6 +8475,7 @@ import contextlib
 import importlib
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -8469,7 +8504,7 @@ _DESCRIPTION = (
     "  python3 -m hbench run       --config config.json [--reps 3] [--only HARNESS] [--keep] [--dry-run]\n"
     "  python3 -m hbench run       --config config.json --resume RUN_ID [--force]   # continue an interrupted run\n"
     "  python3 -m hbench reconcile --config config.json   # pull real spend from LiteLLM\n"
-    "  python3 -m hbench report    --config config.json [--drop-saturated]\n"
+    "  python3 -m hbench report    --config config.json [--drop-saturated] [--only HARNESS ...]\n"
     "  python3 -m hbench schema export [--out PATH]       # JSON Schema of trials.jsonl and run.json\n"
     "  python3 -m hbench suite list     [--config C | PATH...]\n"
     "  python3 -m hbench suite validate [--config C] [--run [--allow-unsandboxed]] [PATH...]\n"
@@ -8502,6 +8537,26 @@ def _add_drop_saturated(p: argparse.ArgumentParser) -> None:
         "--drop-saturated",
         action="store_true",
         help="leave out tasks every non-null run solved before building the report",
+    )
+
+
+HARNESS_NAME = re.compile(r"[A-Za-z0-9_.-]+")
+
+
+def _harness_name(value: str) -> str:
+    if not HARNESS_NAME.fullmatch(value):
+        raise argparse.ArgumentTypeError(f"invalid harness name {value!r} (allowed: letters, digits, _ . -)")
+    return value
+
+
+def _add_report_only(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--only",
+        dest="report_only",
+        nargs="+",
+        type=_harness_name,
+        metavar="HARNESS",
+        help="build the report from these harnesses only; writes summary.only-<names>.md/.csv, not summary.md",
     )
 
 
@@ -8582,6 +8637,7 @@ def build_parser(epilog: str | None = None) -> argparse.ArgumentParser:
     report = sub.add_parser("report", help="write summary.md and summary.csv from the results")
     _add_config(report)
     _add_drop_saturated(report)
+    _add_report_only(report)
     report.add_argument("--cost-source", choices=["auto", "litellm", "computed", "reported"])
     reconcile = sub.add_parser("reconcile", help="fetch real spend per run from LiteLLM")
     _add_config(reconcile)
@@ -13227,6 +13283,7 @@ if __name__ == "__main__":
 ```python
 """Tests for LiteLLM access, `reconcile` and the LiteLLM-only wrapper, against a local scripted server."""
 
+import argparse
 import json
 import os
 import shutil
@@ -13353,8 +13410,16 @@ class ReconcileTests(ServerTestCase):
 
     def reconcile(self) -> str:
         with fixtures.quiet() as out:
-            hb.cmd_reconcile(mock.Mock(cost_source=None), self.cfg, self.base)
+            hb.cmd_reconcile(argparse.Namespace(cost_source=None), self.cfg, self.base)
         return out.getvalue()
+
+    def test_reconcile_writes_only_the_full_report(self) -> None:
+        fixtures.write_rows(self.base / "results" / "results.jsonl", fixtures.run_row())
+        self.server.route("/spend/logs/v2", ok({"data": [{"request_tags": ["tag-1"], "spend": 1.0}]}))
+        self.reconcile()
+        self.assertEqual(
+            sorted(p.name for p in (self.base / "results").glob("summary*")), ["summary.csv", "summary.md"]
+        )
 
     def test_missing_litellm_section_exits(self) -> None:
         with self.assertRaises(SystemExit) as cm:
@@ -14390,6 +14455,7 @@ if __name__ == "__main__":
 ```python
 """Tests for the contract output: `trial_from_row`, `RunWriter`, `apply_gateway_costs`, and `run`/`reconcile` files."""
 
+import argparse
 import json
 import os
 import shutil
@@ -14917,7 +14983,7 @@ class ReconcileContractTests(unittest.TestCase):
             "/spend/logs/v2",
             ok({"data": [{"request_tags": [tag], "spend": 0.25}, {"request_tags": [tag], "spend": 0.5}]}),
         )
-        out = fixtures.call_quiet(hb.cmd_reconcile, mock.Mock(cost_source=None), self.cfg, self.base)
+        out = fixtures.call_quiet(hb.cmd_reconcile, argparse.Namespace(cost_source=None), self.cfg, self.base)
         (trials_path,) = (self.base / "results").glob("*/trials.jsonl")
         usage = read_jsonl(trials_path)[0]["usage"]
         self.assertEqual((usage["costs"]["gateway"], usage["cost_usd"], usage["cost_source"]), (0.75, 0.75, "gateway"))
@@ -14928,7 +14994,7 @@ class ReconcileContractTests(unittest.TestCase):
         results.mkdir()
         fixtures.write_rows(results / "results.jsonl", fixtures.run_row())
         self.server.route("/spend/logs/v2", ok({"data": [{"request_tags": ["tag-1"], "spend": 0.4}]}))
-        out = fixtures.call_quiet(hb.cmd_reconcile, mock.Mock(cost_source=None), self.cfg, self.base)
+        out = fixtures.call_quiet(hb.cmd_reconcile, argparse.Namespace(cost_source=None), self.cfg, self.base)
         self.assertEqual(
             (fixtures.read_rows(results / "results.jsonl")[0]["cost_litellm"], "contract: 0 trials updated" in out),
             (0.4, True),
@@ -15571,9 +15637,11 @@ if __name__ == "__main__":
 ```python
 """Tests for the single CLI (`python3 -m hbench`), the LiteLLM profile and the two shims."""
 
+import argparse
 import contextlib
 import copy
 import dataclasses
+import hashlib
 import importlib
 import io
 import json
@@ -15586,7 +15654,9 @@ from typing import Any
 from unittest import mock
 
 import fixtures
-from hbench import cli
+import harness_bench as hb
+from hbench import cli, report
+from hbench.core.convert import trials_from_rows
 from hbench.core.models import TrialResult
 from hbench.core.schema import schema_document
 from hbench.profiles import apply_litellm_profile
@@ -15983,6 +16053,102 @@ class ReportOptionsTests(unittest.TestCase):
         out = self.report()
         self.assertIn("within 60 pp", out)
         self.assertIn("CI width of 0.40", out)
+
+    def test_only_reports_the_named_harnesses_into_separate_files(self) -> None:
+        self.write_rows(self.row("t", "a", True), self.row("t", "b", False), self.row("t", "c", True))
+        full = self.report()
+        out = self.report("--only", "b", "a")
+        results = self.base / "results"
+        md = (results / "summary.only-a+b.md").read_text()
+        self.assertIn("Filtered: harnesses a, b.", md.splitlines()[2])
+        self.assertIn("| a | m |", md)
+        self.assertNotIn("| c | m |", md)
+        self.assertIn("a,m", (results / "summary.only-a+b.csv").read_text())
+        self.assertNotIn("c,m", (results / "summary.only-a+b.csv").read_text())
+        self.assertIn("summary.only-a+b.md", out)
+        self.assertNotIn("Filtered", (results / "summary.md").read_text())
+        self.assertIn("| c | m |", full)
+
+    def test_only_names_that_differ_by_a_dash_do_not_share_a_file(self) -> None:
+        self.write_rows(self.row("t", "a", True), self.row("t", "b", True), self.row("t", "a-b", False))
+        self.report("--only", "a", "b")
+        self.report("--only", "a-b")
+        results = self.base / "results"
+        self.assertEqual(
+            sorted(p.name for p in results.glob("summary.only-*.md")), ["summary.only-a+b.md", "summary.only-a-b.md"]
+        )
+        self.assertIn("Filtered: harnesses a-b.", (results / "summary.only-a-b.md").read_text())
+
+    def test_only_with_long_names_uses_a_hashed_file_name_and_keeps_the_list_in_the_report(self) -> None:
+        names = [f"harness-{i:02d}-" + "x" * 30 for i in range(20)]
+        self.write_rows(*(self.row("t", n, True) for n in names))
+        self.report("--only", *names)
+        digest = hashlib.sha256("+".join(sorted(names)).encode()).hexdigest()[:12]
+        md = self.base / "results" / f"summary.only-{digest}.md"
+        self.assertIn(f"Filtered: harnesses {', '.join(sorted(names))}.", md.read_text())
+        self.assertTrue(md.with_suffix(".csv").exists())
+
+    def test_only_filters_the_judged_trials_too(self) -> None:
+        self.write_rows(self.row("t", "a", True), self.row("t", "b", True))
+        self.cfg["judge"] = {"model": "j"}
+        everything = trials_from_rows(fixtures.read_rows(self.base / "results" / "results.jsonl"))
+        real_render = report.render_markdown
+        judged_harnesses: list[set[str]] = []
+
+        def spy(*a: Any, **kw: Any) -> str:
+            judged_harnesses.append({t.target.harness for t in kw["judged"]})
+            return str(real_render(*a, **kw))
+
+        with (
+            mock.patch.object(hb, "read_trials", return_value=everything),
+            mock.patch.object(report, "render_markdown", spy),
+        ):
+            self.report("--only", "a")
+            self.report()
+        self.assertEqual(judged_harnesses, [{"a"}, {"a", "b"}])
+
+    def test_litellm_profile_writes_the_filtered_files_in_its_output_dir(self) -> None:
+        self.cfg["litellm"] = {"base_url": "http://localhost:4000", "api_key": "${HB_TEST_KEY}"}
+        self.cfg["matrix"] = []
+        del self.cfg["output_dir"]
+        (self.base / "results-litellm").mkdir()
+        fixtures.write_rows(
+            self.base / "results-litellm" / "results.jsonl",
+            fixtures.run_row(harness="a", cost_litellm=1.0),
+            fixtures.run_row(harness="b", cost_litellm=1.0),
+        )
+        out = self.report("--litellm", "--only", "a")
+        self.assertIn("Filtered: harnesses a.", out)
+        names = sorted(p.name for p in (self.base / "results-litellm").glob("summary*"))
+        self.assertEqual(names, ["summary.only-a.csv", "summary.only-a.md"])
+
+    def test_only_with_drop_saturated_works_on_the_filtered_set(self) -> None:
+        self.write_rows(self.row("easy", "a", True), self.row("hard", "a", False), self.row("easy", "b", True))
+        out = self.report("--only", "a", "--drop-saturated")
+        self.assertIn("Filtered: harnesses a.", out)
+        self.assertNotIn("| easy |", out)
+
+    def test_only_with_an_unknown_name_lists_the_known_harnesses_and_writes_nothing(self) -> None:
+        self.write_rows(self.row("t", "a", True), self.row("t", "b", True))
+        with fixtures.quiet(), self.assertRaises(SystemExit) as cm:
+            self.report("--only", "a", "zzz")
+        self.assertIn("zzz", str(cm.exception.code))
+        self.assertIn("a, b", str(cm.exception.code))
+        self.assertEqual(list((self.base / "results").glob("summary*")), [])
+
+    def test_only_rejects_an_empty_list_and_a_bad_name(self) -> None:
+        self.write_rows(self.row("t", "a", True))
+        for argv in (("--only",), ("--only", "../x"), ("--only", "a/b")):
+            with self.subTest(argv=argv), fixtures.quiet(), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    self.report(*argv)
+                self.assertEqual(cm.exception.code, 2)
+        self.assertEqual(list((self.base / "results").glob("summary*")), [])
+
+    def test_run_only_does_not_filter_the_report(self) -> None:
+        self.write_rows(self.row("t", "a", True), self.row("t", "b", True))
+        fixtures.call_quiet(hb.cmd_report, argparse.Namespace(only=["a"], cost_source=None), self.cfg, self.base)
+        self.assertIn("| b | m |", (self.base / "results" / "summary.md").read_text())
 
 
 class OrchestratorCommandTests(ApiTestCase):

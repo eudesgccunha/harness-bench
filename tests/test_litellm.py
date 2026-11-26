@@ -1,5 +1,6 @@
 """Tests for LiteLLM access, `reconcile` and the LiteLLM-only wrapper, against a local scripted server."""
 
+import argparse
 import json
 import os
 import shutil
@@ -126,8 +127,16 @@ class ReconcileTests(ServerTestCase):
 
     def reconcile(self) -> str:
         with fixtures.quiet() as out:
-            hb.cmd_reconcile(mock.Mock(cost_source=None), self.cfg, self.base)
+            hb.cmd_reconcile(argparse.Namespace(cost_source=None), self.cfg, self.base)
         return out.getvalue()
+
+    def test_reconcile_writes_only_the_full_report(self) -> None:
+        fixtures.write_rows(self.base / "results" / "results.jsonl", fixtures.run_row())
+        self.server.route("/spend/logs/v2", ok({"data": [{"request_tags": ["tag-1"], "spend": 1.0}]}))
+        self.reconcile()
+        self.assertEqual(
+            sorted(p.name for p in (self.base / "results").glob("summary*")), ["summary.csv", "summary.md"]
+        )
 
     def test_missing_litellm_section_exits(self) -> None:
         with self.assertRaises(SystemExit) as cm:

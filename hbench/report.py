@@ -455,13 +455,16 @@ def render_markdown(
     suite_kinds: Mapping[str, str] | None = None,
     judged: Sequence[TrialResult] = (),
     calibration: Calibration | None = None,
+    only: Sequence[str] = (),
 ) -> str:
-    """The summary. `suite_kinds` maps a suite name to its kind and adds the `## By suite kind` section. `judged`
+    """The summary. `only` names the harnesses the report was limited to and adds a `Filtered:` line.
+    `suite_kinds` maps a suite name to its kind and adds the `## By suite kind` section. `judged`
     are the contract trials with grader results (`trials.jsonl`): when one has an `llm_rubric` result, the
     `## Judges` section lists each rubric x judge pair, checked against `calibration`."""
     lines = [
         f"# Harness x model — {now.strftime('%Y-%m-%d %H:%M')}",
         "",
+        *([f"Filtered: harnesses {', '.join(sorted(only))}.", ""] if only else []),
         f"Cost source: `{cost_source}` (auto = litellm > computed > reported). Sorted by cost per solved task.",
         "",
         _HEAD,

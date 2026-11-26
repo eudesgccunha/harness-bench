@@ -116,6 +116,7 @@ python3 harness_bench_litellm.py reconcile --config config.litellm.json
 - `pass@k` is the capability of a pair (at least one of k runs passes) and `pass^k` its consistency (all k runs pass). A large gap between them means the pair is unreliable.
 - The `Recommendation` line names the cheapest pair among those close to the best pass rate. The `Paired comparison` section tells whether the best pair really beats each other pair (small `p`). The `Repetitions` section says how many reps per task would narrow the pass-rate interval to `target_ci_width`.
 - Add the `null` harness (see `config.example.json`) as a negative control: if it solves any task, the hidden tests are too lenient. The `Discrimination` section lists tasks every pair solves or none solves; `report --drop-saturated` leaves the saturated ones out.
+- To compare some harnesses alone, run `report --only pi opencode` (also with `--litellm`). Every figure is computed on those harnesses only, and the result goes to `summary.only-opencode+pi.md` and `.csv` next to the full `summary.md`, which is left untouched. A name with no trials is an error that lists the known harnesses. `run --only` still means "run these harnesses"; `reconcile` always writes the full report.
 - Investigate failures through the `.diff` files and logs in `logs/`, and through Lens traces if you use Lens.
 
 ### Run the trials on several workers (optional)

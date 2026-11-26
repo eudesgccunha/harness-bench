@@ -9,6 +9,7 @@ import contextlib
 import importlib
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -37,7 +38,7 @@ _DESCRIPTION = (
     "  python3 -m hbench run       --config config.json [--reps 3] [--only HARNESS] [--keep] [--dry-run]\n"
     "  python3 -m hbench run       --config config.json --resume RUN_ID [--force]   # continue an interrupted run\n"
     "  python3 -m hbench reconcile --config config.json   # pull real spend from LiteLLM\n"
-    "  python3 -m hbench report    --config config.json [--drop-saturated]\n"
+    "  python3 -m hbench report    --config config.json [--drop-saturated] [--only HARNESS ...]\n"
     "  python3 -m hbench schema export [--out PATH]       # JSON Schema of trials.jsonl and run.json\n"
     "  python3 -m hbench suite list     [--config C | PATH...]\n"
     "  python3 -m hbench suite validate [--config C] [--run [--allow-unsandboxed]] [PATH...]\n"
@@ -70,6 +71,26 @@ def _add_drop_saturated(p: argparse.ArgumentParser) -> None:
         "--drop-saturated",
         action="store_true",
         help="leave out tasks every non-null run solved before building the report",
+    )
+
+
+HARNESS_NAME = re.compile(r"[A-Za-z0-9_.-]+")
+
+
+def _harness_name(value: str) -> str:
+    if not HARNESS_NAME.fullmatch(value):
+        raise argparse.ArgumentTypeError(f"invalid harness name {value!r} (allowed: letters, digits, _ . -)")
+    return value
+
+
+def _add_report_only(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--only",
+        dest="report_only",
+        nargs="+",
+        type=_harness_name,
+        metavar="HARNESS",
+        help="build the report from these harnesses only; writes summary.only-<names>.md/.csv, not summary.md",
     )
 
 
@@ -150,6 +171,7 @@ def build_parser(epilog: str | None = None) -> argparse.ArgumentParser:
     report = sub.add_parser("report", help="write summary.md and summary.csv from the results")
     _add_config(report)
     _add_drop_saturated(report)
+    _add_report_only(report)
     report.add_argument("--cost-source", choices=["auto", "litellm", "computed", "reported"])
     reconcile = sub.add_parser("reconcile", help="fetch real spend per run from LiteLLM")
     _add_config(reconcile)

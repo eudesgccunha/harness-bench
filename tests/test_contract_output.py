@@ -1,5 +1,6 @@
 """Tests for the contract output: `trial_from_row`, `RunWriter`, `apply_gateway_costs`, and `run`/`reconcile` files."""
 
+import argparse
 import json
 import os
 import shutil
@@ -527,7 +528,7 @@ class ReconcileContractTests(unittest.TestCase):
             "/spend/logs/v2",
             ok({"data": [{"request_tags": [tag], "spend": 0.25}, {"request_tags": [tag], "spend": 0.5}]}),
         )
-        out = fixtures.call_quiet(hb.cmd_reconcile, mock.Mock(cost_source=None), self.cfg, self.base)
+        out = fixtures.call_quiet(hb.cmd_reconcile, argparse.Namespace(cost_source=None), self.cfg, self.base)
         (trials_path,) = (self.base / "results").glob("*/trials.jsonl")
         usage = read_jsonl(trials_path)[0]["usage"]
         self.assertEqual((usage["costs"]["gateway"], usage["cost_usd"], usage["cost_source"]), (0.75, 0.75, "gateway"))
@@ -538,7 +539,7 @@ class ReconcileContractTests(unittest.TestCase):
         results.mkdir()
         fixtures.write_rows(results / "results.jsonl", fixtures.run_row())
         self.server.route("/spend/logs/v2", ok({"data": [{"request_tags": ["tag-1"], "spend": 0.4}]}))
-        out = fixtures.call_quiet(hb.cmd_reconcile, mock.Mock(cost_source=None), self.cfg, self.base)
+        out = fixtures.call_quiet(hb.cmd_reconcile, argparse.Namespace(cost_source=None), self.cfg, self.base)
         self.assertEqual(
             (fixtures.read_rows(results / "results.jsonl")[0]["cost_litellm"], "contract: 0 trials updated" in out),
             (0.4, True),

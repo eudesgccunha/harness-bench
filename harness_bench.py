@@ -13,6 +13,7 @@ Usage:
 import argparse
 import contextlib
 import functools
+import hashlib
 import json
 import os
 import platform
@@ -1655,6 +1656,26 @@ def load_calibration(cfg: Mapping[str, Any], base: Path) -> Calibration | None:
         return None
 
 
+MAX_ONLY_SUFFIX = 100  # bytes of joined harness names kept in a file name; longer lists are hashed
+
+
+def only_suffix(only: Sequence[str]) -> str:
+    """The file-name part of a filtered report: names joined by `+` (not allowed in a name, so two lists never
+    collide), or a short hash of them when the list would not fit in a file name. `only` is sorted."""
+    if not only:
+        return ""
+    joined = "+".join(only)
+    if len(joined.encode()) > MAX_ONLY_SUFFIX:
+        joined = hashlib.sha256(joined.encode()).hexdigest()[:12]
+    return f".only-{joined}"
+
+
+def judged_trials(out_dir: Path, only: Sequence[str]) -> list[TrialResult]:
+    """The contract trials of `out_dir`, limited to the harnesses of a filtered report."""
+    trials = read_trials(out_dir)
+    return [t for t in trials if t.target.harness in only] if only else trials
+
+
 def cmd_report(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path) -> None:
     out_dir = base / cfg.get("output_dir", "results")
     results_path = out_dir / "results.jsonl"
@@ -1668,13 +1689,21 @@ def cmd_report(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path) -> 
     within_pp, target_width = report_options(cfg)
     null_harnesses = {name for name, h in cfg.get("harnesses", {}).items() if h.get("parser") == "null"}
     trials = trials_from_rows(rows, warn=print)
+    only = sorted(set(getattr(args, "report_only", None) or []))
+    if only:
+        known = sorted({t.target.harness for t in trials})
+        unknown = [name for name in only if name not in known]
+        if unknown:
+            sys.exit(f"no trials for harness {', '.join(unknown)}; known harnesses: {', '.join(known)}")
+        trials = [t for t in trials if t.target.harness in only]
+    suffix = only_suffix(only)
     if getattr(args, "drop_saturated", False):
         trials = report.drop_saturated(trials, null_harnesses)
         if not trials:
             print("no tasks left after --drop-saturated")
             return
     table = report.aggregate(trials, cost_source, null_harnesses=null_harnesses, target_ci_width=target_width)
-    report.write_csv(table, out_dir / "summary.csv")
+    report.write_csv(table, out_dir / f"summary{suffix}.csv")
     try:
         suite_kinds = {suite.name: suite.kind for suite in load_config_suites(cfg, base)}
     except SuiteError as e:
@@ -1688,12 +1717,13 @@ def cmd_report(args: argparse.Namespace, cfg: Mapping[str, Any], base: Path) -> 
         recommend_within_pp=within_pp,
         target_ci_width=target_width,
         suite_kinds=suite_kinds,
-        judged=read_trials(out_dir) if isinstance(cfg.get("judge"), Mapping) else (),
+        judged=judged_trials(out_dir, only) if isinstance(cfg.get("judge"), Mapping) else (),
         calibration=load_calibration(cfg, base),
+        only=only,
     )
-    (out_dir / "summary.md").write_text(md)
+    (out_dir / f"summary{suffix}.md").write_text(md)
     print("\n" + md)
-    print(f"saved {out_dir / 'summary.md'} and {out_dir / 'summary.csv'}")
+    print(f"saved {out_dir / f'summary{suffix}.md'} and {out_dir / f'summary{suffix}.csv'}")
 
 
 # ---------------------------------------------------------------- main
